@@ -36,6 +36,8 @@
 #include "abstraction.h"
 #include "evaluator.h"
 #include "flatgame.h"
+#include "gpucfr.h"
+#include "gpukernels.h"
 #include "histtree.h"
 #include "mccfr.h"
 #include "philox.h"
@@ -71,9 +73,70 @@ public:
 
     long long iteration() const { return iteration_; }
 
+    int gpu_pass = 0;  // GPU mode: iterations traversed at once (0: the whole batch); memory only
+    // emulation of the GPU trainer on the host: the kernels' functions (gpukernels.h) in loops, the same
+    // steps as GpuFlatTrainer::run_batch (a check of everything but the CUDA calls, on any machine)
+    bool emulate_gpu = false;
+
+    // move the tables to CUDA device `device` and train there from now on (a CUDA build is needed)
+    void use_gpu(int device) {
+        std::string why;
+        if (!GpuFlatTrainer::available(why)) throw std::runtime_error("no usable CUDA device: " + why);
+        FlatGameView v;
+        v.n_players = game.n_players;
+        v.n_decisions = game.n_decisions();
+        v.n_terminals = game.n_terminals();
+        v.n_child = game.child.size();
+        v.rel = game.rel.data();
+        v.n_board = game.n_board.data();
+        v.na = game.na.data();
+        v.child_base = game.child_base.data();
+        v.child = game.child.data();
+        v.hh_a = game.hh_a.data();
+        v.hh_b = game.hh_b.data();
+        v.info_base = game.info_base.data();
+        v.cell_base = game.cell_base.data();
+        v.n_cache = game.n_cache.data();
+        v.invested = game.invested.data();
+        v.folded = game.folded.data();
+        v.n_infosets = game.n_infosets;
+        v.n_cells = game.n_cells;
+        sync();
+        gpu_.reset(new GpuFlatTrainer(v, spec.bb, seed, device));
+        std::vector<uint8_t> tc(game.n_cells, 0);  // touched per cell: every cell of a touched infoset
+        for (size_t d = 0; d < game.n_decisions(); d++)
+            for (int b = 0; b < game.n_cache[d]; b++)
+                if (touched[game.info_base[d] + (uint64_t)b])
+                    for (int a = 0; a < game.na[d]; a++) tc[game.cell_base[d] + (uint64_t)b * game.na[d] + (uint64_t)a] = 1;
+        gpu_->upload(regret.data(), strategy_sum.data(), visits.data(), tc.data());
+    }
+    bool on_gpu() const { return (bool)gpu_; }
+    std::string gpu_device() const { return gpu_ ? gpu_->device_name() : std::string(); }
+    GpuStats gpu_stats() const { return gpu_ ? gpu_->stats() : GpuStats(); }
+
+    // GPU mode: bring the host copies of the tables up to date
+    void sync() {
+        if (!host_stale_) return;
+        std::vector<uint8_t> dl;
+        if (gpu_) {
+            dl.resize(game.n_cells);
+            gpu_->download(regret.data(), strategy_sum.data(), visits.data(), dl.data());
+        }
+        const std::vector<uint8_t>& tc = gpu_ ? dl : emu_touched_;
+        for (size_t d = 0; d < game.n_decisions(); d++)
+            for (int b = 0; b < game.n_cache[d]; b++) {
+                const uint64_t i = game.info_base[d] + (uint64_t)b;
+                bool t = visits[i] > 0;
+                for (int a = 0; a < game.na[d] && !t; a++) t = tc[game.cell_base[d] + (uint64_t)b * game.na[d] + (uint64_t)a] != 0;
+                touched[i] = t;
+            }
+        host_stale_ = false;
+    }
+
     void train(long long iterations) {
         if (batch_size < 1) throw std::invalid_argument("flat trainer: batch_size >= 1");
         const long long target = iteration_ + iterations;
+        if (gpu_ || emulate_gpu) { train_gpu(target); return; }
         const int T = threads;
         std::vector<std::vector<Rec>> recs(T);
         std::vector<Rec> all;
@@ -114,7 +177,8 @@ public:
 
     // every touched infoset: (key, regret, strategy sum, visits)
     template <class F>
-    void for_each_touched(F&& f) const {
+    void for_each_touched(F&& f) {
+        sync();
         std::string key;
         for (size_t d = 0; d < game.n_decisions(); d++) {
             const int na = game.na[d];
@@ -138,13 +202,7 @@ private:
         uint32_t d;
         double v;
     };
-    struct Iter {
-        long long t;
-        double weight;
-        int button;
-        int bucket[MAX_PLAYERS][6];  // [absolute seat][n_board]
-        int64_t strength[MAX_PLAYERS];  // by relative seat
-    };
+    using Iter = FlatIter;
     struct Item {
         int32_t node;        // >= 0 decision, < 0 ~terminal
         uint32_t job;        // iteration index in the pass * n + traverser
@@ -162,29 +220,140 @@ private:
 
     uint64_t info_of_cell(const Rec& u) const { return game.info_base[u.d] + u.info; }
 
+    // what iteration t needs from its deal: weight, button, buckets, showdown strengths
+    void prepare_iter(long long t, Iter& it, int* order) {
+        const int n = spec.n_players;
+        it.t = t;
+        it.weight = linear ? (double)(linear_until > 0 && t > linear_until ? linear_until : t) : 1.0;
+        it.button = (int)(t % n);
+        philox_deal(seed, (uint64_t)t, order);
+        for (int s = 0; s < CFR_MAX_PLAYERS; s++)
+            for (int nb = 0; nb < 6; nb++) it.bucket[s][nb] = -1;
+        for (int s = 0; s < n; s++)
+            for (int nb : {0, 3, 4, 5})
+                if (nb == 0 || nb <= board_cards_by_street(spec.max_street)) it.bucket[s][nb] = bucketer->bucket(&order[2 * s], &order[2 * n], nb);
+        for (int r = 0; r < CFR_MAX_PLAYERS; r++) it.strength[r] = 0;
+        for (int r = 0; r < n; r++) {
+            const int seat = (r + it.button) % n;
+            int cards[7] = {order[2 * seat], order[2 * seat + 1]};
+            for (int i = 0; i < 5; i++) cards[2 + i] = order[2 * n + i];
+            it.strength[r] = evaluate(cards, 7);
+        }
+    }
+
+    // ---- GPU mode (gpucfr.h): the tables live on the device; the host copies are refreshed by sync()
+    std::unique_ptr<GpuFlatTrainer> gpu_;
+    bool host_stale_ = false;
+    std::vector<Iter> gpu_iters_;
+
+    std::vector<uint8_t> emu_touched_;  // emulation: touched per cell (the device's layout)
+
+    void emu_run_batch(const Iter* its, int k, int pass) {
+        const int n = spec.n_players;
+        if ((uint64_t)k * (uint64_t)n >= (1ULL << KEY_JOB_BITS)) throw std::invalid_argument("batch too large for the update keys");
+        if (game.n_cells > KEY_CELL_MASK) throw std::invalid_argument("too many cells for the update keys");
+        if (emu_touched_.size() != game.n_cells) {  // first batch: every cell of a touched infoset
+            emu_touched_.assign(game.n_cells, 0);
+            for (size_t d = 0; d < game.n_decisions(); d++)
+                for (int b = 0; b < game.n_cache[d]; b++)
+                    if (touched[game.info_base[d] + (uint64_t)b])
+                        for (int a = 0; a < game.na[d]; a++) emu_touched_[game.cell_base[d] + (uint64_t)b * game.na[d] + (uint64_t)a] = 1;
+        }
+        if (pass < 1) pass = k;
+        DevGame g{game.rel.data(), game.n_board.data(), game.na.data(), game.child_base.data(), game.child.data(), game.hh_a.data(),
+                  game.hh_b.data(), game.info_base.data(), game.cell_base.data(), game.n_cache.data(), game.invested.data(),
+                  game.folded.data(), n};
+        std::vector<int32_t> node;
+        std::vector<uint32_t> job, first, cnt;
+        std::vector<uint8_t> choice;
+        std::vector<double> value;
+        std::vector<uint64_t> keys;
+        std::vector<double> vals;
+        int err = 0;
+        auto grow = [&](size_t m) {
+            if (node.size() >= m) return;
+            node.resize(m); job.resize(m); first.resize(m); cnt.resize(m); choice.resize(m); value.resize(m);
+        };
+        auto lv = [&]() { return DevLevel{node.data(), job.data(), first.data(), cnt.data(), choice.data(), value.data()}; };
+        for (int lo = 0; lo < k; lo += pass) {
+            const uint32_t jobs = (uint32_t)std::min(pass, k - lo) * (uint32_t)n;
+            std::vector<size_t> off{0}, size{jobs};
+            grow(jobs);
+            for (uint32_t i = 0; i < jobs; i++) item_init(lv(), i, (uint32_t)lo * (uint32_t)n);
+            uint64_t n_rec = 0;
+            for (size_t L = 0; size[L] > 0; L++) {
+                const size_t o = off[L], m = size[L];
+                for (size_t i = 0; i < m; i++) n_rec += item_count(g, lv(), o + i, its, regret.data(), seed, spec.bb, &err);
+                uint32_t acc = 0;  // exclusive scan
+                for (size_t i = 0; i < m; i++) { first[o + i] = acc; acc += cnt[o + i]; }
+                const size_t next_off = o + m;
+                grow(next_off + acc);
+                for (size_t i = 0; i < m; i++) item_emit(g, lv(), o + i, next_off);
+                off.push_back(next_off);
+                size.push_back(acc);
+            }
+            // backward; the items of a level take their record slots in reverse order (on the device the
+            // order is whatever the atomics give): the keys, not the slots, fix the result
+            const uint64_t base = keys.size();
+            keys.resize(base + n_rec);
+            vals.resize(base + n_rec);
+            uint64_t at = base;
+            for (size_t L = size.size() - 1; L-- > 0;)
+                for (size_t i = size[L]; i-- > 0;) {
+                    const uint32_t r = item_records(g, lv(), off[L] + i);
+                    if (!r) continue;
+                    item_back(g, lv(), off[L] + i, off[L + 1], its, regret.data(), keys.data(), vals.data(), at, &err);
+                    at += r;
+                }
+            if (at != base + n_rec) throw std::logic_error("emulation: record count mismatch");
+        }
+        if (err) throw std::runtime_error("GPU emulation: a bucket outside its node's rows");
+        // the radix sort (keys unique: any sort gives this order), then the runs
+        std::vector<size_t> perm(keys.size());
+        for (size_t i = 0; i < perm.size(); i++) perm[i] = i;
+        std::sort(perm.begin(), perm.end(), [&](size_t a, size_t b) { return keys[a] < keys[b]; });
+        std::vector<uint64_t> sk(keys.size());
+        std::vector<double> sv(keys.size());
+        for (size_t i = 0; i < perm.size(); i++) { sk[i] = keys[perm[i]]; sv[i] = vals[perm[i]]; }
+        for (size_t i = 1; i < sk.size(); i++)
+            if (sk[i] == sk[i - 1]) throw std::logic_error("emulation: duplicate update key");
+        for (size_t i = 0; i < sk.size(); i++) apply_run(sk.data(), sv.data(), sk.size(), i, regret.data(), strategy_sum.data(), visits.data(), emu_touched_.data());
+    }
+
+    void train_gpu(long long target) {
+        const int T = threads;
+        while (iteration_ < target) {
+            const long long lo = iteration_ + 1;
+            const long long hi = std::min(target, (iteration_ / batch_size + 1) * batch_size);
+            const int k = (int)(hi - lo + 1);
+            gpu_iters_.resize((size_t)k);
+            std::atomic<int> next{0};
+            auto work = [&]() {
+                int order[52];
+                for (int i = next.fetch_add(64); i < k; i = next.fetch_add(64))
+                    for (int j = i; j < std::min(k, i + 64); j++) prepare_iter(lo + j, gpu_iters_[(size_t)j], order);
+            };
+            if (T == 1) {
+                work();
+            } else {
+                std::vector<std::thread> pool;
+                for (int t = 1; t < T; t++) pool.emplace_back(work);
+                work();
+                for (auto& th : pool) th.join();
+            }
+            if (gpu_) gpu_->run_batch(gpu_iters_.data(), k, gpu_pass);
+            else emu_run_batch(gpu_iters_.data(), k, gpu_pass);
+            host_stale_ = true;
+            iteration_ = hi;
+        }
+    }
+
     void run_pass(long long lo, long long hi, Scratch& sc, std::vector<Rec>& out) {
         const int n = spec.n_players;
         const int n_iter = (int)(hi - lo + 1);
         // per iteration: deal, buckets, showdown strengths (on the GPU: computed beside the traversal)
         sc.iters.resize((size_t)n_iter);
-        for (int k = 0; k < n_iter; k++) {
-            Iter& it = sc.iters[(size_t)k];
-            it.t = lo + k;
-            it.weight = linear ? (double)(linear_until > 0 && it.t > linear_until ? linear_until : it.t) : 1.0;
-            it.button = (int)(it.t % n);
-            philox_deal(seed, (uint64_t)it.t, sc.order);
-            for (int s = 0; s < n; s++)
-                for (int nb = 0; nb < 6; nb++) it.bucket[s][nb] = -1;
-            for (int s = 0; s < n; s++)
-                for (int nb : {0, 3, 4, 5})
-                    if (nb == 0 || nb <= board_cards_by_street(spec.max_street)) it.bucket[s][nb] = bucketer->bucket(&sc.order[2 * s], &sc.order[2 * n], nb);
-            for (int r = 0; r < n; r++) {
-                const int seat = (r + it.button) % n;
-                int cards[7] = {sc.order[2 * seat], sc.order[2 * seat + 1]};
-                for (int i = 0; i < 5; i++) cards[2 + i] = sc.order[2 * n + i];
-                it.strength[r] = evaluate(cards, 7);
-            }
-        }
+        for (int k = 0; k < n_iter; k++) prepare_iter(lo + k, sc.iters[(size_t)k], sc.order);
         // forward
         if (sc.levels.size() < (size_t)game.depth + 1) sc.levels.resize((size_t)game.depth + 1);
         for (auto& l : sc.levels) l.clear();

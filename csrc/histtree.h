@@ -32,9 +32,12 @@
 
 #include "abstraction.h"
 #include "engine.h"
+#include "cfrmath.h"
 #include "nodetable.h"
 
 namespace negp {
+
+static_assert(MAX_PLAYERS == CFR_MAX_PLAYERS, "cfrmath.h: CFR_MAX_PLAYERS must equal MAX_PLAYERS");
 
 struct HistNode {
     HistNode* parent = nullptr;
@@ -240,45 +243,7 @@ private:
     std::string tok_;
 };
 
-// net chips of relative seat `me` at terminal `h` (HandState::finish, in relative seats):
-// `strength[r]` = the 7-card value of relative seat r (read only when two or more reach showdown)
-// (the terminal given by its contributions `invested` and fold bits `folded`)
-inline int terminal_net_of(const int32_t* invested, uint16_t folded, int n, int me, const int64_t* strength) {
-    int active[MAX_PLAYERS];
-    int n_act = 0;
-    for (int r = 0; r < n; r++) if (!(folded >> r & 1)) active[n_act++] = r;
-    int levels[MAX_PLAYERS];
-    int n_levels = 0;
-    for (int r = 0; r < n; r++) if (invested[r] > 0) levels[n_levels++] = invested[r];
-    std::sort(levels, levels + n_levels);
-    n_levels = (int)(std::unique(levels, levels + n_levels) - levels);
-    int won = 0, prev = 0;
-    for (int li = 0; li < n_levels; li++) {
-        const int lvl = levels[li];
-        int portion = 0;
-        for (int r = 0; r < n; r++) portion += std::max(0, std::min(invested[r], lvl) - prev);
-        int eligible[MAX_PLAYERS];
-        int n_el = 0;
-        for (int k = 0; k < n_act; k++) if (invested[active[k]] >= lvl) eligible[n_el++] = active[k];
-        if (n_el == 0) for (int k = 0; k < n_act; k++) eligible[n_el++] = active[k];
-        if (n_el == 1) {
-            if (eligible[0] == me) won += portion;
-        } else {
-            int64_t best = -1;
-            for (int k = 0; k < n_el; k++) best = std::max(best, strength[eligible[k]]);
-            int ws[MAX_PLAYERS];
-            int n_ws = 0;
-            for (int k = 0; k < n_el; k++) if (strength[eligible[k]] == best) ws[n_ws++] = eligible[k];
-            const int share = portion / n_ws, odd = portion % n_ws;
-            // odd chips go first to the seat after the button: key (r - 1) mod n, stable
-            std::stable_sort(ws, ws + n_ws, [&](int a, int b) { return ((a - 1) % n + n) % n < ((b - 1) % n + n) % n; });
-            for (int i = 0; i < n_ws; i++) if (ws[i] == me) won += share + (i < odd ? 1 : 0);
-        }
-        prev = lvl;
-    }
-    return won - invested[me];
-}
-
+// net chips of relative seat `me` at terminal `h` (terminal_net_of, cfrmath.h)
 inline int terminal_net(const HistTerminal* h, int n, int me, const int64_t* strength) {
     return terminal_net_of(h->invested, h->folded, n, me, strength);
 }

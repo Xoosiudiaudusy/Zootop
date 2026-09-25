@@ -1047,6 +1047,12 @@ PYBIND11_MODULE(_fastcore, m) {
     // of racing a table resize.
     using ApiLock = std::lock_guard<std::mutex>;
 
+    m.def("cuda_available", []() {
+        // (usable, reason): a CUDA build of the core and a device
+        std::string why;
+        const bool ok = GpuFlatTrainer::available(why);
+        return py::make_tuple(ok, why);
+    });
     // ---- the GPU algorithm on the CPU (flatcfr.h): level-synchronous batched MCCFR on the flat game
     py::class_<FlatTrainer>(m, "FlatTrainer")
         .def(py::init([](const py::dict& spec, std::shared_ptr<Bucketer> bk, uint64_t seed, bool linear, int threads) {
@@ -1071,7 +1077,21 @@ PYBIND11_MODULE(_fastcore, m) {
             d["depth"] = t.game.depth;
             return d;
         })
-        .def("export_nodes", [](const FlatTrainer& t) {
+        .def_readwrite("gpu_pass", &FlatTrainer::gpu_pass)
+        .def_readwrite("emulate_gpu", &FlatTrainer::emulate_gpu)
+        .def("use_gpu", [](FlatTrainer& t, int device) { py::gil_scoped_release nogil; t.use_gpu(device); }, py::arg("device") = 0)
+        .def_property_readonly("on_gpu", &FlatTrainer::on_gpu)
+        .def_property_readonly("gpu_device", &FlatTrainer::gpu_device)
+        .def("gpu_stats", [](const FlatTrainer& t) {
+            const GpuStats s = t.gpu_stats();
+            py::dict d;
+            d["items"] = s.items;
+            d["records"] = s.records;
+            d["ms_traverse"] = s.ms_traverse;
+            d["ms_apply"] = s.ms_apply;
+            return d;
+        })
+        .def("export_nodes", [](FlatTrainer& t) {
             // {key: (regret, strategy_sum, visits)} of every infoset an update reached
             py::dict out;
             t.for_each_touched([&](const std::string& key, const double* r, const double* s, int na, int64_t v) {

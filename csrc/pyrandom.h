@@ -21,6 +21,8 @@
 #include <stdexcept>
 #include <vector>
 
+#include "cfrmath.h"  // py_sum
+
 namespace negp {
 
 struct PyRandom {
@@ -227,21 +229,5 @@ inline int64_t py_tuple_hash(const int64_t* items, int len) {
     return (int64_t)acc;
 }
 
-// CPython 3.12+ builtins.sum over a non-empty list of floats (start=0): the first item is
-// added to the int 0 exactly, the rest with Neumaier compensation.
-inline double py_sum(const double* x, int n) {
-    if (n == 0) return 0.0;
-    double f = x[0];
-    double c = 0.0;
-    for (int i = 1; i < n; i++) {
-        double xi = x[i];
-        double t = f + xi;
-        if (std::fabs(f) >= std::fabs(xi)) c += (f - t) + xi;
-        else c += (xi - t) + f;
-        f = t;
-    }
-    if (c != 0.0 && std::isfinite(c)) f += c;
-    return f;
-}
 
 }  // namespace negp

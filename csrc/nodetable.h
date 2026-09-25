@@ -50,6 +50,7 @@
 #endif
 
 #include "abstraction.h"
+#include "cfrmath.h"
 #include "engine.h"
 
 namespace negp {
@@ -62,17 +63,7 @@ inline void cpu_relax() {
 #endif
 }
 
-constexpr int MAX_ACTIONS = 8;
-
-// the current strategy of regrets r[0..n) (regret matching, CPython sum() semantics): shared by
-// Node::current_strategy and the flat trainer (flatcfr.h)
-inline void regret_matching(const double* r, int n, double* out) {
-    double pos[MAX_ACTIONS];
-    for (int i = 0; i < n; i++) pos[i] = r[i] > 0 ? r[i] : 0.0;
-    double s = py_sum(pos, n);
-    if (s <= 0) { for (int i = 0; i < n; i++) out[i] = 1.0 / n; return; }
-    for (int i = 0; i < n; i++) out[i] = pos[i] / s;
-}
+// MAX_ACTIONS, regret_matching: cfrmath.h
 
 // Per-node lock, held for a handful of arithmetic operations.  Waiters spin with a pause and give
 // their time slice away after a while: with more runnable threads than cores (other programs, or

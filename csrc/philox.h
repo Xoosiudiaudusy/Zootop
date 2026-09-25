@@ -14,20 +14,22 @@
 #pragma once
 #include <cstdint>
 
+#include "cfrmath.h"  // NEGP_HD: the draws are also made on the GPU
+
 namespace negp {
 
 struct Philox4x32 {
     uint32_t v[4];
 };
 
-inline uint32_t philox_mulhilo(uint32_t a, uint32_t b, uint32_t& hi) {
+NEGP_HD inline uint32_t philox_mulhilo(uint32_t a, uint32_t b, uint32_t& hi) {
     const uint64_t p = (uint64_t)a * (uint64_t)b;
     hi = (uint32_t)(p >> 32);
     return (uint32_t)p;
 }
 
 // ten rounds of Philox4x32 on `ctr` with `key`
-inline Philox4x32 philox4x32_10(Philox4x32 ctr, uint32_t k0, uint32_t k1) {
+NEGP_HD inline Philox4x32 philox4x32_10(Philox4x32 ctr, uint32_t k0, uint32_t k1) {
     const uint32_t M0 = 0xD2511F53u, M1 = 0xCD9E8D57u, W0 = 0x9E3779B9u, W1 = 0xBB67AE85u;
     for (int r = 0; r < 10; r++) {
         uint32_t hi0, hi1;
@@ -76,7 +78,7 @@ struct PhiloxStream {
 };
 
 // the uniform draw of traverser p at the history (a, b) in iteration t (see the header)
-inline double philox_sample_u01(uint64_t seed, uint64_t t, int p, uint64_t a, uint64_t b) {
+NEGP_HD inline double philox_sample_u01(uint64_t seed, uint64_t t, int p, uint64_t a, uint64_t b) {
     Philox4x32 c;
     c.v[0] = (uint32_t)t;
     c.v[1] = (uint32_t)(t >> 32);
