@@ -77,51 +77,6 @@ inline void river_equity_all(const int* board, double* out, std::vector<int64_t>
         }
 }
 
-inline int exact_bin(double e, int bins) {
-    int b = (int)(e * (double)bins);
-    return b >= bins ? bins - 1 : b;
-}
-
-// the feature of one hand by the definition: counts[bins] and the mean (reference implementation)
-inline void exact_feature(const int* hole, const int* board, int n_board, int bins, int* counts, double& mean) {
-    bool used[52] = {false};
-    used[hole[0]] = used[hole[1]] = true;
-    for (int i = 0; i < n_board; i++) used[board[i]] = true;
-    for (int i = 0; i < bins; i++) counts[i] = 0;
-    int b5[5];
-    for (int i = 0; i < n_board; i++) b5[i] = board[i];
-    double total = 0.0;
-    int n = 0;
-    if (n_board == 4) {
-        for (int c = 0; c < 52; c++) {
-            if (used[c]) continue;
-            b5[4] = c;
-            const double e = river_equity_exact(hole, b5, 5);
-            counts[exact_bin(e, bins)]++;
-            total += e;
-            n++;
-        }
-    } else {  // flop
-        for (int t = 0; t < 52; t++) {
-            if (used[t]) continue;
-            b5[3] = t;
-            double s = 0.0;
-            int m = 0;
-            for (int r = 0; r < 52; r++) {
-                if (used[r] || r == t) continue;
-                b5[4] = r;
-                s += river_equity_exact(hole, b5, 5);
-                m++;
-            }
-            const double e = s / (double)m;
-            counts[exact_bin(e, bins)]++;
-            total += e;
-            n++;
-        }
-    }
-    mean = total / (double)n;
-}
-
 // Features of every hole of one flop (3 cards) or turn (4 cards) board.  After compute(), counts(a, b)
 // and mean(a, b) give the feature of hole {a, b} (off the board).
 class ExactFeatureBatch {

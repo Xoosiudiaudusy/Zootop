@@ -27,6 +27,7 @@
 
 #include "abstraction.h"
 #include "binio.h"
+#include "exactfeat.h"
 #include "handindex.h"
 
 namespace negp {
@@ -58,6 +59,10 @@ public:
         if (any() && !same_identity(id_, id)) throw std::invalid_argument("tables of another bucketer: build into a fresh object");
         id_ = id;
         if (street == RIVER && build_river_by_board(bk, threads, done)) return;
+        if (street != RIVER) {
+            const PotentialBucketer* pb = dynamic_cast<const PotentialBucketer*>(&bk);
+            if (pb && pb->exact) { build_exact_by_board(*pb, street, threads, done); return; }
+        }
         const HandIndexer& ix = *ix_[street];
         const uint64_t n = ix.size();
         std::vector<uint8_t> out(n);
@@ -165,6 +170,54 @@ public:
                a.fingerprint == b.fingerprint;
     }
 
+    // flop / turn of an exact potential-aware bucketer from a saved feature file (build_exact_features,
+    // NPXF): every class's histogram -> nearest centroid.  Seconds, for any number of buckets.
+    void build_from_features(const Bucketer& bk, int street, const std::string& path, int threads) {
+        const PotentialBucketer* pb = dynamic_cast<const PotentialBucketer*>(&bk);
+        if (!pb || !pb->exact) throw std::invalid_argument("feature files are for exact potential-aware bucketers");
+        if (street != FLOP && street != TURN) throw std::invalid_argument("feature files hold the flop or the turn");
+        if (!bk.fitted()) throw std::invalid_argument("bucketer not fitted");
+        const BucketerIdentity id = bk.identity();
+        if (any() && !same_identity(id_, id)) throw std::invalid_argument("tables of another bucketer: build into a fresh object");
+        FILE* f = open_file(path, "rb");
+        if (!f) throw std::runtime_error("cannot read " + path);
+        char magic[4];
+        int32_t hdr[2];
+        uint64_t n = 0;
+        const bool ok = std::fread(magic, 1, 4, f) == 4 && std::memcmp(magic, "NPXF", 4) == 0 && std::fread(hdr, sizeof hdr, 1, f) == 1 &&
+                        std::fread(&n, 8, 1, f) == 1;
+        const HandIndexer& ix = *ix_[street];
+        if (!ok || hdr[0] != ix.n_board() || hdr[1] != pb->bins || n != ix.size()) {
+            std::fclose(f);
+            throw std::runtime_error("feature file " + path + " is not for this street / number of bins");
+        }
+        std::vector<uint8_t> counts(n * (uint64_t)hdr[1]);
+        if (std::fread(counts.data(), 1, counts.size(), f) != counts.size()) { std::fclose(f); throw std::runtime_error("truncated feature file: " + path); }
+        std::fclose(f);
+        id_ = id;
+        std::vector<uint8_t> out(n);
+        const int bins = hdr[1];
+        std::atomic<uint64_t> next{0};
+        auto work = [&]() {
+            int c[MAX_BINS];
+            for (;;) {
+                const uint64_t lo = next.fetch_add(65536);
+                if (lo >= n) return;
+                const uint64_t hi = lo + 65536 < n ? lo + 65536 : n;
+                for (uint64_t i = lo; i < hi; i++) {
+                    for (int j = 0; j < bins; j++) c[j] = counts[i * (uint64_t)bins + (uint64_t)j];
+                    out[i] = (uint8_t)pb->assign_counts(street, c);
+                }
+            }
+        };
+        const int T = threads < 1 ? 1 : threads;
+        std::vector<std::thread> pool;
+        for (int t = 1; t < T; t++) pool.emplace_back(work);
+        work();
+        for (auto& th : pool) th.join();
+        t_[street].swap(out);
+    }
+
     // the canonical 5-card boards: the lexicographically smallest sorted image under the 24 suit
     // permutations (every board is a relabelling of exactly one of them)
     static std::vector<std::array<int, 5>> canonical_boards() {
@@ -245,6 +298,45 @@ private:
             if (!(seen[id >> 3] >> (id & 7) & 1)) throw std::logic_error("bucket table: a river class was not covered by the canonical boards");
         t_[RIVER].swap(out);
         return true;
+    }
+
+    // flop / turn of an exact potential-aware bucketer: the features of all holes of each canonical
+    // board at once (ExactFeatureBatch), then the nearest centroid; the same numbers as bucket()
+    void build_exact_by_board(const PotentialBucketer& pb, int street, int threads, std::atomic<uint64_t>* done) {
+        const int n_board = street == FLOP ? 3 : 4;
+        const std::vector<std::vector<int>> boards = canonical_small_boards(n_board);
+        const HandIndexer& ix = *ix_[street];
+        std::vector<uint8_t> out(ix.size(), 0);
+        std::atomic<size_t> next{0};
+        auto work = [&]() {
+            ExactFeatureBatch batch(pb.bins);
+            int counts[MAX_BINS];
+            for (size_t i = next.fetch_add(1); i < boards.size(); i = next.fetch_add(1)) {
+                const int* board = boards[i].data();
+                batch.compute(board, n_board);
+                bool on[52] = {false};
+                for (int k = 0; k < n_board; k++) on[board[k]] = true;
+                uint64_t written = 0;
+                for (int a = 0; a < 52; a++) {
+                    if (on[a]) continue;
+                    for (int b = a + 1; b < 52; b++) {
+                        if (on[b]) continue;
+                        double m;
+                        batch.feature(a, b, counts, m);
+                        const int hole[2] = {a, b};
+                        out[ix.index(hole, board)] = (uint8_t)pb.assign_counts(street, counts);  // same value per class
+                        written++;
+                    }
+                }
+                if (done) done->fetch_add(written, std::memory_order_relaxed);
+            }
+        };
+        const int T = threads < 1 ? 1 : threads;
+        std::vector<std::thread> pool;
+        for (int t = 1; t < T; t++) pool.emplace_back(work);
+        work();
+        for (auto& th : pool) th.join();
+        t_[street].swap(out);
     }
 
     // pair (c, d) -> 0..1325, c < d in card order (the convention of river_buckets_all's callers)
