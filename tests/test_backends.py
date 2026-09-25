@@ -314,14 +314,18 @@ def test_cpp_pushfold_blueprint_reaches_low_exploitability_and_matches_python():
 
 # ================================================== 5. flag, equivalence, checkpoints
 @needs_core
-def test_single_thread_cpp_trainer_is_bit_identical_to_python(flop_bucketer):
+@pytest.mark.parametrize("verify", ["1", "0"])
+def test_single_thread_cpp_trainer_is_bit_identical_to_python(flop_bucketer, monkeypatch, verify):
+    # verify "0": production mode, where the history tree caches Node pointers (csrc/histtree.h);
+    # the C++ run is split in two train() calls so the second one starts from a warm tree
+    monkeypatch.setenv("NEGPLURIBUS_VERIFY_KEYS", verify)
     for spec, bk, iters in (
         (pushfold_spec(), None, 2000),
         (GameSpec(n_players=2, stack_bb=10, max_street=Street.PREFLOP, preflop_fracs=(1.0,)), None, 1500),
         (GameSpec(n_players=3, stack_bb=15, max_street=Street.FLOP, n_buckets=8), flop_bucketer, 200),
     ):
         py = MCCFRTrainer(spec, bk, seed=4, backend="python").train(iters)
-        cpp = MCCFRTrainer(spec, bk, seed=4, backend="cpp", threads=1).train(iters)
+        cpp = MCCFRTrainer(spec, bk, seed=4, backend="cpp", threads=1).train(iters // 3).train(iters - iters // 3)
         assert cpp.iteration == py.iteration and cpp.nodes_touched == py.nodes_touched
         assert set(cpp.nodes) == set(py.nodes)
         for k, n in py.nodes.items():

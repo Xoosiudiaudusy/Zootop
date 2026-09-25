@@ -452,6 +452,8 @@ public:
 
     size_t size() const { return size_.load(std::memory_order_relaxed); }
     size_t capacity() const { return mask_ + 1; }
+    // changes whenever Node pointers handed out before become invalid (clear())
+    uint64_t epoch() const { return epoch_; }
     size_t slot_bytes() const { return capacity() * sizeof(Slot); }
     size_t node_bytes() const { size_t s = 0; for (auto& a : arenas_) s += a->node_bytes(); return s; }
     size_t key_bytes() const { size_t s = 0; for (auto& a : arenas_) s += a->char_bytes(); return s; }
@@ -502,8 +504,9 @@ public:
         if (cap != capacity()) rehash(cap);
     }
 
-    // not concurrent with anything
+    // not concurrent with anything; invalidates every Node pointer (epoch() changes)
     void clear() {
+        epoch_++;
         for (auto& a : arenas_) a->clear();
         allocate(initial_);
         grow_requested_.store(false, std::memory_order_relaxed);
@@ -590,6 +593,7 @@ private:
     std::vector<std::unique_ptr<NodeArena>> arenas_;
     TableGroup* group_ = nullptr;
     size_t initial_;
+    uint64_t epoch_ = 0;
 };
 
 // Lookups by key string (Python, checkpoints).  The stored string must match too, so the answer

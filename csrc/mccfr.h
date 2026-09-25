@@ -31,6 +31,7 @@
 
 #include "abstraction.h"
 #include "engine.h"
+#include "histtree.h"
 #include "nodetable.h"
 #include "pyrandom.h"
 
@@ -77,11 +78,16 @@ struct ThreadCtx {
     std::string tok;           // one history token
     std::vector<int> order;
     int bucket_memo[MAX_PLAYERS][6];  // [seat][n_board], -1 = not computed in this iteration
+    // history-tree traversal: the deal of the iteration and the showdown strengths by relative seat
+    int button = 0;
+    bool strength_done = false;
+    int64_t strength[MAX_PLAYERS];
 
     ThreadCtx() { reset_bucket_memo(); }
     void reset_bucket_memo() {
         for (int s = 0; s < MAX_PLAYERS; s++)
             for (int b = 0; b < 6; b++) bucket_memo[s][b] = -1;
+        strength_done = false;
     }
 };
 
@@ -136,7 +142,8 @@ public:
 
     Trainer(const Spec& spec_, std::shared_ptr<Bucketer> bk, uint64_t seed_, bool linear_, int threads_, bool verify_keys_ = false)
         : spec(spec_), grid(spec_.grid()), bucketer(std::move(bk)), codec(spec_.n_players), linear(linear_),
-          threads(std::max(1, threads_)), seed(seed_), verify_keys(verify_keys_) {
+          threads(std::max(1, threads_)), seed(seed_), verify_keys(verify_keys_),
+          tree_(spec.stacks(), spec.sb, spec.bb, spec.ante, spec.max_street, grid, std::max(1, bucketer->identity().n_buckets)) {
         if (spec.max_street > PREFLOP && !bucketer->fitted()) throw std::invalid_argument("this spec bets postflop: pass a fitted bucketer");
         if (grid.preflop_fracs.size() > 5 || grid.postflop_fracs.size() > 5)
             throw std::invalid_argument("too many grid fractions for the C++ core (max 5 per street)");
@@ -165,6 +172,7 @@ public:
         long long base = iteration_;
         long long target = base + iterations;
         int T = threads;
+        root_ = tree_.root(nodes.epoch());
         group_.begin(T);
         // T == 1: iterations in order (bit-identical to the Python trainer).  T > 1: chunks of
         // iterations handed out dynamically, so faster cores (P vs E cores, a busy sibling
@@ -206,12 +214,16 @@ public:
     // every thread's generator (checkpoints restore them so a resumed run continues its streams)
     PyRandom& rng(int tid) { return ctxs_[tid].rng; }
 
+    size_t tree_nodes() const { return tree_.nodes(); }
+
 private:
     TableGroup group_;
     KeyChecker checker_;
     std::vector<ThreadCtx> ctxs_;
     long long iteration_ = 0;
     long long nodes_touched_ = 0;
+    HistTree tree_;
+    HistNode* root_ = nullptr;
 
     void run_iteration(long long t, ThreadCtx& ctx) {
         double weight = linear ? (double)t : 1.0;
@@ -220,11 +232,104 @@ private:
         ctx.rng.shuffle(ctx.order);
         ctx.reset_bucket_memo();  // a new deal
         int button = (int)(t % spec.n_players);
-        std::vector<int> stacks = spec.stacks();
-        for (int traverser = 0; traverser < spec.n_players; traverser++) {
-            HandState st(stacks, button, spec.sb, spec.bb, spec.ante, ctx.order.data(), spec.max_street);
-            traverse(st, HistHash(), traverser, weight, ctx);
+        ctx.button = button;
+        for (int traverser = 0; traverser < spec.n_players; traverser++) traverse_tree(root_, traverser, weight, ctx);
+    }
+
+    // ---- the traversal on the history tree (histtree.h); same numbers, same random draws as
+    // traverse() on the engine, which remains for the rare node whose stored actions differ
+    int tree_bucket(int seat, int n_board, ThreadCtx& ctx) {
+        int& slot = ctx.bucket_memo[seat][n_board];
+        if (slot < 0) slot = bucketer->bucket(&ctx.order[2 * seat], &ctx.order[2 * spec.n_players], n_board);
+        return slot;
+    }
+
+    Node* tree_node(HistNode* h, int b, ThreadCtx& ctx, bool& cached) {
+        cached = false;
+        if (b < h->n_cache && !verify_keys) {  // test mode: every visit goes through the table and the key check
+            Node* p = h->cache[b].load(std::memory_order_acquire);
+            if (p) { cached = true; return p; }
         }
+        const int n = spec.n_players;
+        FlatNodeTable::Found f = nodes.get_or_create(node_key(h->street, h->rel, h->n_active, b, h->hh), ctx.tid,
+                                                     [&](Node& nd, NodeArena& arena) {
+            nd.init(h->ids, h->na);
+            tree_key(h, b, n, ctx.key);
+            return arena.copy_key(ctx.key.data(), ctx.key.size());
+        });
+        if (verify_keys) {
+            tree_key(h, b, n, ctx.key);
+            if (std::strcmp(f.key, ctx.key.c_str()) != 0)
+                checker_.report("node found for '" + ctx.key + "' is stored as '" + f.key + "'");
+        }
+        return f.node;
+    }
+
+    static void tree_key(const HistNode* h, int b, int n, std::string& key) {
+        key.clear();
+        key += street_letter(h->street);
+        key += '|';
+        key += position_name(h->rel, 0, n);
+        key += '|';
+        key += std::to_string(h->n_active);
+        key += "|b";
+        key += std::to_string(b);
+        key += '|';
+        key += h->hist;
+    }
+
+    double traverse_tree(HistNode* h, int traverser, double weight, ThreadCtx& ctx) {
+        const int n = spec.n_players;
+        if (h->terminal) {
+            if (h->n_act > 1 && !ctx.strength_done) {
+                for (int r = 0; r < n; r++) {
+                    const int seat = (r + ctx.button) % n;
+                    int cards[7] = {ctx.order[2 * seat], ctx.order[2 * seat + 1]};
+                    for (int i = 0; i < 5; i++) cards[2 + i] = ctx.order[2 * n + i];
+                    ctx.strength[r] = evaluate(cards, 7);
+                }
+                ctx.strength_done = true;
+            }
+            const int me = ((traverser - ctx.button) % n + n) % n;
+            return (double)terminal_net(h, n, me, ctx.strength) / (double)spec.bb;
+        }
+        const int seat = (h->rel + ctx.button) % n;
+        const int b = tree_bucket(seat, h->n_board, ctx);
+        bool cached;
+        Node* node = tree_node(h, b, ctx, cached);
+        if (!cached) {
+            bool same = node->n == h->na;
+            if (same) for (int i = 0; i < h->na; i++) if (node->acts[i] != h->ids[i]) { same = false; break; }
+            if (!same) {  // a node imported with another action list: the engine traversal copes
+                HandState st = tree_.replay(h, ctx.order.data(), ctx.button);
+                return traverse(st, HistHash(), traverser, weight, ctx);
+            }
+            if (b < h->n_cache) h->cache[b].store(node, std::memory_order_release);
+        }
+        ctx.nodes_touched++;
+        const int na = h->na;
+        double sigma[MAX_ACTIONS];
+        node->lock.lock();
+        node->current_strategy(sigma);
+        node->lock.unlock();
+
+        if (seat == traverser) {
+            double utils[MAX_ACTIONS];
+            for (int i = 0; i < na; i++) utils[i] = traverse_tree(tree_.child(h, i), traverser, weight, ctx);
+            double prods[MAX_ACTIONS];
+            for (int i = 0; i < na; i++) prods[i] = sigma[i] * utils[i];
+            double u = py_sum(prods, na);
+            node->lock.lock();
+            for (int i = 0; i < na; i++) node->regret[i] += weight * (utils[i] - u);
+            node->lock.unlock();
+            return u;
+        }
+        node->lock.lock();
+        for (int i = 0; i < na; i++) node->strategy_sum[i] += weight * sigma[i];
+        node->visits += 1;
+        node->lock.unlock();
+        int a = sample(sigma, na, ctx.rng);
+        return traverse_tree(tree_.child(h, a), traverser, weight, ctx);
     }
 
     static int sample(const double* probs, int n, PyRandom& rng) {
