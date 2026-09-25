@@ -507,6 +507,9 @@ public:
     virtual bool fitted() const = 0;
     virtual int bucket(const int* hole, const int* board, int n_board) = 0;
     virtual BucketerIdentity identity() const = 0;
+    // the postflop bucket of a canonical form, computed without the cache (thread-safe, const):
+    // bucket() == bucket_of_form(canonical_form(...)) for every postflop hand (bucket tables)
+    virtual int bucket_of_form(const CanonicalForm& cf) const = 0;
     const HoleClasses& classes() const { return classes_; }
 
     // {flop, turn, river} capacities in entries (missing -> default); call before training
@@ -583,6 +586,16 @@ public:
         const std::vector<double>& cuts = boundaries[street];
         if (cuts.empty()) throw std::runtime_error("bucketer not fitted");
         double e = ehs(hole, board, n_board);
+        return (int)(std::upper_bound(cuts.begin(), cuts.end(), e) - cuts.begin());
+    }
+
+    int bucket_of_form(const CanonicalForm& cf) const override {
+        const std::vector<double>& cuts = boundaries[street_of_board(cf.n_board)];
+        if (cuts.empty()) throw std::runtime_error("bucketer not fitted");
+        uint64_t seed = (uint64_t)canonical_key_hash(cf) & 0xFFFFFFFFULL;
+        PyRandom rng(seed);
+        double won = equity_won_vs_random(cf.hole, 2, cf.board, cf.n_board, 1, samples, rng);
+        double e = decode((uint32_t)(won * 2.0));
         return (int)(std::upper_bound(cuts.begin(), cuts.end(), e) - cuts.begin());
     }
 
@@ -717,6 +730,8 @@ public:
         caches_[street].put(key, (uint32_t)b);
         return b;
     }
+
+    int bucket_of_form(const CanonicalForm& cf) const override { return bucket_canonical(cf); }
 
 private:
     int bucket_canonical(const CanonicalForm& cf) const {

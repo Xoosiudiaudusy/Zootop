@@ -35,6 +35,7 @@ from ..cfr.game import GameSpec
 from ..cfr.mccfr import MCCFRTrainer, Node
 from ..cfr.strategy import BlueprintStrategy
 from . import core, default_threads, resolve_cache_caps, verify_keys_enabled
+from .tables import tabulated
 from .blueprint import CppBlueprint, is_json_path
 
 
@@ -59,7 +60,9 @@ def core_bucketer(bucketer, cache_caps=None):
     """The C++ twin of a fitted Python bucketer (its cache starts empty): ``Bucketer`` for an
     ``EquityBucketer`` (same boundaries / sample count), ``PotentialBucketer`` for a
     ``PotentialAwareBucketer`` (same centroids, river cut points, samples, bins).
-    ``cache_caps``: (flop, turn, river) cache capacities in entries (None: env / defaults)."""
+    ``cache_caps``: (flop, turn, river) cache capacities in entries (None: env / defaults).
+    With ``NEGPLURIBUS_BUCKET_TABLES`` pointing at a directory that holds a precomputed table of
+    this bucketer (fast/tables.py), the result answers from it: same buckets, no Monte-Carlo."""
     c = core()
     caps = list(resolve_cache_caps(cache_caps))
     boundaries = {int(k): list(v) for k, v in bucketer.boundaries.items()}
@@ -67,8 +70,8 @@ def core_bucketer(bucketer, cache_caps=None):
         if not hasattr(c, "PotentialBucketer"):
             raise RuntimeError("the built C++ core predates potential-aware buckets; run `python scripts/build_fast.py`")
         centroids = {int(k): [list(cdf) for cdf in v] for k, v in bucketer.centroids.items()}
-        return c.PotentialBucketer(bucketer.n_buckets, bucketer.samples, bucketer.bins, centroids, boundaries, caps)
-    return c.Bucketer(bucketer.n_buckets, bucketer.samples, boundaries, caps)
+        return tabulated(c.PotentialBucketer(bucketer.n_buckets, bucketer.samples, bucketer.bins, centroids, boundaries, caps))
+    return tabulated(c.Bucketer(bucketer.n_buckets, bucketer.samples, boundaries, caps))
 
 
 def _to_node(row) -> Node:

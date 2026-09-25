@@ -2,15 +2,20 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <chrono>
 #include <cstring>
+#include <exception>
 #include <memory>
+#include <thread>
 #include <string>
 #include <vector>
 
 #include "abstraction.h"
+#include "buckettable.h"
 #include "engine.h"
 #include "equity.h"
 #include "evaluator.h"
+#include "handindex.h"
 #include "mccfr.h"
 #include "persist.h"
 #include "pyrandom.h"
@@ -728,7 +733,14 @@ PYBIND11_MODULE(_fastcore, m) {
         .def("set_cache_caps", [](Bucketer& b, const py::object& caps) { b.set_cache_caps(caps_from_py(caps)); },
              "capacities in entries for (flop, turn, river); call before training")
         .def_property_readonly("cache_caps", [](const Bucketer& b) { return b.cache_caps(); })
-        .def_property_readonly("fitted", &Bucketer::fitted);
+        .def_property_readonly("fitted", &Bucketer::fitted)
+        .def_property_readonly("identity", [](const Bucketer& b) {
+            const BucketerIdentity id = b.identity();
+            py::dict d;
+            d["kind"] = id.kind; d["n_buckets"] = id.n_buckets; d["samples"] = id.samples; d["bins"] = id.bins;
+            d["fingerprint"] = id.fingerprint;
+            return d;
+        }, "kind, n_buckets, samples, bins and the fingerprint of the fitted parameters");
 
     py::class_<PotentialBucketer, Bucketer, std::shared_ptr<PotentialBucketer>>(m, "PotentialBucketer")
         .def(py::init([](int n_buckets, int samples, int bins, const py::dict& centroids, const py::dict& boundaries, const py::object& cache_caps) {
@@ -792,6 +804,68 @@ PYBIND11_MODULE(_fastcore, m) {
         .def("cache_size", &EquityBucketer::cache_size)
         .def_property_readonly("n_buckets", [](const EquityBucketer& b) { return b.n_buckets; })
         .def_property_readonly("samples", [](const EquityBucketer& b) { return b.samples; });
+
+    // ---- hand classes and precomputed bucket tables (handindex.h, buckettable.h)
+    py::class_<HandIndexer, std::shared_ptr<HandIndexer>>(m, "HandIndexer")
+        .def(py::init<int>(), py::arg("n_board"))
+        .def_property_readonly("size", &HandIndexer::size)
+        .def_property_readonly("n_board", &HandIndexer::n_board)
+        .def("index", [](const HandIndexer& ix, const py::sequence& hole, const py::sequence& board) {
+            std::vector<int> h = to_cards(hole), bd = to_cards(board);
+            if (h.size() != 2 || (int)bd.size() != ix.n_board()) throw std::invalid_argument("2 hole cards and n_board board cards");
+            return ix.index(h.data(), bd.data());
+        })
+        .def("unindex", [](const HandIndexer& ix, uint64_t idx) {
+            int h[2], bd[5];
+            ix.unindex(idx, h, bd);
+            return py::make_tuple(std::vector<int>(h, h + 2), std::vector<int>(bd, bd + ix.n_board()));
+        });
+
+    py::class_<BucketTables, std::shared_ptr<BucketTables>>(m, "BucketTables")
+        .def(py::init<>())
+        .def("build", [](BucketTables& t, const Bucketer& bk, int street, int threads, const py::object& progress, double every) {
+            // runs without the GIL; `progress(done, total)` is called from this thread every `every` s
+            std::atomic<uint64_t> done{0};
+            std::atomic<bool> finished{false};
+            std::exception_ptr err;
+            std::thread worker([&] {
+                try { t.build(bk, street, threads, &done); } catch (...) { err = std::current_exception(); }
+                finished.store(true);
+            });
+            const uint64_t total = t.size(street);
+            {
+                py::gil_scoped_release nogil;
+                while (!finished.load()) {
+                    for (int i = 0; i < (int)(every * 20) && !finished.load(); i++) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    if (!finished.load() && !progress.is_none()) {
+                        py::gil_scoped_acquire g;
+                        progress(done.load(), total);
+                    }
+                }
+                worker.join();
+            }
+            if (err) std::rethrow_exception(err);
+        }, py::arg("bucketer"), py::arg("street"), py::arg("threads") = 1, py::arg("progress") = py::none(), py::arg("every") = 10.0,
+           "tabulate one street (1 flop, 2 turn, 3 river) of a fitted core bucketer")
+        .def("has", &BucketTables::has)
+        .def("size", &BucketTables::size)
+        .def("lookup", [](const BucketTables& t, const py::sequence& hole, const py::sequence& board) {
+            std::vector<int> h = to_cards(hole), bd = to_cards(board);
+            if (h.size() != 2 || bd.size() < 3 || bd.size() > 5) throw std::invalid_argument("2 hole cards and a 3..5 card board");
+            if (!t.has(street_of_board((int)bd.size()))) throw std::invalid_argument("street not tabulated");
+            return t.lookup(h.data(), bd.data(), (int)bd.size());
+        })
+        .def("save", [](const BucketTables& t, const std::string& path) { py::gil_scoped_release nogil; t.save(path); })
+        .def("load", [](BucketTables& t, const std::string& path, std::shared_ptr<Bucketer> expect) {
+            py::gil_scoped_release nogil;
+            t.load(path, expect.get());
+        }, py::arg("path"), py::arg("expect") = nullptr);
+
+    py::class_<TabulatedBucketer, Bucketer, std::shared_ptr<TabulatedBucketer>>(m, "TabulatedBucketer")
+        .def(py::init([](std::shared_ptr<Bucketer> inner, std::shared_ptr<BucketTables> tables) {
+            return std::make_shared<TabulatedBucketer>(std::move(inner), std::shared_ptr<const BucketTables>(tables));
+        }), py::arg("inner"), py::arg("tables"))
+        .def_property_readonly("inner", &TabulatedBucketer::inner);
 
     // ---- game = spec + grid + bucketer, hands driven from Python (tests, key checks)
     struct Game {
