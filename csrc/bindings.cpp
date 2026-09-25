@@ -984,8 +984,10 @@ PYBIND11_MODULE(_fastcore, m) {
             ApiLock lk(t.api_mu);
             py::dict d = table_stats_dict(t.nodes);
             d["resizes"] = t.table_resizes();
+            d["tree_nodes"] = t.tree_nodes();
+            d["tree_bytes"] = t.tree_bytes();
             return d;
-        }, "node table: size, capacity (slots), slot / node / key-string bytes, resizes")
+        }, "node table: size, capacity (slots), slot / node / key-string bytes, resizes; history tree: nodes, bytes")
         .def("rng_state", [](Trainer& t) { return state_to_py(t.rng0()); })
         .def("set_rng_state", [](Trainer& t, const py::tuple& st) { state_from_py(st, t.rng0()); })
         .def("rng_states", [](Trainer& t) { return rng_states_of(t); }, "MT state of every thread's generator")
@@ -1147,6 +1149,8 @@ PYBIND11_MODULE(_fastcore, m) {
             d["hero"] = table_stats_dict(t.hero_nodes);
             d["opp"] = table_stats_dict(t.opp_nodes);
             d["resizes"] = t.table_resizes();
+            d["tree_nodes"] = t.tree_nodes();
+            d["tree_bytes"] = t.tree_bytes();
             return d;
         })
         .def("get_hero", [](RNRTrainer& t, const std::string& key) {

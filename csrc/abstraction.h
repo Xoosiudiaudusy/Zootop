@@ -163,6 +163,17 @@ struct BetGrid {
         amount = clamp_raise(obs, raise_to_for_frac(obs, a.frac));
     }
 
+    // the abstract action with id `id` on `street`, exactly as abstract_actions() builds it
+    AbstractAction action_from_id(int street, int id) const {
+        if (id == 0) return {0, FOLD, 0.0};
+        if (id == 1) return {1, CALL, 0.0};
+        if (id == 2) return {2, ALL_IN_KIND, 0.0};
+        const std::vector<int>& ids = ids_for(street);
+        const std::vector<double>& fracs = fracs_for(street);
+        for (size_t k = 0; k < ids.size(); k++) if (ids[k] == id) return {id, RAISE, fracs[k]};
+        throw std::logic_error("unknown action id");
+    }
+
     AbstractAction action_from_name(const std::string& s) {
         if (s == "f") return {0, FOLD, 0.0};
         if (s == "c") return {1, CALL, 0.0};

@@ -101,7 +101,7 @@ inline int memo_bucket(Bucketer& bk, const HandState& st, int seat, ThreadCtx& c
 // ---- history-tree traversal helpers (histtree.h), shared by Trainer and RNRTrainer
 
 // the value of terminal `h` for absolute seat `traverser` in bb (HandState::net / bb)
-inline double tree_terminal_value(const HistNode* h, int n, int traverser, int bb, ThreadCtx& ctx) {
+inline double tree_terminal_value(const HistTerminal* h, int n, int traverser, int bb, ThreadCtx& ctx) {
     if (h->n_act > 1 && !ctx.strength_done) {  // showdown strengths: once per seat and iteration
         for (int r = 0; r < n; r++) {
             const int seat = (r + ctx.button) % n;
@@ -120,20 +120,6 @@ inline int tree_bucket(Bucketer& bk, int n_players, int seat, int n_board, Threa
     int& slot = ctx.bucket_memo[seat][n_board];
     if (slot < 0) slot = bk.bucket(&ctx.order[2 * seat], &ctx.order[2 * n_players], n_board);
     return slot;
-}
-
-// the key string infoset_key_for_bucket() spells for decision node `h` and bucket `b`
-inline void tree_key(const HistNode* h, int b, int n, std::string& key) {
-    key.clear();
-    key += street_letter(h->street);
-    key += '|';
-    key += position_name(h->rel, 0, n);
-    key += '|';
-    key += std::to_string(h->n_active);
-    key += "|b";
-    key += std::to_string(b);
-    key += '|';
-    key += h->hist;
 }
 
 // Test mode (verify_keys): the stored key string of every node a traversal reaches must equal the
@@ -186,6 +172,7 @@ public:
         if (grid.preflop_fracs.size() > 5 || grid.postflop_fracs.size() > 5)
             throw std::invalid_argument("too many grid fractions for the C++ core (max 5 per street)");
         nodes.set_arenas(threads + 1);  // one per worker, one for imports (main_arena())
+        nodes.set_dense(true);          // reached through the history tree's pointer caches
         nodes.attach(&group_);
         group_.add(&nodes);
         ctxs_.resize(threads);
@@ -253,6 +240,7 @@ public:
     PyRandom& rng(int tid) { return ctxs_[tid].rng; }
 
     size_t tree_nodes() const { return tree_.nodes(); }
+    size_t tree_bytes() const { return tree_.bytes(); }
 
 private:
     TableGroup group_;
@@ -276,18 +264,17 @@ private:
 
     // ---- the traversal on the history tree (histtree.h); same numbers, same random draws as
     // traverse() on the engine, which remains for the rare node whose stored actions differ
-    Node* tree_node(HistNode* h, int b, ThreadCtx& ctx, bool& cached) {
+    Node* tree_node(HistDecision* h, int b, ThreadCtx& ctx, bool& cached) {
         cached = false;
         if (b < h->n_cache && !verify_keys) {  // test mode: every visit goes through the table and the key check
-            Node* p = h->cache[b].load(std::memory_order_acquire);
+            Node* p = h->cache()[b].load(std::memory_order_acquire);
             if (p) { cached = true; return p; }
         }
         const int n = spec.n_players;
         FlatNodeTable::Found f = nodes.get_or_create(node_key(h->street, h->rel, h->n_active, b, h->hh), ctx.tid, h->na,
-                                                     [&](Node& nd, NodeArena& arena) {
+                                                     [&](Node& nd, NodeArena&) {
             nd.init(h->ids, h->na);
-            tree_key(h, b, n, ctx.key);
-            return arena.copy_key(ctx.key.data(), ctx.key.size());
+            return nd.refer_to_tree(h, b);  // key string spelled on demand from the tree (no copy)
         });
         if (verify_keys) {
             tree_key(h, b, n, ctx.key);
@@ -297,9 +284,10 @@ private:
         return f.node;
     }
 
-    double traverse_tree(HistNode* h, int traverser, double weight, ThreadCtx& ctx) {
+    double traverse_tree(HistNode* node_h, int traverser, double weight, ThreadCtx& ctx) {
         const int n = spec.n_players;
-        if (h->terminal) return tree_terminal_value(h, n, traverser, spec.bb, ctx);
+        if (node_h->terminal) return tree_terminal_value(static_cast<const HistTerminal*>(node_h), n, traverser, spec.bb, ctx);
+        HistDecision* h = static_cast<HistDecision*>(node_h);
         const int seat = (h->rel + ctx.button) % n;
         const int b = tree_bucket(*bucketer, n, seat, h->n_board, ctx);
         bool cached;
@@ -311,7 +299,7 @@ private:
                 HandState st = tree_.replay(h, ctx.order.data(), ctx.button);
                 return traverse(st, HistHash(), traverser, weight, ctx);
             }
-            if (b < h->n_cache) h->cache[b].store(node, std::memory_order_release);
+            if (b < h->n_cache) h->cache()[b].store(node, std::memory_order_release);
         }
         ctx.nodes_touched++;
         const int na = h->na;
