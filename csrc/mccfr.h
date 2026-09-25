@@ -80,6 +80,9 @@ struct alignas(64) ThreadCtx {  // one cache line boundary per thread: no false 
     int bucket_memo[MAX_PLAYERS][6];  // [seat][n_board], -1 = not computed in this iteration
     // history-tree traversal: the deal of the iteration and the showdown strengths by relative seat
     int button = 0;
+    bool prune = false;        // this iteration prunes (Trainer::prune_below)
+    double prune_limit = 0.0;  // regrets below this are pruned
+    long long pruned = 0;      // actions skipped
     bool strength_done = false;
     int64_t strength[MAX_PLAYERS];
 
@@ -162,6 +165,16 @@ public:
     int threads = 1;
     uint64_t seed = 0;
     bool verify_keys = false;  // test mode, see KeyChecker
+    // Regret-based pruning (Pluribus, Brown & Sandholm 2019, supplement): in a share `prune_prob` of the
+    // iterations after `prune_after`, the traverser does not explore an action whose accumulated
+    // regret is below -prune_below (the stored units: bb x iteration weight; Pluribus: -300,000,000
+    // in its own units); never on the last betting street (unless prune_last_street, for
+    // measurements on one-street games), never an action that ends the hand, and never every action
+    // of a node.  prune_below <= 0: off (the default; then nothing changes, not even the draws).
+    double prune_below = 0.0;
+    double prune_prob = 0.95;
+    long long prune_after = 0;
+    bool prune_last_street = false;
     std::mutex api_mu;         // held by train() and by the Python-facing table accessors (bindings)
 
     Trainer(const Spec& spec_, std::shared_ptr<Bucketer> bk, uint64_t seed_, bool linear_, int threads_, bool verify_keys_ = false)
@@ -229,10 +242,11 @@ public:
         group_.end();
         iteration_ = target;
         long long touched = 0;
-        for (auto& c : ctxs_) { touched += c.nodes_touched; c.nodes_touched = 0; }
+        for (auto& c : ctxs_) { touched += c.nodes_touched; c.nodes_touched = 0; pruned_ += c.pruned; c.pruned = 0; }
         nodes_touched_ += touched;
         checker_.rethrow();
     }
+    long long pruned_actions() const { return pruned_; }
 
     // RNG state of thread 0 (interop with random.Random.getstate()/setstate())
     PyRandom& rng0() { return ctxs_[0].rng; }
@@ -250,6 +264,7 @@ private:
     long long nodes_touched_ = 0;
     HistTree tree_;
     HistNode* root_ = nullptr;
+    long long pruned_ = 0;
 
     void run_iteration(long long t, ThreadCtx& ctx) {
         double weight = linear ? (double)t : 1.0;
@@ -259,6 +274,12 @@ private:
         ctx.reset_bucket_memo();  // a new deal
         int button = (int)(t % spec.n_players);
         ctx.button = button;
+        ctx.prune_limit = 0.0;
+        ctx.prune = false;
+        if (prune_below > 0.0 && t > prune_after && ctx.rng.random() < prune_prob) {
+            ctx.prune = true;
+            ctx.prune_limit = -prune_below;
+        }
         for (int traverser = 0; traverser < spec.n_players; traverser++) traverse_tree(root_, traverser, weight, ctx);
     }
 
@@ -304,18 +325,32 @@ private:
         ctx.nodes_touched++;
         const int na = h->na;
         double sigma[MAX_ACTIONS];
+        double reg[MAX_ACTIONS];
+        const bool prune_here = ctx.prune && seat == traverser && (prune_last_street || h->street < spec.max_street);
         node->lock.lock();
         node->current_strategy(sigma);
+        if (prune_here) for (int i = 0; i < na; i++) reg[i] = node->regret()[i];
         node->lock.unlock();
 
         if (seat == traverser) {
             double utils[MAX_ACTIONS];
-            for (int i = 0; i < na; i++) utils[i] = traverse_tree(tree_.child(h, i), traverser, weight, ctx);
+            bool explore[MAX_ACTIONS];
+            int n_explore = 0;
+            for (int i = 0; i < na; i++) {
+                explore[i] = true;
+                if (prune_here && reg[i] < ctx.prune_limit && !tree_.child(h, i)->terminal) explore[i] = false;
+                n_explore += explore[i];
+            }
+            if (n_explore == 0) for (int i = 0; i < na; i++) explore[i] = true;
+            for (int i = 0; i < na; i++) {
+                if (explore[i]) utils[i] = traverse_tree(tree_.child(h, i), traverser, weight, ctx);
+                else { utils[i] = 0.0; ctx.pruned++; }
+            }
             double prods[MAX_ACTIONS];
-            for (int i = 0; i < na; i++) prods[i] = sigma[i] * utils[i];
+            for (int i = 0; i < na; i++) prods[i] = explore[i] ? sigma[i] * utils[i] : 0.0;
             double u = py_sum(prods, na);
             node->lock.lock();
-            for (int i = 0; i < na; i++) node->regret()[i] += weight * (utils[i] - u);
+            for (int i = 0; i < na; i++) if (explore[i]) node->regret()[i] += weight * (utils[i] - u);
             node->lock.unlock();
             return u;
         }

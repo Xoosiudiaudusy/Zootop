@@ -147,6 +147,20 @@ class CppMCCFRTrainer(MCCFRTrainer):
                                     verify_keys=verify_keys_enabled())
         self._view = NodeView(lambda: self._core.n_nodes, self._core.get_node, self._core.keys, self._core.export_nodes)
 
+    def set_pruning(self, below: float, prob: float = 0.95, after: int = 0, last_street: bool = False) -> "CppMCCFRTrainer":
+        """Regret-based pruning as in Pluribus (off by default, ``below=0``): in a share ``prob`` of the
+        iterations after ``after``, the traverser skips actions whose accumulated regret is below
+        ``-below`` (stored units: bb x iteration weight; Pluribus used 300,000,000 in its units), except
+        on the last betting street (``last_street=True`` allows it there, for measurements on one-street
+        games) and except actions that end the hand.  Changes the algorithm: judge it by the result
+        (exploitability, duels), not bit for bit."""
+        self._core.set_pruning(float(below), float(prob), int(after), bool(last_street))
+        return self
+
+    @property
+    def pruned_actions(self) -> int:
+        return self._core.pruned_actions
+
     # ------------------------------------------------------------ state mirrors
     def _ready(self) -> bool:
         return "_core" in self.__dict__

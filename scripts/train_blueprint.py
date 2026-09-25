@@ -92,6 +92,11 @@ def main() -> None:
     ap.add_argument("--json", action="store_true", help="C++ backend: also write the JSON files next to the binary ones")
     ap.add_argument("--no-l1", action="store_true",
                     help="skip the L1-change diagnostic at checkpoints (C++ backend: frees the ~60 bytes per infoset it keeps between checkpoints)")
+    ap.add_argument("--prune-below", type=float, default=0.0,
+                    help="C++ backend: regret-based pruning (Pluribus) of actions whose accumulated regret is below -X "
+                         "(stored units: bb x iteration weight; Pluribus 3e8; 0 = off, the default); changes the algorithm, judge by the result")
+    ap.add_argument("--prune-prob", type=float, default=0.95, help="share of iterations that prune (Pluribus: 0.95)")
+    ap.add_argument("--prune-after", type=int, default=0, help="iterations before pruning starts")
     ap.add_argument("--data-dir", default=DATA, help="where buckets / checkpoints / blueprints go (default data/)")
     args = ap.parse_args()
     no_throttle = disable_power_throttling()  # scheduling only, results unchanged
@@ -129,6 +134,11 @@ def main() -> None:
     trainer = MCCFRTrainer(spec, bucketer, seed=args.seed, linear=not args.no_linear, backend=args.backend, threads=args.threads,
                            cache_caps=args.bucket_cache)
     cpp = trainer.backend == "cpp"
+    if args.prune_below > 0:
+        if not cpp:
+            raise SystemExit("--prune-below needs --backend cpp")
+        trainer.set_pruning(args.prune_below, args.prune_prob, args.prune_after)
+        print(f"pruning: regret below -{args.prune_below:g}, {args.prune_prob:.0%} of iterations after {args.prune_after:,}")
     ext = ".bin" if cpp and args.format == "bin" else ".json"
     bp_path = os.path.join(data, f"blueprint_{tag}{ext}")
     ck_path = os.path.join(data, f"checkpoint_{tag}{ext}")
