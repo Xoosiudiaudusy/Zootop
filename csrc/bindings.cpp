@@ -177,8 +177,8 @@ static py::dict export_table(FlatNodeTable& nodes, const BetGrid& grid) {
         py::list acts, reg, ss;
         for (int i = 0; i < n.n; i++) {
             acts.append(grid.names[n.acts[i]]);
-            reg.append(n.regret[i]);
-            ss.append(n.strategy_sum[i]);
+            reg.append(n.regret()[i]);
+            ss.append(n.strategy_sum()[i]);
         }
         out[py::str(key)] = py::make_tuple(acts, reg, ss, n.visits);
     });
@@ -218,7 +218,7 @@ static void import_table(FlatNodeTable& nodes, const KeyCodec& codec, int arena,
         Node* n = get_or_create_by_string(nodes, codec, key, r.ids, k, arena).node;
         n->lock.lock();
         n->init(r.ids, k);
-        for (int i = 0; i < k; i++) { n->regret[i] = r.reg[i]; n->strategy_sum[i] = r.ss[i]; }
+        for (int i = 0; i < k; i++) { n->regret()[i] = r.reg[i]; n->strategy_sum()[i] = r.ss[i]; }
         n->visits = r.visits;
         n->lock.unlock();
     }
@@ -231,7 +231,7 @@ static void add_table(FlatNodeTable& nodes, const KeyCodec& codec, int arena, Be
         NodeRow r = node_row(key, kv.second, grid);
         Node* n = get_or_create_by_string(nodes, codec, key, r.ids, (int)r.acts.size(), arena).node;
         n->lock.lock();
-        for (size_t i = 0; i < r.acts.size() && i < n->n; i++) { n->regret[i] += r.reg[i]; n->strategy_sum[i] += r.ss[i]; }
+        for (size_t i = 0; i < r.acts.size() && i < n->n; i++) { n->regret()[i] += r.reg[i]; n->strategy_sum()[i] += r.ss[i]; }
         n->visits += r.visits;
         n->lock.unlock();
     }
@@ -297,7 +297,7 @@ static py::dict table_stress(int threads, int n_keys, int rounds, size_t initial
             for (int i = 0; i < n_keys; i++) order[i] = i;
             rng.shuffle(order);
             for (int idx : order) {
-                FlatNodeTable::Found f = table.get_or_create(nks[idx], tid, [&](Node& n, NodeArena& a) {
+                FlatNodeTable::Found f = table.get_or_create(nks[idx], tid, 1, [&](Node& n, NodeArena& a) {
                     n.init(ids, 1);
                     return a.copy_key(keys[idx].data(), keys[idx].size());
                 });
@@ -371,8 +371,8 @@ static py::object node_to_py(Node* n, const BetGrid& grid) {
     n->lock.lock();
     for (int i = 0; i < n->n; i++) {
         acts.append(grid.names[n->acts[i]]);
-        reg.append(n->regret[i]);
-        ss.append(n->strategy_sum[i]);
+        reg.append(n->regret()[i]);
+        ss.append(n->strategy_sum()[i]);
     }
     long long visits = n->visits;
     n->lock.unlock();

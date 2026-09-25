@@ -186,7 +186,7 @@ private:
         }
         const int n = spec.n_players;
         FlatNodeTable& table = is_hero ? hero_nodes : opp_nodes;
-        FlatNodeTable::Found f = table.get_or_create(nk, ctx.tid, [&](Node& node, NodeArena& arena) {
+        FlatNodeTable::Found f = table.get_or_create(nk, ctx.tid, h->na, [&](Node& node, NodeArena& arena) {
             node.init(h->ids, h->na);
             tree_key(h, b, n, ctx.key);
             if (!warm_start.empty() && warm_visits > 0) {
@@ -199,8 +199,8 @@ private:
                         double mean_w = linear ? std::max(1.0, (double)planned_iters / 2.0) : 1.0;
                         double w = warm_visits * mean_w;
                         for (int i = 0; i < actions.n; i++) {
-                            node.regret[i] = w * regret_scale_bb * base[i];
-                            node.strategy_sum[i] = w * base[i];
+                            node.regret()[i] = w * regret_scale_bb * base[i];
+                            node.strategy_sum()[i] = w * base[i];
                         }
                     }
                 }
@@ -247,7 +247,7 @@ private:
             for (int i = 0; i < na; i++) prods[i] = sigma[i] * utils[i];
             double u = py_sum(prods, na);
             node->lock.lock();
-            for (int i = 0; i < na; i++) node->regret[i] += weight * (utils[i] - u);
+            for (int i = 0; i < na; i++) node->regret()[i] += weight * (utils[i] - u);
             node->lock.unlock();
             return u;
         }
@@ -259,7 +259,7 @@ private:
             if (model_policy(nk, actions, probs, verify_keys ? &ctx.key : nullptr)) use = probs;
         } else {
             node->lock.lock();
-            for (int i = 0; i < na; i++) node->strategy_sum[i] += weight * sigma[i];
+            for (int i = 0; i < na; i++) node->strategy_sum()[i] += weight * sigma[i];
             node->lock.unlock();
         }
         int a = sample(use, na, ctx.rng);
@@ -281,7 +281,7 @@ private:
                                  const Obs& obs, int bucket, ThreadCtx& ctx) {
         uint8_t ids[MAX_ACTIONS];
         for (int i = 0; i < actions.n; i++) ids[i] = (uint8_t)actions.a[i].id;
-        return table.get_or_create(nk, ctx.tid, [&](Node& node, NodeArena& arena) {
+        return table.get_or_create(nk, ctx.tid, actions.n, [&](Node& node, NodeArena& arena) {
             node.init(ids, actions.n);
             infoset_key_for_bucket(st, obs, bucket, grid, ctx.key, ctx.hist);
             if (!warm_start.empty() && warm_visits > 0) {
@@ -292,8 +292,8 @@ private:
                         double mean_w = linear ? std::max(1.0, (double)planned_iters / 2.0) : 1.0;
                         double w = warm_visits * mean_w;
                         for (int i = 0; i < actions.n; i++) {
-                            node.regret[i] = w * regret_scale_bb * base[i];
-                            node.strategy_sum[i] = w * base[i];
+                            node.regret()[i] = w * regret_scale_bb * base[i];
+                            node.strategy_sum()[i] = w * base[i];
                         }
                     }
                 }
@@ -361,7 +361,7 @@ private:
             for (int i = 0; i < na; i++) prods[i] = sigma[i] * utils[i];
             double u = py_sum(prods, na);
             node->lock.lock();
-            for (int i = 0; i < na; i++) node->regret[i] += weight * (utils[i] - u);
+            for (int i = 0; i < na; i++) node->regret()[i] += weight * (utils[i] - u);
             node->lock.unlock();
             return u;
         }
@@ -372,7 +372,7 @@ private:
             if (model_policy(nk, actions, probs, verify_keys ? &ctx.key : nullptr)) use = probs;
         } else {
             node->lock.lock();
-            for (int i = 0; i < na; i++) node->strategy_sum[i] += weight * sigma[i];
+            for (int i = 0; i < na; i++) node->strategy_sum()[i] += weight * sigma[i];
             node->lock.unlock();
         }
         int a = sample(use, na, ctx.rng);

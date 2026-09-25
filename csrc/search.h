@@ -485,8 +485,8 @@ public:
         if (c < 0 || class_of_[(size_t)c] < 0) return false;
         const FlatNodeTable::Found f = table_->find(search_key(root_street_, st.to_act, class_of_[(size_t)c], ph));
         if (!f.node) return false;
-        regret.assign(f.node->regret, f.node->regret + f.node->n);
-        ssum.assign(f.node->strategy_sum, f.node->strategy_sum + f.node->n);
+        regret.assign(f.node->regret(), f.node->regret() + f.node->n);
+        ssum.assign(f.node->strategy_sum(), f.node->strategy_sum() + f.node->n);
         visits = f.node->visits;
         return true;
     }
@@ -992,7 +992,7 @@ private:
         NodeActions na;
         build_actions(st, obs, path_node ? &path_[(size_t)k] : nullptr, na);
         const NodeKey key = search_key(st.street, seat, card_part(st, seat, ctx), ph);
-        Node* node = table_->get_or_create(key, ctx.tid, [&](Node& nd, NodeArena&) {
+        Node* node = table_->get_or_create(key, ctx.tid, na.n, [&](Node& nd, NodeArena&) {
             nd.init(na.id, na.n);
             return "";
         }).node;
@@ -1029,13 +1029,13 @@ private:
             for (int i = 0; i < na.n; i++) u += sigma[i] * utils[i];
             const double w = weight * w_imp;
             node->lock.lock();
-            for (int i = 0; i < na.n; i++) node->regret[i] += w * (utils[i] - u);
+            for (int i = 0; i < na.n; i++) node->regret()[i] += w * (utils[i] - u);
             node->lock.unlock();
             return u;
         }
         if (!focused) {
             node->lock.lock();
-            for (int i = 0; i < na.n; i++) node->strategy_sum[i] += weight * sigma[i];
+            for (int i = 0; i < na.n; i++) node->strategy_sum()[i] += weight * sigma[i];
             node->visits += 1;
             node->lock.unlock();
         }

@@ -283,7 +283,7 @@ private:
             if (p) { cached = true; return p; }
         }
         const int n = spec.n_players;
-        FlatNodeTable::Found f = nodes.get_or_create(node_key(h->street, h->rel, h->n_active, b, h->hh), ctx.tid,
+        FlatNodeTable::Found f = nodes.get_or_create(node_key(h->street, h->rel, h->n_active, b, h->hh), ctx.tid, h->na,
                                                      [&](Node& nd, NodeArena& arena) {
             nd.init(h->ids, h->na);
             tree_key(h, b, n, ctx.key);
@@ -327,12 +327,12 @@ private:
             for (int i = 0; i < na; i++) prods[i] = sigma[i] * utils[i];
             double u = py_sum(prods, na);
             node->lock.lock();
-            for (int i = 0; i < na; i++) node->regret[i] += weight * (utils[i] - u);
+            for (int i = 0; i < na; i++) node->regret()[i] += weight * (utils[i] - u);
             node->lock.unlock();
             return u;
         }
         node->lock.lock();
-        for (int i = 0; i < na; i++) node->strategy_sum[i] += weight * sigma[i];
+        for (int i = 0; i < na; i++) node->strategy_sum()[i] += weight * sigma[i];
         node->visits += 1;
         node->lock.unlock();
         int a = sample(sigma, na, ctx.rng);
@@ -361,7 +361,7 @@ private:
         int na = actions.n;
         for (int i = 0; i < na; i++) ids[i] = (uint8_t)actions.a[i].id;
         const int b = memo_bucket(*bucketer, st, seat, ctx);
-        FlatNodeTable::Found f = nodes.get_or_create(codec.key(obs, st.button, b, hh), ctx.tid, [&](Node& n, NodeArena& arena) {
+        FlatNodeTable::Found f = nodes.get_or_create(codec.key(obs, st.button, b, hh), ctx.tid, na, [&](Node& n, NodeArena& arena) {
             n.init(ids, na);
             infoset_key_for_bucket(st, obs, b, grid, ctx.key, ctx.hist);
             return arena.copy_key(ctx.key.data(), ctx.key.size());
@@ -395,12 +395,12 @@ private:
             for (int i = 0; i < na; i++) prods[i] = sigma[i] * utils[i];
             double u = py_sum(prods, na);
             node->lock.lock();
-            for (int i = 0; i < na; i++) node->regret[i] += weight * (utils[i] - u);
+            for (int i = 0; i < na; i++) node->regret()[i] += weight * (utils[i] - u);
             node->lock.unlock();
             return u;
         }
         node->lock.lock();
-        for (int i = 0; i < na; i++) node->strategy_sum[i] += weight * sigma[i];
+        for (int i = 0; i < na; i++) node->strategy_sum()[i] += weight * sigma[i];
         node->visits += 1;
         node->lock.unlock();
         int a = sample(sigma, na, ctx.rng);
