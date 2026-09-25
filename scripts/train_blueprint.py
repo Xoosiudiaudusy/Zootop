@@ -101,6 +101,9 @@ def main() -> None:
     ap.add_argument("--prune-scale-t", action="store_true", help="the pruning threshold is --prune-below x t")
     ap.add_argument("--regret-floor", type=float, default=0.0,
                     help="clamp regrets at this factor x the pruning threshold (Pluribus: 310/300 = 1.033; 0 = off)")
+    ap.add_argument("--batch", type=int, default=0,
+                    help="C++ backend: batched synchronous mode (CPU reference of the GPU trainer): B iterations per strategy "
+                         "snapshot, updates applied after each batch in a fixed order; checkpoints on multiples of B; 0 = off")
     ap.add_argument("--linear-until", type=int, default=0,
                     help="C++ backend: Linear CFR weights stop growing after this iteration (Pluribus-style schedule; 0 = always linear)")
     ap.add_argument("--prune-after", type=int, default=0, help="iterations before pruning starts")
@@ -141,6 +144,11 @@ def main() -> None:
     trainer = MCCFRTrainer(spec, bucketer, seed=args.seed, linear=not args.no_linear, backend=args.backend, threads=args.threads,
                            cache_caps=args.bucket_cache)
     cpp = trainer.backend == "cpp"
+    if args.batch > 0:
+        if not cpp:
+            raise SystemExit("--batch needs --backend cpp")
+        trainer.set_batch(args.batch)
+        print(f"batched mode: {args.batch:,} iterations per strategy snapshot (Philox deals)")
     if args.linear_until > 0:
         if not cpp:
             raise SystemExit("--linear-until needs --backend cpp")

@@ -33,6 +33,7 @@
 #include "engine.h"
 #include "histtree.h"
 #include "nodetable.h"
+#include "philox.h"
 #include "pyrandom.h"
 
 namespace negp {
@@ -86,6 +87,19 @@ struct alignas(64) ThreadCtx {  // one cache line boundary per thread: no false 
     long long pruned = 0;      // actions skipped
     bool strength_done = false;
     int64_t strength[MAX_PLAYERS];
+
+    // batched mode (Trainer::batch_size): the updates of this thread's iterations of the current batch
+    struct Upd {
+        uint64_t k1, k2;   // node key: the sort order that makes the application deterministic
+        long long t;       // iteration
+        uint32_t seq;      // order within the iteration's traversals
+        uint16_t a;        // action (visits: 0)
+        uint8_t kind;      // 0 regret, 1 strategy sum, 2 visits
+        double v;
+        Node* node;
+    };
+    std::vector<Upd> upd;
+    uint32_t upd_seq = 0;
 
     ThreadCtx() { reset_bucket_memo(); }
     void reset_bucket_memo() {
@@ -219,7 +233,17 @@ public:
     // run `iterations` iterations on `threads` threads
     static constexpr long long ITER_CHUNK = 16;
 
+    // Batched synchronous mode (batch_size > 0; the CPU reference of the GPU trainer): the iterations of
+    // a batch all read the strategy of the tables as they were at the start of the batch; their updates
+    // are recorded and applied after the batch, summed per cell in the order (node key, kind, action,
+    // iteration, sequence), so the result does not depend on the number of threads or their schedule.
+    // Deals and samples come from Philox4x32-10 addressed by (seed, iteration, ...) (philox.h).  Another
+    // algorithm than the sequential trainer when batch_size > 1 (every iteration of a batch sees the
+    // same strategy); judge it by the result.  Pruning is not supported in this mode.
+    long long batch_size = 0;
+
     void train(long long iterations) {
+        if (batch_size > 0) { train_batched(iterations); return; }
         long long base = iteration_;
         long long target = base + iterations;
         int T = threads;
@@ -261,6 +285,58 @@ public:
     }
     long long pruned_actions() const { return pruned_; }
 
+    void train_batched(long long iterations) {
+        if (prune_below > 0.0) throw std::invalid_argument("pruning is not supported in batched mode");
+        const long long target = iteration_ + iterations;
+        const int T = threads;
+        root_ = tree_.root(nodes.epoch());
+        std::vector<ThreadCtx::Upd> all;
+        while (iteration_ < target) {
+            const long long lo = iteration_ + 1;
+            // batches are aligned on absolute iterations (1..B, B+1..2B, ...): a run split into several
+            // train() calls or resumed from a checkpoint forms the same batches
+            const long long hi = std::min(target, (iteration_ / batch_size + 1) * batch_size);
+            // phase 1: traverse, reading the tables only (nodes may be created)
+            group_.begin(T);
+            std::atomic<long long> next{lo};
+            auto work = [&](int tid) {
+                ThreadCtx& ctx = ctxs_[tid];
+                for (long long t = next.fetch_add(1); t <= hi; t = next.fetch_add(1)) run_iteration_batched(t, ctx);
+                group_.leave();
+            };
+            if (T == 1) {
+                work(0);
+            } else {
+                std::vector<std::thread> pool;
+                for (int t = 1; t < T; t++) pool.emplace_back(work, t);
+                work(0);
+                for (auto& th : pool) th.join();
+            }
+            group_.end();
+            // phase 2: apply the updates in a fixed order
+            all.clear();
+            for (auto& c : ctxs_) { all.insert(all.end(), c.upd.begin(), c.upd.end()); c.upd.clear(); }
+            std::sort(all.begin(), all.end(), [](const ThreadCtx::Upd& x, const ThreadCtx::Upd& y) {
+                if (x.k1 != y.k1) return x.k1 < y.k1;
+                if (x.k2 != y.k2) return x.k2 < y.k2;
+                if (x.kind != y.kind) return x.kind < y.kind;
+                if (x.a != y.a) return x.a < y.a;
+                if (x.t != y.t) return x.t < y.t;
+                return x.seq < y.seq;
+            });
+            for (const ThreadCtx::Upd& u : all) {
+                if (u.kind == 0) u.node->regret()[u.a] += u.v;
+                else if (u.kind == 1) u.node->strategy_sum()[u.a] += u.v;
+                else u.node->visits += 1;
+            }
+            iteration_ = hi;
+        }
+        long long touched = 0;
+        for (auto& c : ctxs_) { touched += c.nodes_touched; c.nodes_touched = 0; }
+        nodes_touched_ += touched;
+        checker_.rethrow();
+    }
+
     // RNG state of thread 0 (interop with random.Random.getstate()/setstate())
     PyRandom& rng0() { return ctxs_[0].rng; }
     // every thread's generator (checkpoints restore them so a resumed run continues its streams)
@@ -301,6 +377,60 @@ private:
             }
         }
         for (int traverser = 0; traverser < spec.n_players; traverser++) traverse_tree(root_, traverser, weight, ctx);
+    }
+
+    void run_iteration_batched(long long t, ThreadCtx& ctx) {
+        const double weight = linear ? (double)(linear_until > 0 && t > linear_until ? linear_until : t) : 1.0;
+        ctx.order.resize(52);
+        philox_deal(seed, (uint64_t)t, ctx.order.data());
+        ctx.reset_bucket_memo();
+        ctx.button = (int)(t % spec.n_players);
+        ctx.upd_seq = 0;
+        for (int traverser = 0; traverser < spec.n_players; traverser++) {
+            PhiloxStream rs(seed, (uint64_t)t, 1u + (uint32_t)traverser);
+            traverse_batched(root_, traverser, weight, t, rs, ctx);
+        }
+    }
+
+    // the tree traversal of batched mode: reads the tables, records the updates (see batch_size)
+    double traverse_batched(HistNode* node_h, int traverser, double weight, long long t, PhiloxStream& rs, ThreadCtx& ctx) {
+        const int n = spec.n_players;
+        if (node_h->terminal) return tree_terminal_value(static_cast<const HistTerminal*>(node_h), n, traverser, spec.bb, ctx);
+        HistDecision* h = static_cast<HistDecision*>(node_h);
+        const int seat = (h->rel + ctx.button) % n;
+        const int b = tree_bucket(*bucketer, n, seat, h->n_board, ctx);
+        bool cached;
+        Node* node = tree_node(h, b, ctx, cached);
+        if (!cached) {
+            bool same = node->n == h->na;
+            if (same) for (int i = 0; i < h->na; i++) if (node->acts[i] != h->ids[i]) { same = false; break; }
+            if (!same) throw std::runtime_error("batched mode: a node with another action list (imported table?)");
+            if (b < h->n_cache) h->cache()[b].store(node, std::memory_order_release);
+        }
+        const NodeKey nk = node_key(h->street, h->rel, h->n_active, b, h->hh);
+        ctx.nodes_touched++;
+        const int na = h->na;
+        double sigma[MAX_ACTIONS];
+        node->current_strategy(sigma);  // no writer during the traversal phase
+        if (seat == traverser) {
+            double utils[MAX_ACTIONS];
+            for (int i = 0; i < na; i++) utils[i] = traverse_batched(tree_.child(h, i), traverser, weight, t, rs, ctx);
+            double prods[MAX_ACTIONS];
+            for (int i = 0; i < na; i++) prods[i] = sigma[i] * utils[i];
+            const double u = py_sum(prods, na);
+            for (int i = 0; i < na; i++) ctx.upd.push_back({nk.k1, nk.k2, t, ctx.upd_seq++, (uint16_t)i, 0, weight * (utils[i] - u), node});
+            return u;
+        }
+        for (int i = 0; i < na; i++) ctx.upd.push_back({nk.k1, nk.k2, t, ctx.upd_seq++, (uint16_t)i, 1, weight * sigma[i], node});
+        ctx.upd.push_back({nk.k1, nk.k2, t, ctx.upd_seq++, 0, 2, 0.0, node});
+        const double r = rs.uniform01();
+        int a = na - 1;
+        double acc = 0.0;
+        for (int i = 0; i < na; i++) {
+            acc += sigma[i];
+            if (r < acc) { a = i; break; }
+        }
+        return traverse_batched(tree_.child(h, a), traverser, weight, t, rs, ctx);
     }
 
     // ---- the traversal on the history tree (histtree.h); same numbers, same random draws as

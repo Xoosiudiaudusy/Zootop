@@ -18,6 +18,7 @@
 #include "handindex.h"
 #include "mccfr.h"
 #include "persist.h"
+#include "philox.h"
 #include "pyrandom.h"
 #include "bucketcache.h"
 #include "rnr.h"
@@ -724,6 +725,18 @@ PYBIND11_MODULE(_fastcore, m) {
         return py::make_tuple(std::vector<int>(counts, counts + bins), mean);
     }, "next-street E[HS] histogram (counts over `bins`, mean equity) as abstraction/potential.py computes it");
 
+    m.def("philox4x32_10", [](std::vector<uint32_t> ctr, std::vector<uint32_t> key) {
+        if (ctr.size() != 4 || key.size() != 2) throw std::invalid_argument("counter of 4 words, key of 2");
+        Philox4x32 c;
+        for (int i = 0; i < 4; i++) c.v[i] = ctr[i];
+        const Philox4x32 r = philox4x32_10(c, key[0], key[1]);
+        return std::vector<uint32_t>(r.v, r.v + 4);
+    }, "one Philox4x32-10 block (known-answer tests)");
+    m.def("philox_deal", [](uint64_t seed, uint64_t t) {
+        int order[52];
+        philox_deal(seed, t, order);
+        return std::vector<int>(order, order + 52);
+    });
     m.def("count_betting_tree", [](const py::dict& spec_d, long long limit) {
         // size of the abstract betting tree (button 0): decision histories and actions per street,
         // terminals; stops after `limit` decision histories (then "complete" is False)
@@ -1075,6 +1088,12 @@ PYBIND11_MODULE(_fastcore, m) {
            "regret-based pruning (Pluribus): skip actions with regret < -below (stored units), or with relative=True below "
            "-below bb per unit of the node's own traverser weight; below = 0 turns it off")
         .def_property_readonly("pruned_actions", &Trainer::pruned_actions)
+        .def_property("batch_size", [](const Trainer& t) { return t.batch_size; },
+                      [](Trainer& t, long long v) {
+                          ApiLock lk(t.api_mu);
+                          if (v < 0) throw std::invalid_argument("batch_size >= 0");
+                          t.batch_size = v;
+                      }, "> 0: batched synchronous mode (CPU reference of the GPU trainer); 0: the sequential trainer")
         .def_property("linear_until", [](const Trainer& t) { return t.linear_until; },
                       [](Trainer& t, long long v) {
                           ApiLock lk(t.api_mu);

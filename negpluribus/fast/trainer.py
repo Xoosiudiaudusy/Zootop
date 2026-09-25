@@ -164,6 +164,14 @@ class CppMCCFRTrainer(MCCFRTrainer):
         self._core.set_pruning(float(below), float(prob), int(after), bool(last_street), bool(relative), bool(scale_t), float(floor))
         return self
 
+    def set_batch(self, batch_size: int) -> "CppMCCFRTrainer":
+        """Batched synchronous mode (the CPU reference of the GPU trainer): the iterations of a batch of
+        ``batch_size`` all read the strategy as it was at the start of the batch, and their updates are
+        applied after it in a fixed order (deterministic for any thread count); deals and samples come
+        from Philox4x32-10.  0 (the default): the sequential trainer.  Changes the algorithm."""
+        self._core.batch_size = int(batch_size)
+        return self
+
     def set_linear_until(self, iterations: int) -> "CppMCCFRTrainer":
         """Linear CFR weights stop growing after ``iterations`` (Pluribus stopped its linear discounting
         after 400 minutes); 0 (the default) keeps Linear CFR for the whole run.  Changes the algorithm."""
