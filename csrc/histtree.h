@@ -43,8 +43,8 @@ struct HistNode {
     std::atomic<HistNode*> child[MAX_ACTIONS];
     HistHash hh;                     // hash of the history text (numeric key, nodetable.h)
     const char* hist = nullptr;      // history text, for the key string of new Nodes
-    int n_cache = 0;                 // buckets cached: 169 preflop, n_buckets postflop
-    std::atomic<Node*>* cache = nullptr;
+    int n_cache = 0;                 // buckets cached per table: 169 preflop, n_buckets postflop
+    std::atomic<Node*>* cache = nullptr;  // [table * n_cache + bucket]
     // ---- terminals: contributions and folds by relative seat
     int32_t invested[MAX_PLAYERS];
     uint16_t folded = 0;  // bit r: relative seat r folded
@@ -54,8 +54,10 @@ struct HistNode {
 class HistTree {
 public:
     // the game: equal starting stacks, blinds, ante, last street; `grid` must outlive the tree
-    HistTree(std::vector<int> stacks, int sb, int bb, int ante, int max_street, const BetGrid& grid, int n_buckets)
-        : stacks_(std::move(stacks)), sb_(sb), bb_(bb), ante_(ante), max_street_(max_street), grid_(grid), n_buckets_(n_buckets) {
+    // `n_tables`: node tables whose Node pointers are cached (MCCFR 1, RNR 2: hero / opponents)
+    HistTree(std::vector<int> stacks, int sb, int bb, int ante, int max_street, const BetGrid& grid, int n_buckets, int n_tables = 1)
+        : stacks_(std::move(stacks)), sb_(sb), bb_(bb), ante_(ante), max_street_(max_street), grid_(grid), n_buckets_(n_buckets),
+          n_tables_(n_tables) {
         for (int i = 0; i < 52; i++) dummy_deck_[i] = i;
     }
 
@@ -170,9 +172,10 @@ private:
         grid_.history_string(st.events, st.n_events, hist);
         h->hist = keep(hist);
         h->n_cache = obs.street == PREFLOP ? 169 : n_buckets_;
-        cache_chunks_.emplace_back(new std::atomic<Node*>[h->n_cache]);
+        const int n_slots = h->n_cache * n_tables_;
+        cache_chunks_.emplace_back(new std::atomic<Node*>[n_slots]);
         h->cache = cache_chunks_.back().get();
-        for (int i = 0; i < h->n_cache; i++) h->cache[i].store(nullptr, std::memory_order_relaxed);
+        for (int i = 0; i < n_slots; i++) h->cache[i].store(nullptr, std::memory_order_relaxed);
         return h;
     }
 
@@ -181,6 +184,7 @@ private:
     int sb_, bb_, ante_, max_street_;
     const BetGrid& grid_;
     int n_buckets_;
+    int n_tables_;
     int dummy_deck_[52];
     std::mutex mu_;
     std::atomic<HistNode*> root_{nullptr};

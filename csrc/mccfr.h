@@ -98,6 +98,44 @@ inline int memo_bucket(Bucketer& bk, const HandState& st, int seat, ThreadCtx& c
     return slot;
 }
 
+// ---- history-tree traversal helpers (histtree.h), shared by Trainer and RNRTrainer
+
+// the value of terminal `h` for absolute seat `traverser` in bb (HandState::net / bb)
+inline double tree_terminal_value(const HistNode* h, int n, int traverser, int bb, ThreadCtx& ctx) {
+    if (h->n_act > 1 && !ctx.strength_done) {  // showdown strengths: once per seat and iteration
+        for (int r = 0; r < n; r++) {
+            const int seat = (r + ctx.button) % n;
+            int cards[7] = {ctx.order[2 * seat], ctx.order[2 * seat + 1]};
+            for (int i = 0; i < 5; i++) cards[2 + i] = ctx.order[2 * n + i];
+            ctx.strength[r] = evaluate(cards, 7);
+        }
+        ctx.strength_done = true;
+    }
+    const int me = ((traverser - ctx.button) % n + n) % n;
+    return (double)terminal_net(h, n, me, ctx.strength) / (double)bb;
+}
+
+// the bucket of absolute `seat` with `n_board` board cards in the iteration's deal (memoised)
+inline int tree_bucket(Bucketer& bk, int n_players, int seat, int n_board, ThreadCtx& ctx) {
+    int& slot = ctx.bucket_memo[seat][n_board];
+    if (slot < 0) slot = bk.bucket(&ctx.order[2 * seat], &ctx.order[2 * n_players], n_board);
+    return slot;
+}
+
+// the key string infoset_key_for_bucket() spells for decision node `h` and bucket `b`
+inline void tree_key(const HistNode* h, int b, int n, std::string& key) {
+    key.clear();
+    key += street_letter(h->street);
+    key += '|';
+    key += position_name(h->rel, 0, n);
+    key += '|';
+    key += std::to_string(h->n_active);
+    key += "|b";
+    key += std::to_string(b);
+    key += '|';
+    key += h->hist;
+}
+
 // Test mode (verify_keys): the stored key string of every node a traversal reaches must equal the
 // string infoset_key builds from the state.  A mismatch would mean two key strings share a numeric
 // key; the first one is kept and reported when train() returns.
@@ -238,12 +276,6 @@ private:
 
     // ---- the traversal on the history tree (histtree.h); same numbers, same random draws as
     // traverse() on the engine, which remains for the rare node whose stored actions differ
-    int tree_bucket(int seat, int n_board, ThreadCtx& ctx) {
-        int& slot = ctx.bucket_memo[seat][n_board];
-        if (slot < 0) slot = bucketer->bucket(&ctx.order[2 * seat], &ctx.order[2 * spec.n_players], n_board);
-        return slot;
-    }
-
     Node* tree_node(HistNode* h, int b, ThreadCtx& ctx, bool& cached) {
         cached = false;
         if (b < h->n_cache && !verify_keys) {  // test mode: every visit goes through the table and the key check
@@ -265,36 +297,11 @@ private:
         return f.node;
     }
 
-    static void tree_key(const HistNode* h, int b, int n, std::string& key) {
-        key.clear();
-        key += street_letter(h->street);
-        key += '|';
-        key += position_name(h->rel, 0, n);
-        key += '|';
-        key += std::to_string(h->n_active);
-        key += "|b";
-        key += std::to_string(b);
-        key += '|';
-        key += h->hist;
-    }
-
     double traverse_tree(HistNode* h, int traverser, double weight, ThreadCtx& ctx) {
         const int n = spec.n_players;
-        if (h->terminal) {
-            if (h->n_act > 1 && !ctx.strength_done) {
-                for (int r = 0; r < n; r++) {
-                    const int seat = (r + ctx.button) % n;
-                    int cards[7] = {ctx.order[2 * seat], ctx.order[2 * seat + 1]};
-                    for (int i = 0; i < 5; i++) cards[2 + i] = ctx.order[2 * n + i];
-                    ctx.strength[r] = evaluate(cards, 7);
-                }
-                ctx.strength_done = true;
-            }
-            const int me = ((traverser - ctx.button) % n + n) % n;
-            return (double)terminal_net(h, n, me, ctx.strength) / (double)spec.bb;
-        }
+        if (h->terminal) return tree_terminal_value(h, n, traverser, spec.bb, ctx);
         const int seat = (h->rel + ctx.button) % n;
-        const int b = tree_bucket(seat, h->n_board, ctx);
+        const int b = tree_bucket(*bucketer, n, seat, h->n_board, ctx);
         bool cached;
         Node* node = tree_node(h, b, ctx, cached);
         if (!cached) {

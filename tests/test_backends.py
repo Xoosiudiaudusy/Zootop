@@ -522,10 +522,13 @@ def test_bounded_bucket_cache_is_bit_identical(kind, flop_bucketer, tiny_potenti
 
 
 @needs_core
+@pytest.mark.parametrize("verify", ["1", "0"])
 @pytest.mark.parametrize("kind", ["ehs", "potential"])
-def test_cpp_rnr_bit_identical_on_the_4_street_game(kind, flop_bucketer, tiny_potential):
+def test_cpp_rnr_bit_identical_on_the_4_street_game(kind, verify, flop_bucketer, tiny_potential, monkeypatch):
     """RNR, cpp x1 == the Python reference on the 4-street game (csrc/rnr.h shares the trainer's
-    per-iteration bucket memo; model table and warm start on turn and river keys too)."""
+    per-iteration bucket memo; model table and warm start on turn and river keys too).  verify "0":
+    production mode, the history tree caches Node pointers of both tables."""
+    monkeypatch.setenv("NEGPLURIBUS_VERIFY_KEYS", verify)
     from negpluribus.exploit.model import OpponentModel
     from negpluribus.exploit.rnr import RNRTrainer
 
