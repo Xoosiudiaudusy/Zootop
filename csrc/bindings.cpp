@@ -1057,15 +1057,17 @@ PYBIND11_MODULE(_fastcore, m) {
         .def_property_readonly("action_names", [](const Trainer& t) { return t.grid.names; })
         .def_property_readonly("cache_size", [](const Trainer& t) { return t.bucketer->cache_size(); })
         .def("cache_stats", [](const Trainer& t) { return cache_stats_dict(*t.bucketer); })
-        .def("set_pruning", [](Trainer& t, double below, double prob, long long after, bool last_street) {
+        .def("set_pruning", [](Trainer& t, double below, double prob, long long after, bool last_street, bool relative) {
             ApiLock lk(t.api_mu);
             if (below < 0 || prob < 0 || prob > 1 || after < 0) throw std::invalid_argument("pruning: below >= 0, 0 <= prob <= 1, after >= 0");
             t.prune_below = below;
+            t.prune_relative = relative;
             t.prune_prob = prob;
             t.prune_after = after;
             t.prune_last_street = last_street;
-        }, py::arg("below"), py::arg("prob") = 0.95, py::arg("after") = 0, py::arg("last_street") = false,
-           "regret-based pruning (Pluribus): skip actions with regret < -below (stored units); below = 0 turns it off")
+        }, py::arg("below"), py::arg("prob") = 0.95, py::arg("after") = 0, py::arg("last_street") = false, py::arg("relative") = false,
+           "regret-based pruning (Pluribus): skip actions with regret < -below (stored units), or with relative=True below "
+           "-below bb per unit of the node's own traverser weight; below = 0 turns it off")
         .def_property_readonly("pruned_actions", &Trainer::pruned_actions)
         .def_property("linear_until", [](const Trainer& t) { return t.linear_until; },
                       [](Trainer& t, long long v) {

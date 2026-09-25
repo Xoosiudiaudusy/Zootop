@@ -172,6 +172,10 @@ public:
     // measurements on one-street games), never an action that ends the hand, and never every action
     // of a node.  prune_below <= 0: off (the default; then nothing changes, not even the draws).
     long long linear_until = 0;  // > 0: Linear CFR weights stop growing after this iteration (off: 0)
+    // relative pruning: prune_below is in bb of regret per unit of the node's own traverser weight
+    // (the weight-averaged regret per visit), which does not grow with t or with the bucket count;
+    // nodes created while it is on carry that weight (Node::tw, 8 bytes), older nodes are never pruned
+    bool prune_relative = false;
     double prune_below = 0.0;
     double prune_prob = 0.95;
     long long prune_after = 0;
@@ -295,9 +299,11 @@ private:
             if (p) { cached = true; return p; }
         }
         const int n = spec.n_players;
-        FlatNodeTable::Found f = nodes.get_or_create(node_key(h->street, h->rel, h->n_active, b, h->hh), ctx.tid, h->na,
+        const int extra = prune_relative ? 1 : 0;
+        FlatNodeTable::Found f = nodes.get_or_create(node_key(h->street, h->rel, h->n_active, b, h->hh), ctx.tid, h->na, extra,
                                                      [&](Node& nd, NodeArena&) {
             nd.init(h->ids, h->na);
+            if (extra) { nd.has_tw = 1; *nd.tw() = 0.0; }
             return nd.refer_to_tree(h, b);  // key string spelled on demand from the tree (no copy)
         });
         if (verify_keys) {
@@ -332,7 +338,11 @@ private:
         const bool prune_here = ctx.prune && seat == traverser && (prune_last_street || h->street < spec.max_street);
         node->lock.lock();
         node->current_strategy(sigma);
-        if (prune_here) for (int i = 0; i < na; i++) reg[i] = node->regret()[i];
+        double limit = ctx.prune_limit;
+        if (prune_here) {
+            for (int i = 0; i < na; i++) reg[i] = node->regret()[i];
+            if (prune_relative) limit = node->has_tw ? ctx.prune_limit * *node->tw() : -1e300;
+        }
         node->lock.unlock();
 
         if (seat == traverser) {
@@ -341,7 +351,7 @@ private:
             int n_explore = 0;
             for (int i = 0; i < na; i++) {
                 explore[i] = true;
-                if (prune_here && reg[i] < ctx.prune_limit && !tree_.child(h, i)->terminal) explore[i] = false;
+                if (prune_here && reg[i] < limit && !tree_.child(h, i)->terminal) explore[i] = false;
                 n_explore += explore[i];
             }
             if (n_explore == 0) for (int i = 0; i < na; i++) explore[i] = true;
@@ -354,6 +364,7 @@ private:
             double u = py_sum(prods, na);
             node->lock.lock();
             for (int i = 0; i < na; i++) if (explore[i]) node->regret()[i] += weight * (utils[i] - u);
+            if (node->has_tw) *node->tw() += weight;
             node->lock.unlock();
             return u;
         }

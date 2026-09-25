@@ -96,6 +96,8 @@ def main() -> None:
                     help="C++ backend: regret-based pruning (Pluribus) of actions whose accumulated regret is below -X "
                          "(stored units: bb x iteration weight; Pluribus 3e8; 0 = off, the default); changes the algorithm, judge by the result")
     ap.add_argument("--prune-prob", type=float, default=0.95, help="share of iterations that prune (Pluribus: 0.95)")
+    ap.add_argument("--prune-relative", action="store_true",
+                    help="--prune-below in bb of regret per unit of the node's own traverser weight (independent of t and bucket count)")
     ap.add_argument("--linear-until", type=int, default=0,
                     help="C++ backend: Linear CFR weights stop growing after this iteration (Pluribus-style schedule; 0 = always linear)")
     ap.add_argument("--prune-after", type=int, default=0, help="iterations before pruning starts")
@@ -144,8 +146,9 @@ def main() -> None:
     if args.prune_below > 0:
         if not cpp:
             raise SystemExit("--prune-below needs --backend cpp")
-        trainer.set_pruning(args.prune_below, args.prune_prob, args.prune_after)
-        print(f"pruning: regret below -{args.prune_below:g}, {args.prune_prob:.0%} of iterations after {args.prune_after:,}")
+        trainer.set_pruning(args.prune_below, args.prune_prob, args.prune_after, relative=args.prune_relative)
+        print(f"pruning: regret below -{args.prune_below:g}{' bb per unit of node weight' if args.prune_relative else ''}, "
+              f"{args.prune_prob:.0%} of iterations after {args.prune_after:,}")
     ext = ".bin" if cpp and args.format == "bin" else ".json"
     bp_path = os.path.join(data, f"blueprint_{tag}{ext}")
     ck_path = os.path.join(data, f"checkpoint_{tag}{ext}")

@@ -49,3 +49,14 @@ def test_linear_until_off_changes_nothing_and_on_changes_weights():
     c = MCCFRTrainer(_spec(), seed=3, backend="cpp", threads=1).set_linear_until(1000).train(3000)
     assert _table(a) == _table(b)
     assert _table(a) != _table(c)
+
+
+def test_relative_pruning_skips_actions_and_off_is_unchanged():
+    a = MCCFRTrainer(_spec(), seed=3, backend="cpp", threads=1).train(3000)
+    b = MCCFRTrainer(_spec(), seed=3, backend="cpp", threads=1).set_pruning(0.0, relative=True).train(3000)
+    assert _table(a) == _table(b)
+    tr = MCCFRTrainer(_spec(), seed=3, backend="cpp", threads=2).set_pruning(0.2, prob=0.95, after=500, last_street=True, relative=True)
+    tr.train(20000)
+    assert tr.pruned_actions > 0
+    s = tr.strategy()
+    assert all(abs(sum(p) - 1) < 1e-9 for _, p in s.table.values())
