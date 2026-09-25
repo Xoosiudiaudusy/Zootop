@@ -713,6 +713,47 @@ PYBIND11_MODULE(_fastcore, m) {
         return py::make_tuple(std::vector<int>(counts, counts + bins), mean);
     }, "next-street E[HS] histogram (counts over `bins`, mean equity) as abstraction/potential.py computes it");
 
+    m.def("count_betting_tree", [](const py::dict& spec_d, long long limit) {
+        // size of the abstract betting tree (button 0): decision histories and actions per street,
+        // terminals; stops after `limit` decision histories (then "complete" is False)
+        Spec spec = spec_from_dict(spec_d);
+        BetGrid grid = spec.grid();
+        int deck[52];
+        for (int i = 0; i < 52; i++) deck[i] = i;
+        long long dec[4] = {0, 0, 0, 0}, acts[4] = {0, 0, 0, 0}, term = 0, total = 0;
+        bool complete = true;
+        {
+            py::gil_scoped_release nogil;
+            std::vector<HandState> stack;
+            stack.emplace_back(spec.stacks(), 0, spec.sb, spec.bb, spec.ante, deck, spec.max_street);
+            while (!stack.empty()) {
+                HandState st = stack.back();
+                stack.pop_back();
+                if (st.terminal) { term++; continue; }
+                if (total >= limit) { complete = false; break; }
+                Obs obs = observe(st, st.to_act);
+                ActionList al;
+                grid.abstract_actions(obs, al);
+                dec[obs.street]++;
+                acts[obs.street] += al.n;
+                total++;
+                for (int i = 0; i < al.n; i++) {
+                    HandState c(st);
+                    int type, amount;
+                    grid.to_concrete(obs, al.a[i], type, amount);
+                    c.apply(type, amount);
+                    stack.push_back(c);
+                }
+            }
+        }
+        py::dict d;
+        d["decisions"] = std::vector<long long>(dec, dec + 4);
+        d["actions"] = std::vector<long long>(acts, acts + 4);
+        d["terminals"] = term;
+        d["complete"] = complete;
+        return d;
+    }, py::arg("spec"), py::arg("limit") = 200000000LL);
+
     m.def("river_equity_exact", [](const py::sequence& hole, const py::sequence& board) {
         std::vector<int> h = to_cards(hole), bd = to_cards(board);
         if (h.size() != 2 || bd.size() != 5) throw std::invalid_argument("river_equity_exact expects 2 hole cards and a 5-card board");
