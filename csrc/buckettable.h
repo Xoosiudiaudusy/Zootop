@@ -12,6 +12,8 @@
 // (0 = street not tabulated), size bytes, u64 FNV-1a of those bytes.  A table is only valid
 // for the bucketer whose identity it carries; load() checks it.
 #pragma once
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -55,6 +57,7 @@ public:
         if (id.n_buckets > 256) throw std::invalid_argument("bucket tables hold at most 256 buckets");
         if (any() && !same_identity(id_, id)) throw std::invalid_argument("tables of another bucketer: build into a fresh object");
         id_ = id;
+        if (street == RIVER && build_river_by_board(bk, threads, done)) return;
         const HandIndexer& ix = *ix_[street];
         const uint64_t n = ix.size();
         std::vector<uint8_t> out(n);
@@ -162,7 +165,102 @@ public:
                a.fingerprint == b.fingerprint;
     }
 
+    // the canonical 5-card boards: the lexicographically smallest sorted image under the 24 suit
+    // permutations (every board is a relabelling of exactly one of them)
+    static std::vector<std::array<int, 5>> canonical_boards() {
+        std::vector<std::array<int, 5>> out;
+        int b[5];
+        for (b[0] = 0; b[0] < 52; b[0]++)
+            for (b[1] = b[0] + 1; b[1] < 52; b[1]++)
+                for (b[2] = b[1] + 1; b[2] < 52; b[2]++)
+                    for (b[3] = b[2] + 1; b[3] < 52; b[3]++)
+                        for (b[4] = b[3] + 1; b[4] < 52; b[4]++) {
+                            bool smallest = true;
+                            for (int p = 1; p < 24 && smallest; p++) {
+                                int q[5];
+                                for (int i = 0; i < 5; i++) q[i] = (b[i] >> 2) * 4 + SUIT_PERMS[p][b[i] & 3];
+                                std::sort(q, q + 5);
+                                if (std::lexicographical_compare(q, q + 5, b, b + 5)) smallest = false;
+                            }
+                            if (smallest) out.push_back({b[0], b[1], b[2], b[3], b[4]});
+                        }
+        return out;
+    }
+
 private:
+    // River by board, for bucketers with a per-board batch (Bucketer::river_buckets_all: the
+    // potential-aware exact river equity, all 1,081 holes of a board from one sorted pass instead of
+    // 990 evaluations per hand).  Every class (hole, board) is a relabelling of a hand on a canonical
+    // board, so the canonical boards cover the table; a class met on several boards (or twice on one)
+    // gets the same bucket each time, because the batch gives bucket()'s own number (a pure function
+    // of the class).  Returns false (nothing built) when the bucketer has no batch.
+    bool build_river_by_board(const Bucketer& bk, int threads, std::atomic<uint64_t>* done) {
+        {
+            const int probe[5] = {0, 5, 10, 15, 20};
+            std::vector<uint8_t> tmp(1326);
+            if (!bk.river_buckets_all(probe, pair_index(), tmp.data())) return false;
+        }
+        const std::vector<std::array<int, 5>> boards = canonical_boards();
+        const HandIndexer& ix = *ix_[RIVER];
+        const uint64_t n = ix.size();
+        std::vector<uint8_t> out(n, 0);
+        std::vector<uint8_t> seen((n + 7) / 8, 0);  // coverage check: every class written at least once
+        std::atomic<size_t> next{0};
+        std::atomic<bool> failed{false};
+        std::mutex seen_mu;
+        const int (*idx)[52] = pair_index();
+        auto work = [&]() {
+            std::vector<uint8_t> b(1326);
+            std::vector<uint64_t> mine;
+            for (size_t i = next.fetch_add(1); i < boards.size() && !failed.load(); i = next.fetch_add(1)) {
+                const int* board = boards[i].data();
+                if (!bk.river_buckets_all(board, idx, b.data())) { failed.store(true); return; }
+                bool on[52] = {false};
+                for (int k = 0; k < 5; k++) on[board[k]] = true;
+                mine.clear();
+                for (int c = 0; c < 52; c++) {
+                    if (on[c]) continue;
+                    for (int d = c + 1; d < 52; d++) {
+                        if (on[d]) continue;
+                        const int hole[2] = {c, d};
+                        const uint64_t id = ix.index(hole, board);
+                        out[id] = b[(size_t)idx[c][d]];  // equal values for equal classes: a benign race
+                        mine.push_back(id);
+                    }
+                }
+                {
+                    std::lock_guard<std::mutex> lk(seen_mu);
+                    for (uint64_t id : mine) seen[id >> 3] |= (uint8_t)(1u << (id & 7));
+                }
+                if (done) done->fetch_add(mine.size(), std::memory_order_relaxed);
+            }
+        };
+        const int T = threads < 1 ? 1 : threads;
+        std::vector<std::thread> pool;
+        for (int t = 1; t < T; t++) pool.emplace_back(work);
+        work();
+        for (auto& th : pool) th.join();
+        if (failed.load()) throw std::runtime_error("bucket table build failed: river batch refused a board");
+        for (uint64_t id = 0; id < n; id++)
+            if (!(seen[id >> 3] >> (id & 7) & 1)) throw std::logic_error("bucket table: a river class was not covered by the canonical boards");
+        t_[RIVER].swap(out);
+        return true;
+    }
+
+    // pair (c, d) -> 0..1325, c < d in card order (the convention of river_buckets_all's callers)
+    static const int (*pair_index())[52] {
+        static const struct Idx {
+            int v[52][52];
+            Idx() {
+                int k = 0;
+                for (int a = 0; a < 52; a++) for (int b = 0; b < 52; b++) v[a][b] = -1;
+                for (int a = 0; a < 52; a++)
+                    for (int b = a + 1; b < 52; b++) { v[a][b] = v[b][a] = k; k++; }
+            }
+        } t;
+        return t.v;
+    }
+
     bool any() const { return has(FLOP) || has(TURN) || has(RIVER); }
     static uint64_t fnv1a(const std::vector<uint8_t>& v) {
         uint64_t h = 0xCBF29CE484222325ULL;
