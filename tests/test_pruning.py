@@ -41,3 +41,11 @@ def test_pruning_skips_actions_and_trains():
     assert tr.pruned_actions > 0
     s = tr.strategy()
     assert len(s) == tr.n_nodes and all(abs(sum(p) - 1) < 1e-9 for _, p in s.table.values())
+
+
+def test_linear_until_off_changes_nothing_and_on_changes_weights():
+    a = MCCFRTrainer(_spec(), seed=3, backend="cpp", threads=1).train(3000)
+    b = MCCFRTrainer(_spec(), seed=3, backend="cpp", threads=1).set_linear_until(0).train(3000)
+    c = MCCFRTrainer(_spec(), seed=3, backend="cpp", threads=1).set_linear_until(1000).train(3000)
+    assert _table(a) == _table(b)
+    assert _table(a) != _table(c)

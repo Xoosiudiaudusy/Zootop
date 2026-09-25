@@ -171,6 +171,7 @@ public:
     // in its own units); never on the last betting street (unless prune_last_street, for
     // measurements on one-street games), never an action that ends the hand, and never every action
     // of a node.  prune_below <= 0: off (the default; then nothing changes, not even the draws).
+    long long linear_until = 0;  // > 0: Linear CFR weights stop growing after this iteration (off: 0)
     double prune_below = 0.0;
     double prune_prob = 0.95;
     long long prune_after = 0;
@@ -267,7 +268,9 @@ private:
     long long pruned_ = 0;
 
     void run_iteration(long long t, ThreadCtx& ctx) {
-        double weight = linear ? (double)t : 1.0;
+        // Linear CFR: weight t; with linear_until > 0 the weight stops growing at that iteration (Pluribus
+        // stopped its linear discounting after 400 minutes), i.e. plain CFR from there on
+        double weight = linear ? (double)(linear_until > 0 && t > linear_until ? linear_until : t) : 1.0;
         ctx.order.resize(52);
         for (int i = 0; i < 52; i++) ctx.order[i] = i;
         ctx.rng.shuffle(ctx.order);

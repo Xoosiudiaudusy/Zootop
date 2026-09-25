@@ -1067,6 +1067,12 @@ PYBIND11_MODULE(_fastcore, m) {
         }, py::arg("below"), py::arg("prob") = 0.95, py::arg("after") = 0, py::arg("last_street") = false,
            "regret-based pruning (Pluribus): skip actions with regret < -below (stored units); below = 0 turns it off")
         .def_property_readonly("pruned_actions", &Trainer::pruned_actions)
+        .def_property("linear_until", [](const Trainer& t) { return t.linear_until; },
+                      [](Trainer& t, long long v) {
+                          ApiLock lk(t.api_mu);
+                          if (v < 0) throw std::invalid_argument("linear_until >= 0");
+                          t.linear_until = v;
+                      }, "> 0: Linear CFR weights stop growing after this iteration (Pluribus-style schedule); 0: always linear")
         .def("table_stats", [](Trainer& t) {
             ApiLock lk(t.api_mu);
             py::dict d = table_stats_dict(t.nodes);

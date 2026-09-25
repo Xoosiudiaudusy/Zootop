@@ -96,6 +96,8 @@ def main() -> None:
                     help="C++ backend: regret-based pruning (Pluribus) of actions whose accumulated regret is below -X "
                          "(stored units: bb x iteration weight; Pluribus 3e8; 0 = off, the default); changes the algorithm, judge by the result")
     ap.add_argument("--prune-prob", type=float, default=0.95, help="share of iterations that prune (Pluribus: 0.95)")
+    ap.add_argument("--linear-until", type=int, default=0,
+                    help="C++ backend: Linear CFR weights stop growing after this iteration (Pluribus-style schedule; 0 = always linear)")
     ap.add_argument("--prune-after", type=int, default=0, help="iterations before pruning starts")
     ap.add_argument("--data-dir", default=DATA, help="where buckets / checkpoints / blueprints go (default data/)")
     args = ap.parse_args()
@@ -134,6 +136,11 @@ def main() -> None:
     trainer = MCCFRTrainer(spec, bucketer, seed=args.seed, linear=not args.no_linear, backend=args.backend, threads=args.threads,
                            cache_caps=args.bucket_cache)
     cpp = trainer.backend == "cpp"
+    if args.linear_until > 0:
+        if not cpp:
+            raise SystemExit("--linear-until needs --backend cpp")
+        trainer.set_linear_until(args.linear_until)
+        print(f"Linear CFR weights stop growing after iteration {args.linear_until:,}")
     if args.prune_below > 0:
         if not cpp:
             raise SystemExit("--prune-below needs --backend cpp")

@@ -157,6 +157,12 @@ class CppMCCFRTrainer(MCCFRTrainer):
         self._core.set_pruning(float(below), float(prob), int(after), bool(last_street))
         return self
 
+    def set_linear_until(self, iterations: int) -> "CppMCCFRTrainer":
+        """Linear CFR weights stop growing after ``iterations`` (Pluribus stopped its linear discounting
+        after 400 minutes); 0 (the default) keeps Linear CFR for the whole run.  Changes the algorithm."""
+        self._core.linear_until = int(iterations)
+        return self
+
     @property
     def pruned_actions(self) -> int:
         return self._core.pruned_actions
