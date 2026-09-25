@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+data/
+*.log
+.claude/
+negpluribus/buckets_ehs10.json
+negpluribus/buckets_pot10.json
+*.pyd
+*.so

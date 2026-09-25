@@ -1,0 +1,25 @@
+[project]
+name = "negpluribus"
+version = "0.1.0"
+description = "6-max No-Limit Hold'em research sandbox: engine, archetype bots, HUD stats, duplicate evaluation, CFR."
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+fast = ["phevaluator", "numpy"]
+# build the C++ core: python -m pip install -e ".[fast-build]" && python scripts/build_fast.py
+fast-build = ["pybind11>=2.12", "cmake>=3.18", "ninja"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["negpluribus*"]
+
+[tool.setuptools.package-data]
+negpluribus = ["*.json", "*.pyd", "*.so"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
