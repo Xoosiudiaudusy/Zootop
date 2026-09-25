@@ -5,9 +5,10 @@
 // ----------------------------
 // * threads == 1 reproduces the Python trainer bit for bit for the same seed (same deals,
 //   same sampled actions, same floating-point sums).
-// * threads > 1: iteration t is assigned statically to thread (t - 1) % T, each thread has
-//   its own RNG stream, so *which deals* are played is deterministic; only the interleaving
-//   of table updates is not.  Every node carries a spinlock: the current strategy is read,
+// * threads > 1: iterations are handed out in chunks of ITER_CHUNK to whichever thread is free
+//   (hybrid CPUs: P and E cores finish together), each thread has its own RNG stream, so the
+//   deals are statistically the same as with one thread but *which* deals are played depends on
+//   the scheduling, as does the interleaving of table updates.  Every node carries a spinlock: the current strategy is read,
 //   and regrets / strategy sums are added, under that lock, so no update is lost.  What
 //   remains racy is *staleness*: a traverser computes its regret update with the strategy it
 //   read before descending, while other threads may have updated the same node in between.
@@ -157,15 +158,31 @@ public:
     int main_arena() const { return threads; }
     long long table_resizes() const { return group_.resizes(); }
 
-    // run `iterations` iterations on `threads` threads; iteration t goes to thread (t-1) % T
+    // run `iterations` iterations on `threads` threads
+    static constexpr long long ITER_CHUNK = 16;
+
     void train(long long iterations) {
         long long base = iteration_;
         long long target = base + iterations;
         int T = threads;
         group_.begin(T);
+        // T == 1: iterations in order (bit-identical to the Python trainer).  T > 1: chunks of
+        // iterations handed out dynamically, so faster cores (P vs E cores, a busy sibling
+        // hyperthread) do more of them instead of waiting for the slowest thread at the end;
+        // each thread still draws its deals from its own RNG stream.
+        std::atomic<long long> next{base + 1};
         auto work = [&](int tid) {
             ThreadCtx& ctx = ctxs_[tid];
-            for (long long t = base + 1 + tid; t <= target; t += T) run_iteration(t, ctx);
+            if (T == 1) {
+                for (long long t = base + 1; t <= target; t++) run_iteration(t, ctx);
+            } else {
+                for (;;) {
+                    const long long lo = next.fetch_add(ITER_CHUNK, std::memory_order_relaxed);
+                    if (lo > target) break;
+                    const long long hi = lo + ITER_CHUNK - 1 < target ? lo + ITER_CHUNK - 1 : target;
+                    for (long long t = lo; t <= hi; t++) run_iteration(t, ctx);
+                }
+            }
             group_.leave();
         };
         if (T == 1) {

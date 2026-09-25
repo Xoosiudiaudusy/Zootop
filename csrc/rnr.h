@@ -103,14 +103,30 @@ public:
 
     // planned_iters (warm-start weight) is set by the caller once per outer train() call, as in
     // RNRTrainer.train(); chunked calls must not shrink it
+    static constexpr long long ITER_CHUNK = 16;
+
     void train(long long iterations) {
         long long base = iteration_;
         long long target = base + iterations;
         int T = threads;
         group_.begin(T);
+        // T == 1: iterations in order (bit-identical to the Python trainer).  T > 1: chunks of
+        // iterations handed out dynamically, so faster cores (P vs E cores, a busy sibling
+        // hyperthread) do more of them instead of waiting for the slowest thread at the end;
+        // each thread still draws its deals from its own RNG stream.
+        std::atomic<long long> next{base + 1};
         auto work = [&](int tid) {
             ThreadCtx& ctx = ctxs_[tid];
-            for (long long t = base + 1 + tid; t <= target; t += T) run_iteration(t, ctx);
+            if (T == 1) {
+                for (long long t = base + 1; t <= target; t++) run_iteration(t, ctx);
+            } else {
+                for (;;) {
+                    const long long lo = next.fetch_add(ITER_CHUNK, std::memory_order_relaxed);
+                    if (lo > target) break;
+                    const long long hi = lo + ITER_CHUNK - 1 < target ? lo + ITER_CHUNK - 1 : target;
+                    for (long long t = lo; t <= hi; t++) run_iteration(t, ctx);
+                }
+            }
             group_.leave();
         };
         if (T == 1) {
