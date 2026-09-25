@@ -324,8 +324,8 @@ inline void write_checkpoint_bin(const std::string& path, const GameIdentity& id
             w.str16(key, std::strlen(key));
             w.u8(n->n);
             w.bytes(n->acts, n->n);
-            w.bytes(n->regret, sizeof(double) * n->n);
-            w.bytes(n->strategy_sum, sizeof(double) * n->n);
+            w.bytes(n->regret(), sizeof(double) * n->n);
+            w.bytes(n->strategy_sum(), sizeof(double) * n->n);
             w.i64(n->visits);
         }
     }
@@ -412,7 +412,7 @@ inline CheckpointScalars read_checkpoint_bin(const std::string& path, const Game
                     if (!rekey && c != nk) throw std::runtime_error(path + ": the numeric key stored for '" + key + "' is not the key of that string");
                     nk = c;
                 }
-                FlatNodeTable::Found f = t.get_or_create(nk, arena, [&](Node& node, NodeArena& a) {
+                FlatNodeTable::Found f = t.get_or_create(nk, arena, na, [&](Node& node, NodeArena& a) {
                     node.init(acts, na);
                     return a.copy_key(key.data(), key.size());
                 });
@@ -421,7 +421,7 @@ inline CheckpointScalars read_checkpoint_bin(const std::string& path, const Game
                     throw std::runtime_error("numeric infoset key collision: '" + key + "' and '" + std::string(f.key) + "'");
                 }
                 Node* node = f.node;
-                for (int a = 0; a < na; a++) { node->regret[a] = reg[a]; node->strategy_sum[a] = ss[a]; }
+                for (int a = 0; a < na; a++) { node->regret()[a] = reg[a]; node->strategy_sum()[a] = ss[a]; }
                 node->visits = visits;
             }
         }
@@ -449,12 +449,12 @@ inline void json_node(const char* key, const Node& n, const BetGrid& grid, std::
     o += "], [";
     for (int i = 0; i < n.n; i++) {
         if (i) o += ", ";
-        py_float_repr(n.regret[i], o);
+        py_float_repr(n.regret()[i], o);
     }
     o += "], [";
     for (int i = 0; i < n.n; i++) {
         if (i) o += ", ";
-        py_float_repr(n.strategy_sum[i], o);
+        py_float_repr(n.strategy_sum()[i], o);
     }
     o += "], ";
     o += std::to_string(n.visits);
@@ -561,7 +561,7 @@ inline void read_json_nodes(JsonReader& j, FlatNodeTable& t, BetGrid& grid, cons
         for (int i = 0; i < k; i++) ids[i] = (uint8_t)grid_action_id(grid, street, row.names[i]);
         Node* n = get_or_create_by_string(t, codec, key, ids, k, arena).node;
         n->init(ids, k);  // a key given twice: the last row wins, as in json.load
-        for (int i = 0; i < k; i++) { n->regret[i] = row.reg[i]; n->strategy_sum[i] = row.ss[i]; }
+        for (int i = 0; i < k; i++) { n->regret()[i] = row.reg[i]; n->strategy_sum()[i] = row.ss[i]; }
         n->visits = row.visits;
     }
 }
@@ -1262,8 +1262,8 @@ inline void checkpoint_bin_to_json(const std::string& src, const std::string& ds
             node.n = r.u8();
             if (node.n > MAX_ACTIONS) throw std::runtime_error("corrupt file (node actions): " + src);
             r.bytes(node.acts, node.n);
-            r.bytes(node.regret, sizeof(double) * node.n);
-            r.bytes(node.strategy_sum, sizeof(double) * node.n);
+            r.bytes(node.regret(), sizeof(double) * node.n);
+            r.bytes(node.strategy_sum(), sizeof(double) * node.n);
             node.visits = r.i64();
             if (i) o += ", ";
             py_json_string(key.data(), key.size(), o);
@@ -1274,9 +1274,9 @@ inline void checkpoint_bin_to_json(const std::string& src, const std::string& ds
                 py_json_string(names[node.acts[a]].data(), names[node.acts[a]].size(), o);
             }
             o += "], [";
-            for (int a = 0; a < node.n; a++) { if (a) o += ", "; py_float_repr(node.regret[a], o); }
+            for (int a = 0; a < node.n; a++) { if (a) o += ", "; py_float_repr(node.regret()[a], o); }
             o += "], [";
-            for (int a = 0; a < node.n; a++) { if (a) o += ", "; py_float_repr(node.strategy_sum[a], o); }
+            for (int a = 0; a < node.n; a++) { if (a) o += ", "; py_float_repr(node.strategy_sum()[a], o); }
             o += "], ";
             o += std::to_string(node.visits);
             o += ']';

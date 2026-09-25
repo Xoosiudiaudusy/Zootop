@@ -2,18 +2,24 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <chrono>
 #include <cstring>
+#include <exception>
 #include <memory>
+#include <thread>
 #include <string>
 #include <vector>
 
 #include "abstraction.h"
+#include "buckettable.h"
 #include "engine.h"
 #include "equity.h"
 #include "evaluator.h"
+#include "handindex.h"
 #include "mccfr.h"
 #include "persist.h"
 #include "pyrandom.h"
+#include "bucketcache.h"
 #include "rnr.h"
 #include "search.h"
 
@@ -172,8 +178,8 @@ static py::dict export_table(FlatNodeTable& nodes, const BetGrid& grid) {
         py::list acts, reg, ss;
         for (int i = 0; i < n.n; i++) {
             acts.append(grid.names[n.acts[i]]);
-            reg.append(n.regret[i]);
-            ss.append(n.strategy_sum[i]);
+            reg.append(n.regret()[i]);
+            ss.append(n.strategy_sum()[i]);
         }
         out[py::str(key)] = py::make_tuple(acts, reg, ss, n.visits);
     });
@@ -213,7 +219,7 @@ static void import_table(FlatNodeTable& nodes, const KeyCodec& codec, int arena,
         Node* n = get_or_create_by_string(nodes, codec, key, r.ids, k, arena).node;
         n->lock.lock();
         n->init(r.ids, k);
-        for (int i = 0; i < k; i++) { n->regret[i] = r.reg[i]; n->strategy_sum[i] = r.ss[i]; }
+        for (int i = 0; i < k; i++) { n->regret()[i] = r.reg[i]; n->strategy_sum()[i] = r.ss[i]; }
         n->visits = r.visits;
         n->lock.unlock();
     }
@@ -226,7 +232,7 @@ static void add_table(FlatNodeTable& nodes, const KeyCodec& codec, int arena, Be
         NodeRow r = node_row(key, kv.second, grid);
         Node* n = get_or_create_by_string(nodes, codec, key, r.ids, (int)r.acts.size(), arena).node;
         n->lock.lock();
-        for (size_t i = 0; i < r.acts.size() && i < n->n; i++) { n->regret[i] += r.reg[i]; n->strategy_sum[i] += r.ss[i]; }
+        for (size_t i = 0; i < r.acts.size() && i < n->n; i++) { n->regret()[i] += r.reg[i]; n->strategy_sum()[i] += r.ss[i]; }
         n->visits += r.visits;
         n->lock.unlock();
     }
@@ -292,7 +298,7 @@ static py::dict table_stress(int threads, int n_keys, int rounds, size_t initial
             for (int i = 0; i < n_keys; i++) order[i] = i;
             rng.shuffle(order);
             for (int idx : order) {
-                FlatNodeTable::Found f = table.get_or_create(nks[idx], tid, [&](Node& n, NodeArena& a) {
+                FlatNodeTable::Found f = table.get_or_create(nks[idx], tid, 1, [&](Node& n, NodeArena& a) {
                     n.init(ids, 1);
                     return a.copy_key(keys[idx].data(), keys[idx].size());
                 });
@@ -366,8 +372,8 @@ static py::object node_to_py(Node* n, const BetGrid& grid) {
     n->lock.lock();
     for (int i = 0; i < n->n; i++) {
         acts.append(grid.names[n->acts[i]]);
-        reg.append(n->regret[i]);
-        ss.append(n->strategy_sum[i]);
+        reg.append(n->regret()[i]);
+        ss.append(n->strategy_sum()[i]);
     }
     long long visits = n->visits;
     n->lock.unlock();
@@ -493,6 +499,16 @@ static py::tuple blueprint_entry_py(const BlueprintTable& b, long long i) {
         probs.append(py::float_(b.prob(t)));
     }
     return py::make_tuple(names, probs);
+}
+
+static int depth_from_py(const py::object& d) {
+    if (py::isinstance<py::int_>(d)) return d.cast<int>();
+    const std::string s = d.cast<std::string>();
+    if (s == "end") return DEPTH_END;
+    if (s == "pluribus") return DEPTH_PLURIBUS;
+    if (s == "hu_flop_limit") return DEPTH_HU_FLOP;
+    if (s == "next_street") return DEPTH_NEXT_STREET;
+    throw std::invalid_argument("depth: 'end', 'pluribus', 'hu_flop_limit' or 'next_street'");
 }
 
 static std::string file_kind(const std::string& path) {
@@ -727,8 +743,40 @@ PYBIND11_MODULE(_fastcore, m) {
              "per street: capacity (slots), size (occupied), computes (misses), evictions")
         .def("set_cache_caps", [](Bucketer& b, const py::object& caps) { b.set_cache_caps(caps_from_py(caps)); },
              "capacities in entries for (flop, turn, river); call before training")
+        .def("precompute", [](Bucketer& b, int street, int threads) {
+            py::gil_scoped_release nogil;
+            return precompute_buckets(b, street, threads);
+        }, py::arg("street"), py::arg("threads") = 8,
+           "compute every canonical (hole, board) form of the street into the cache; returns the (board, hole) pairs visited")
+        .def("save_cache", [](const Bucketer& b, const std::string& path, const std::vector<int>& streets) {
+            py::gil_scoped_release nogil;
+            save_bucket_cache(path, b, streets);
+        }, py::arg("path"), py::arg("streets") = std::vector<int>{1, 2}, "save the cached buckets of these streets (with the bucketer's identity)")
+        .def("load_cache", [](Bucketer& b, const std::string& path) {
+            std::vector<std::array<long long, 3>> r;
+            {
+                py::gil_scoped_release nogil;
+                r = load_bucket_cache(path, b);
+            }
+            py::list out;
+            for (const auto& x : r) out.append(py::make_tuple(x[0], x[1], x[2]));
+            return out;
+        }, py::arg("path"), "load a saved cache (refused if it holds other buckets); [(street, entries, evicted)]")
+        .def("river_buckets_all", [](const Bucketer& b, const std::vector<int>& board) -> py::object {
+            if (board.size() != 5) throw std::invalid_argument("a 5-card board");
+            std::vector<uint8_t> out((size_t)N_COMBOS, 255);
+            if (!b.river_buckets_all(board.data(), combo_table().idx, out.data())) return py::none();
+            return py::cast(std::vector<int>(out.begin(), out.end()));
+        }, "river bucket of every combo on a board in one batch (255 on the board), None if the abstraction has no batch")
         .def_property_readonly("cache_caps", [](const Bucketer& b) { return b.cache_caps(); })
-        .def_property_readonly("fitted", &Bucketer::fitted);
+        .def_property_readonly("fitted", &Bucketer::fitted)
+        .def_property_readonly("identity", [](const Bucketer& b) {
+            const BucketerIdentity id = b.identity();
+            py::dict d;
+            d["kind"] = id.kind; d["n_buckets"] = id.n_buckets; d["samples"] = id.samples; d["bins"] = id.bins;
+            d["fingerprint"] = id.fingerprint;
+            return d;
+        }, "kind, n_buckets, samples, bins and the fingerprint of the fitted parameters");
 
     py::class_<PotentialBucketer, Bucketer, std::shared_ptr<PotentialBucketer>>(m, "PotentialBucketer")
         .def(py::init([](int n_buckets, int samples, int bins, const py::dict& centroids, const py::dict& boundaries, const py::object& cache_caps) {
@@ -792,6 +840,68 @@ PYBIND11_MODULE(_fastcore, m) {
         .def("cache_size", &EquityBucketer::cache_size)
         .def_property_readonly("n_buckets", [](const EquityBucketer& b) { return b.n_buckets; })
         .def_property_readonly("samples", [](const EquityBucketer& b) { return b.samples; });
+
+    // ---- hand classes and precomputed bucket tables (handindex.h, buckettable.h)
+    py::class_<HandIndexer, std::shared_ptr<HandIndexer>>(m, "HandIndexer")
+        .def(py::init<int>(), py::arg("n_board"))
+        .def_property_readonly("size", &HandIndexer::size)
+        .def_property_readonly("n_board", &HandIndexer::n_board)
+        .def("index", [](const HandIndexer& ix, const py::sequence& hole, const py::sequence& board) {
+            std::vector<int> h = to_cards(hole), bd = to_cards(board);
+            if (h.size() != 2 || (int)bd.size() != ix.n_board()) throw std::invalid_argument("2 hole cards and n_board board cards");
+            return ix.index(h.data(), bd.data());
+        })
+        .def("unindex", [](const HandIndexer& ix, uint64_t idx) {
+            int h[2], bd[5];
+            ix.unindex(idx, h, bd);
+            return py::make_tuple(std::vector<int>(h, h + 2), std::vector<int>(bd, bd + ix.n_board()));
+        });
+
+    py::class_<BucketTables, std::shared_ptr<BucketTables>>(m, "BucketTables")
+        .def(py::init<>())
+        .def("build", [](BucketTables& t, const Bucketer& bk, int street, int threads, const py::object& progress, double every) {
+            // runs without the GIL; `progress(done, total)` is called from this thread every `every` s
+            std::atomic<uint64_t> done{0};
+            std::atomic<bool> finished{false};
+            std::exception_ptr err;
+            std::thread worker([&] {
+                try { t.build(bk, street, threads, &done); } catch (...) { err = std::current_exception(); }
+                finished.store(true);
+            });
+            const uint64_t total = t.size(street);
+            {
+                py::gil_scoped_release nogil;
+                while (!finished.load()) {
+                    for (int i = 0; i < (int)(every * 20) && !finished.load(); i++) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    if (!finished.load() && !progress.is_none()) {
+                        py::gil_scoped_acquire g;
+                        progress(done.load(), total);
+                    }
+                }
+                worker.join();
+            }
+            if (err) std::rethrow_exception(err);
+        }, py::arg("bucketer"), py::arg("street"), py::arg("threads") = 1, py::arg("progress") = py::none(), py::arg("every") = 10.0,
+           "tabulate one street (1 flop, 2 turn, 3 river) of a fitted core bucketer")
+        .def("has", &BucketTables::has)
+        .def("size", &BucketTables::size)
+        .def("lookup", [](const BucketTables& t, const py::sequence& hole, const py::sequence& board) {
+            std::vector<int> h = to_cards(hole), bd = to_cards(board);
+            if (h.size() != 2 || bd.size() < 3 || bd.size() > 5) throw std::invalid_argument("2 hole cards and a 3..5 card board");
+            if (!t.has(street_of_board((int)bd.size()))) throw std::invalid_argument("street not tabulated");
+            return t.lookup(h.data(), bd.data(), (int)bd.size());
+        })
+        .def("save", [](const BucketTables& t, const std::string& path) { py::gil_scoped_release nogil; t.save(path); })
+        .def("load", [](BucketTables& t, const std::string& path, std::shared_ptr<Bucketer> expect) {
+            py::gil_scoped_release nogil;
+            t.load(path, expect.get());
+        }, py::arg("path"), py::arg("expect") = nullptr);
+
+    py::class_<TabulatedBucketer, Bucketer, std::shared_ptr<TabulatedBucketer>>(m, "TabulatedBucketer")
+        .def(py::init([](std::shared_ptr<Bucketer> inner, std::shared_ptr<BucketTables> tables) {
+            return std::make_shared<TabulatedBucketer>(std::move(inner), std::shared_ptr<const BucketTables>(tables));
+        }), py::arg("inner"), py::arg("tables"))
+        .def_property_readonly("inner", &TabulatedBucketer::inner);
 
     // ---- game = spec + grid + bucketer, hands driven from Python (tests, key checks)
     struct Game {
@@ -910,8 +1020,10 @@ PYBIND11_MODULE(_fastcore, m) {
             ApiLock lk(t.api_mu);
             py::dict d = table_stats_dict(t.nodes);
             d["resizes"] = t.table_resizes();
+            d["tree_nodes"] = t.tree_nodes();
+            d["tree_bytes"] = t.tree_bytes();
             return d;
-        }, "node table: size, capacity (slots), slot / node / key-string bytes, resizes")
+        }, "node table: size, capacity (slots), slot / node / key-string bytes, resizes; history tree: nodes, bytes")
         .def("rng_state", [](Trainer& t) { return state_to_py(t.rng0()); })
         .def("set_rng_state", [](Trainer& t, const py::tuple& st) { state_from_py(st, t.rng0()); })
         .def("rng_states", [](Trainer& t) { return rng_states_of(t); }, "MT state of every thread's generator")
@@ -1073,6 +1185,8 @@ PYBIND11_MODULE(_fastcore, m) {
             d["hero"] = table_stats_dict(t.hero_nodes);
             d["opp"] = table_stats_dict(t.opp_nodes);
             d["resizes"] = t.table_resizes();
+            d["tree_nodes"] = t.tree_nodes();
+            d["tree_bytes"] = t.tree_bytes();
             return d;
         })
         .def("get_hero", [](RNRTrainer& t, const std::string& key) {
@@ -1103,8 +1217,15 @@ PYBIND11_MODULE(_fastcore, m) {
             return tab.debug_set_key(t.codec.of_string(key), t.main_arena(), stored);
         }, py::arg("key"), py::arg("stored"), py::arg("hero") = true);
 
-    // ---- real-time search, part 1 (search.h)
+    // ---- real-time search (search.h)
     m.def("combo_index", &combo_index, "index of the hole (a, b) among the 1326 combos (a < b order), -1 if invalid");
+    m.def("apply_continuation", [](const std::vector<int>& kinds, std::vector<double> p, int choice, double bias) {
+        if (kinds.size() != p.size()) throw std::invalid_argument("kinds and probabilities: same length");
+        apply_continuation(kinds.data(), (int)p.size(), choice, bias, p.data());
+        return p;
+    }, py::arg("kinds"), py::arg("probs"), py::arg("choice"), py::arg("bias") = 5.0,
+       "tests: a continuation on probabilities (kinds 0 fold / 1 call / 2 raise; choice 0 blueprint / 1 fold / 2 call / 3 raise)");
+    m.def("canonical_boards", [](int n) { return canonical_boards(n).size(); }, "number of suit-canonical boards of n cards");
     py::class_<SearchGame, std::shared_ptr<SearchGame>>(m, "SearchGame")
         .def(py::init([](const py::dict& spec, std::shared_ptr<Bucketer> bk, const py::object& blueprint) {
             std::shared_ptr<const BlueprintTable> bp;
@@ -1112,13 +1233,21 @@ PYBIND11_MODULE(_fastcore, m) {
             return std::make_shared<SearchGame>(spec_from_dict(spec), std::move(bk), bp);
         }), py::arg("spec"), py::arg("bucketer"), py::arg("blueprint") = py::none(),
             "game + bucketer + blueprint lookup (BlueprintTable, or None: uniform ranges) shared by the searches of a match")
-        .def_property_readonly("action_names", [](const SearchGame& g) { return g.grid.names; });
+        .def_property_readonly("action_names", [](const SearchGame& g) { return g.grid.names; })
+        .def("presample", [](SearchGame& g, uint64_t seed, double bias) {
+            py::gil_scoped_release nogil;
+            g.presample(seed, bias);
+        }, py::arg("seed") = 0, py::arg("bias") = 5.0,
+           "draw one action per blueprint infoset and continuation; rollouts then play it (Pluribus' compression)")
+        .def("clear_presampled", [](SearchGame& g) { g.presampled.clear(); g.presampled.shrink_to_fit(); })
+        .def_property_readonly("presampled_bytes", [](const SearchGame& g) { return g.presampled.capacity(); });
 
     py::class_<SubgameSearch>(m, "SubgameSearch")
         .def(py::init([](std::shared_ptr<SearchGame> game, const std::vector<int>& stacks, int button,
                          const std::vector<std::pair<int, int>>& actions, const std::vector<int>& board, int seat,
                          const std::vector<int>& hole, long long iterations, double time_budget, int threads, uint64_t seed,
-                         double focus, double min_prob, bool linear, const py::object& overrides) {
+                         double focus, double min_prob, bool linear, const py::object& overrides, const py::object& depth,
+                         int rollouts, double bias, int debug_leaves) {
             HandInput h;
             h.stacks = stacks;
             h.button = button;
@@ -1146,12 +1275,18 @@ PYBIND11_MODULE(_fastcore, m) {
             p.focus = focus;
             p.min_prob = min_prob;
             p.linear = linear;
+            p.depth = depth_from_py(depth);
+            p.rollouts = rollouts;
+            p.bias = bias;
+            p.debug_leaves = debug_leaves;
             py::gil_scoped_release nogil;
             return new SubgameSearch(std::shared_ptr<const SearchGame>(game), h, p);
         }), py::arg("game"), py::arg("stacks"), py::arg("button"), py::arg("actions"), py::arg("board"), py::arg("seat"),
             py::arg("hole"), py::arg("iterations") = 0, py::arg("time_budget") = 2.0, py::arg("threads") = 15, py::arg("seed") = 0,
             py::arg("focus") = 0.5, py::arg("min_prob") = 1e-3, py::arg("linear") = true, py::arg("overrides") = py::none(),
-            "the subgame of the hand so far: root at the start of the current round, ranges by Bayes over the blueprint")
+            py::arg("depth") = "end", py::arg("rollouts") = 3, py::arg("bias") = 5.0, py::arg("debug_leaves") = 0,
+            "the subgame of the hand so far: root at the start of the current round, ranges by Bayes over the blueprint; "
+            "depth 'end' / 'pluribus' / 'hu_flop_limit' / 'next_street' (leaves: four continuations, `rollouts` rollouts each)")
         .def("solve", [](SubgameSearch& s) {
             SearchResult r;
             {
@@ -1168,6 +1303,7 @@ PYBIND11_MODULE(_fastcore, m) {
             d["ids"] = r.ids;
             d["final"] = r.final_strategy;
             d["average"] = r.average_strategy;
+            d["average_table"] = r.table_average;
             d["visited"] = r.visited;
             d["iterations"] = r.iterations;
             d["traversals"] = r.traversals;
@@ -1175,6 +1311,10 @@ PYBIND11_MODULE(_fastcore, m) {
             d["nodes_touched"] = r.nodes_touched;
             d["forced"] = r.forced;
             d["redeals"] = r.redeals;
+            d["leaves"] = r.leaves;
+            d["leaf_evals"] = r.leaf_evals;
+            d["rollouts"] = r.rollouts;
+            d["rollout_steps"] = r.rollout_steps;
             d["table_size"] = r.table_size;
             d["seconds"] = r.seconds;
             d["threads"] = r.threads;
@@ -1208,6 +1348,10 @@ PYBIND11_MODULE(_fastcore, m) {
             d["n_events"] = st.n_events;
             d["n_classes"] = s.n_classes();
             d["range_seconds"] = s.range_seconds();
+            d["limit_street"] = s.limit_street();
+            d["raise_limit"] = s.raise_limit();
+            d["river_table_boards"] = s.river_table_boards();
+            d["river_table_seconds"] = s.river_table_seconds();
             return d;
         }, "the root: the public state at the start of the current betting round")
         .def("path", [](const SubgameSearch& s) {
@@ -1256,6 +1400,10 @@ PYBIND11_MODULE(_fastcore, m) {
             return out;
         }, py::arg("conditioned") = false, py::arg("our_seat") = -1, py::arg("hole") = std::vector<int>(),
            "per seat: 1326 weights (None if folded); conditioned: the other seats' combos holding `hole` removed")
+        .def("class_of", [](const SubgameSearch& s, int combo) {
+            if (combo < 0 || combo >= N_COMBOS) throw std::invalid_argument("combo: 0..1325");
+            return s.class_of(combo);
+        }, py::arg("combo"), "the combo's lossless class on the root's round (its infoset there); -1 if it meets the board")
         .def("set_reach", &SubgameSearch::set_reach, py::arg("seat"), py::arg("weights"),
              "replace a live seat's range (1326 weights)")
         .def("likelihood", [](const SubgameSearch& s, int seat, const py::object& actions) {
@@ -1285,6 +1433,82 @@ PYBIND11_MODULE(_fastcore, m) {
         }, py::arg("kind") = 0,
            "2 players, river root: (exploitability, BR gains of the two live seats) in bb per deal of the subgame, of "
            "0 the search's average strategy, 1 its final iteration, 2 the blueprint as the agent plays it")
+        .def("subgame_exploitability", [](const SubgameSearch& s, int kind, int br_street) {
+            std::vector<double> r;
+            {
+                py::gil_scoped_release nogil;
+                r = s.subgame_exploitability(kind, br_street);
+            }
+            return py::make_tuple(r[0], r[1], r[2], r[3], r[4]);
+        }, py::arg("kind") = 0, py::arg("br_street") = 0,
+           "2 players, turn or river root: (exploitability, BR gains of seat a and seat b, profile values of a and b) in bb per "
+           "deal; the river card a chance node; the best responder deviates on streets >= br_street only (3: the river play); "
+           "br_street 7 with leaves at the river start: the search's own model (deviations on the turn and in the leaf choice)")
+        .def("_river_exploitability_slow", [](const SubgameSearch& s, int kind) {
+            py::gil_scoped_release nogil;
+            return s.river_exploitability_slow(kind);
+        }, "tests: river_exploitability through pairwise showdowns")
+        .def("_leaves", [](const SubgameSearch& s, long long max_nodes) {
+            long long terminals = 0, decisions = 0;
+            std::vector<LeafInfo> leaves = s.leaf_list(max_nodes, terminals, decisions);
+            py::list out;
+            for (const LeafInfo& li : leaves) {
+                py::dict d;
+                d["actions"] = li.actions;
+                d["street"] = li.street;
+                d["raises"] = li.raises;
+                d["n_board"] = li.n_board;
+                d["reason"] = li.reason == 0 ? "next_street" : "raise_limit";
+                d["choosers"] = li.choosers;
+                out.append(d);
+            }
+            return py::make_tuple(out, terminals, decisions);
+        }, py::arg("max_nodes") = 2000000, "tests: (leaves, terminals, decision nodes) of the public tree under the depth rule")
+        .def("_rollout_policy", [](const SubgameSearch& s, const std::vector<std::pair<int, int>>& actions, int h0, int h1, int choice) {
+            std::vector<int> ids;
+            std::vector<double> p = s.rollout_policy(actions, h0, h1, choice, ids);
+            py::list names;
+            for (int id : ids) names.append(s.game().grid.names[(size_t)id]);
+            return py::make_tuple(names, p);
+        }, "tests: (names, probabilities) of the rollout policy after `actions` from the root, its actor holding (h0, h1), "
+           "continuation 0 blueprint / 1 fold / 2 call / 3 raise")
+        .def("_later_bucket", &SubgameSearch::later_bucket_of, "tests: the bucket the search uses for a hole on a later board")
+        .def("freeze_round", [](SubgameSearch& s, const py::object& src, int kind) {
+            s.freeze_round(src.is_none() ? nullptr : src.cast<const SubgameSearch*>(), kind);
+        }, py::arg("src"), py::arg("kind") = 0, py::keep_alive<1, 2>(),
+           "measurement: every player plays the root's round as the solved search `src` of the same spot does (kind 0 its "
+           "average, 1 its final iteration), frozen; solve() then learns only the later rounds; None unfreezes")
+        .def_property_readonly("is_frozen", &SubgameSearch::frozen)
+        .def("path_strategies", [](const SubgameSearch& s, int k, int kind) {
+            std::vector<std::vector<double>> rows;
+            {
+                py::gil_scoped_release nogil;
+                rows = s.path_strategies(k, kind);
+            }
+            py::list out;
+            for (const auto& r : rows) {
+                if (r.empty()) out.append(py::none());
+                else out.append(py::cast(r));
+            }
+            return out;
+        }, py::arg("k"), py::arg("kind") = 0,
+           "at real-path node k (len(path): our decision), 1326 strategies of the actor (kind 0 average, 1 final iteration); "
+           "None for combos on the board or infosets not in the table")
+        .def("_leaf_log", [](const SubgameSearch& s) {
+            py::list out;
+            for (const LeafLogEntry& e : s.leaf_log()) {
+                py::dict d;
+                d["seat"] = e.seat;
+                d["combo"] = e.combo;
+                d["cls"] = e.cls;
+                d["key"] = py::make_tuple(py::int_(e.k1), py::int_(e.k2));
+                d["path"] = py::int_(e.path);
+                d["board"] = std::vector<int>(e.board, e.board + e.n_board);
+                d["combos"] = std::vector<int>(e.combos, e.combos + s.root().n);
+                out.append(d);
+            }
+            return out;
+        }, "tests: the continuation choices logged inside the solver (debug_leaves > 0)")
         .def("_node_at_path", [](const SubgameSearch& s, int k, int h0, int h1) -> py::object {
             std::vector<double> regret, ssum;
             long long visits = 0;

@@ -163,6 +163,17 @@ struct BetGrid {
         amount = clamp_raise(obs, raise_to_for_frac(obs, a.frac));
     }
 
+    // the abstract action with id `id` on `street`, exactly as abstract_actions() builds it
+    AbstractAction action_from_id(int street, int id) const {
+        if (id == 0) return {0, FOLD, 0.0};
+        if (id == 1) return {1, CALL, 0.0};
+        if (id == 2) return {2, ALL_IN_KIND, 0.0};
+        const std::vector<int>& ids = ids_for(street);
+        const std::vector<double>& fracs = fracs_for(street);
+        for (size_t k = 0; k < ids.size(); k++) if (ids[k] == id) return {id, RAISE, fracs[k]};
+        throw std::logic_error("unknown action id");
+    }
+
     AbstractAction action_from_name(const std::string& s) {
         if (s == "f") return {0, FOLD, 0.0};
         if (s == "c") return {1, CALL, 0.0};
@@ -414,6 +425,43 @@ public:
         evictions_.fetch_add(1, std::memory_order_relaxed);
     }
 
+    // every occupied slot's word (key << VALUE_BITS | value): the cache's contents, for saving
+    std::vector<uint64_t> words() const {
+        std::vector<uint64_t> out;
+        const std::atomic<uint64_t>* t = table_.load(std::memory_order_acquire);
+        if (!t) return out;
+        const size_t total = n_sets_ * WAYS;
+        for (size_t i = 0; i < total; i++) {
+            const uint64_t w = t[i].load(std::memory_order_relaxed);
+            if (w != 0) out.push_back(w);
+        }
+        return out;
+    }
+    // insert saved words (not counted as computes); returns how many did not fit without an eviction
+    size_t load(const uint64_t* w, size_t n) {
+        if (n_sets_ == 0) return n;
+        std::atomic<uint64_t>* t = table_.load(std::memory_order_acquire);
+        if (!t) t = allocate();
+        size_t evicted = 0;
+        for (size_t i = 0; i < n; i++) {
+            const uint64_t word = w[i];
+            const uint64_t key = word >> VALUE_BITS;
+            std::atomic<uint64_t>* set = t + set_index(key) * WAYS;
+            bool placed = false;
+            for (int k = 0; k < WAYS && !placed; k++) {
+                uint64_t cur = set[k].load(std::memory_order_relaxed);
+                if (cur == 0 && set[k].compare_exchange_strong(cur, word, std::memory_order_relaxed)) placed = true;
+                else if ((cur & ~VALUE_MASK) == (word & ~VALUE_MASK)) placed = true;
+            }
+            if (!placed) {
+                set[i % WAYS].store(word, std::memory_order_relaxed);
+                evicted++;
+                evictions_.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        return evicted;
+    }
+
     // occupied slots: a scan of the whole table (for reporting only)
     size_t size() const {
         const std::atomic<uint64_t>* t = table_.load(std::memory_order_acquire);
@@ -507,6 +555,9 @@ public:
     virtual bool fitted() const = 0;
     virtual int bucket(const int* hole, const int* board, int n_board) = 0;
     virtual BucketerIdentity identity() const = 0;
+    // the postflop bucket of a canonical form, computed without the cache (thread-safe, const):
+    // bucket() == bucket_of_form(canonical_form(...)) for every postflop hand (bucket tables)
+    virtual int bucket_of_form(const CanonicalForm& cf) const = 0;
     const HoleClasses& classes() const { return classes_; }
 
     // {flop, turn, river} capacities in entries (missing -> default); call before training
@@ -523,6 +574,13 @@ public:
         return caches_[FLOP].size() + caches_[TURN].size() + caches_[RIVER].size();
     }
     FormCacheStats cache_stats(int street) const { return caches_[street].stats(); }
+    // the cached values of a street (saved to disk and loaded back by persist.h)
+    std::vector<uint64_t> cache_words(int street) const { return caches_[street].words(); }
+    size_t load_cache_words(int street, const uint64_t* w, size_t n) { return caches_[street].load(w, n); }
+
+    // River buckets of every hole on a 5-card board at once, when the abstraction allows a batch
+    // with the same numbers as bucket() (false: use bucket()); out[combo index] (255 on the board).
+    virtual bool river_buckets_all(const int* /*board5*/, const int (*/*combo_index*/)[52], uint8_t* /*out*/) const { return false; }
 
 protected:
     HoleClasses classes_;
@@ -583,6 +641,16 @@ public:
         const std::vector<double>& cuts = boundaries[street];
         if (cuts.empty()) throw std::runtime_error("bucketer not fitted");
         double e = ehs(hole, board, n_board);
+        return (int)(std::upper_bound(cuts.begin(), cuts.end(), e) - cuts.begin());
+    }
+
+    int bucket_of_form(const CanonicalForm& cf) const override {
+        const std::vector<double>& cuts = boundaries[street_of_board(cf.n_board)];
+        if (cuts.empty()) throw std::runtime_error("bucketer not fitted");
+        uint64_t seed = (uint64_t)canonical_key_hash(cf) & 0xFFFFFFFFULL;
+        PyRandom rng(seed);
+        double won = equity_won_vs_random(cf.hole, 2, cf.board, cf.n_board, 1, samples, rng);
+        double e = decode((uint32_t)(won * 2.0));
         return (int)(std::upper_bound(cuts.begin(), cuts.end(), e) - cuts.begin());
     }
 
@@ -705,6 +773,65 @@ public:
         return river_equity_exact(cf.hole, cf.board, cf.n_board);
     }
 
+    // bucket() of every hole on one river board: the 1081 hands of the 47 other cards are
+    // evaluated once and sorted; a hole's opponents are those 1081 minus the 91 sharing one of its
+    // cards, so its wins and ties are counts over the sorted list minus those 91.  won = wins +
+    // ties / 2 is the same number river_equity_exact accumulates (sums of 1.0 and 0.5, exact), won /
+    // 990 the same double, so the same bucket (checked in tests against bucket()).
+    bool river_buckets_all(const int* board, const int (*idx)[52], uint8_t* out) const override {
+        const std::vector<double>& cuts = boundaries[RIVER];
+        if (cuts.empty()) return false;
+        bool on_board[52] = {false};
+        for (int i = 0; i < 5; i++) on_board[board[i]] = true;
+        int rest[52];
+        int nr = 0;
+        for (int c = 0; c < 52; c++) if (!on_board[c]) rest[nr++] = c;
+        static thread_local std::vector<int64_t> str, all;
+        str.assign(52 * 52, 0);
+        all.clear();
+        int cards[7];
+        for (int i = 0; i < 5; i++) cards[2 + i] = board[i];
+        for (int i = 0; i < nr; i++) {
+            for (int j = i + 1; j < nr; j++) {
+                cards[0] = rest[i];
+                cards[1] = rest[j];
+                const int64_t s = evaluate(cards, 7);
+                str[(size_t)(rest[i] * 52 + rest[j])] = str[(size_t)(rest[j] * 52 + rest[i])] = s;
+                all.push_back(s);
+            }
+        }
+        std::sort(all.begin(), all.end());
+        for (int c = 0; c < 52; c++)
+            for (int d = c + 1; d < 52; d++)
+                if (on_board[c] || on_board[d]) out[idx[c][d]] = 255;
+        for (int i = 0; i < nr; i++) {
+            for (int j = i + 1; j < nr; j++) {
+                const int a = rest[i], b = rest[j];
+                const int64_t s = str[(size_t)(a * 52 + b)];
+                long long lower = std::lower_bound(all.begin(), all.end(), s) - all.begin();
+                long long equal = (std::upper_bound(all.begin(), all.end(), s) - all.begin()) - lower;
+                for (int k = 0; k < nr; k++) {
+                    const int y = rest[k];
+                    if (y != a) {
+                        const int64_t t = str[(size_t)(a * 52 + y)];
+                        if (t < s) lower--;
+                        else if (t == s) equal--;
+                    }
+                    if (y != b) {
+                        const int64_t t = str[(size_t)(b * 52 + y)];
+                        if (t < s) lower--;
+                        else if (t == s) equal--;
+                    }
+                }
+                equal++;  // (a, b) itself was removed twice
+                const double won = (double)lower + 0.5 * (double)equal;
+                const double e = won / (double)((nr - 2) * (nr - 3) / 2);
+                out[idx[a][b]] = (uint8_t)(std::upper_bound(cuts.begin(), cuts.end(), e) - cuts.begin());
+            }
+        }
+        return true;
+    }
+
     int bucket(const int* hole, const int* board, int n_board) override {
         if (n_board == 0) return classes_.of(hole[0], hole[1]);
         CanonicalForm cf;
@@ -717,6 +844,8 @@ public:
         caches_[street].put(key, (uint32_t)b);
         return b;
     }
+
+    int bucket_of_form(const CanonicalForm& cf) const override { return bucket_canonical(cf); }
 
 private:
     int bucket_canonical(const CanonicalForm& cf) const {

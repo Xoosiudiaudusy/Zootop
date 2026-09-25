@@ -414,6 +414,32 @@ def test_river_subgame_average_strategy_converges_below_the_blueprint(trained):
     assert all(v >= -1e-9 for v in ex[1])  # a best response never loses against the strategy it answers
 
 
+def test_exact_evaluator_on_turn_and_river_roots(trained):
+    """The prefix-sum showdowns equal the pairwise ones on river roots; on turn roots (the river card a
+    chance node) the profile's values of the two seats sum to zero, best responses gain >= 0, and a
+    best response on the river alone gains no more than one on the turn and the river."""
+    spec, _, game, _ = trained[2]
+    st, acts = line_hand(spec, ["r1", "c", "c", "c", "c", "c"])
+    s = make_search(game, st, acts, iterations=20_000, time_budget=0.0, threads=4)
+    s.solve()
+    for kind in (0, 1, 2):
+        assert list(s.river_exploitability(kind)) == pytest.approx(s._river_exploitability_slow(kind), rel=1e-9, abs=1e-12)
+    st, acts = line_hand(spec, ["r1", "c", "c", "c"])
+    assert st.street == Street.TURN
+    # deterministic: the river cards' subtrees are summed in card order, whatever the thread count
+    blueprint = [make_search(game, st, acts, threads=t).subgame_exploitability(2, b) for t in (1, 4) for b in (2, 3)]
+    assert blueprint[:2] == blueprint[2:]
+    for depth in ("end", "next_street"):
+        s = make_search(game, st, acts, iterations=20_000, time_budget=0.0, threads=4, depth=depth)
+        s.solve()
+        for kind in (0, 1, 2):
+            full = s.subgame_exploitability(kind, 2)
+            river = s.subgame_exploitability(kind, 3)
+            assert abs(full[3] + full[4]) < 1e-9 and full[3] == river[3], (depth, kind, full)
+            assert min(full[1], full[2], river[1], river[2]) > -1e-9, (depth, kind, full, river)
+            assert river[1] <= full[1] + 1e-9 and river[2] <= full[2] + 1e-9, (depth, kind, full, river)
+
+
 # ============================================================ the solver itself
 def test_solve_respects_budgets_and_returns_distributions(trained):
     spec, _, game, _ = trained[2]
@@ -430,3 +456,355 @@ def test_solve_respects_budgets_and_returns_distributions(trained):
     with pytest.raises(RuntimeError):  # not our turn: nothing to solve
         core.SubgameSearch(game, list(st.starting_stacks), st.button, acts, list(st.board), 1 - st.current_player,
                            list(st.players[1 - st.current_player].hole), iterations=10).solve()
+
+
+# ============================================================ part 2: depth limits and leaves
+def line_hand(spec: GameSpec, names, seed: int = 5):
+    """A hand along grid action names (button 0), from a shuffled deck."""
+    order = list(range(52))
+    random.Random(seed).shuffle(order)
+    st = spec.new_hand(order, button=0)
+    acts = []
+    for name in names:
+        a = spec.grid.to_concrete(st.observe(st.current_player), name)
+        _act(st, acts, a)
+    return st, acts
+
+
+LINES = {  # root street -> line to a decision on it (2 and 3 players, button 0)
+    2: {Street.PREFLOP: [], Street.FLOP: ["r1", "c"], Street.TURN: ["r1", "c", "c", "c"], Street.RIVER: ["r1", "c", "c", "c", "c", "c"]},
+    3: {Street.PREFLOP: [], Street.FLOP: ["r1", "c", "c"], Street.TURN: ["r1", "c", "c", "c", "c", "c"],
+        Street.RIVER: ["r1", "c", "c", "c", "c", "c", "c", "c", "c"]},
+}
+
+
+@pytest.mark.parametrize("players", [2, 3])
+def test_leaves_are_exactly_where_each_depth_rule_puts_them(trained, players):
+    spec, _, game, _ = trained[players]
+    for root, line in LINES[players].items():
+        st, acts = line_hand(spec, line)
+        assert st.street == root
+        for mode in ("end", "pluribus", "hu_flop_limit", "next_street"):
+            s = make_search(game, st, acts, depth=mode)
+            info = s.root_info()
+            if mode == "end" and root <= Street.FLOP:  # the whole rest of the game: too big to enumerate here
+                assert info["limit_street"] == 3 and info["raise_limit"] == 0
+                continue
+            leaves, terminals, decisions = s._leaves(3_000_000)
+            assert terminals > 0 and decisions > 0
+            if mode == "end" or root == Street.RIVER:
+                expect = None
+            elif root == Street.PREFLOP:
+                expect = Street.FLOP  # every rule: the first round searches to its end
+            elif mode == "pluribus":
+                expect = Street.TURN if (root == Street.FLOP and players > 2) else None
+            elif mode == "hu_flop_limit":
+                expect = Street.TURN if root == Street.FLOP else None
+            else:
+                expect = Street(int(root) + 1)
+            if expect is None:
+                assert leaves == [] and info["limit_street"] == 3, (mode, root, leaves[:2])
+                continue
+            assert leaves, (mode, root)
+            raise_rule = mode == "pluribus" and root == Street.FLOP and players > 2
+            for lf in leaves:
+                if lf["reason"] == "next_street":
+                    # the first node of the next street: nothing played on it yet, its cards dealt,
+                    # at least two players left to act (else the engine runs the board out)
+                    assert lf["street"] == int(expect) and lf["raises"] == 0, lf
+                    assert lf["n_board"] == {Street.FLOP: 3, Street.TURN: 4, Street.RIVER: 5}[expect]
+                    assert lf["choosers"] >= 2
+                else:
+                    # right after the second raise (an all-in may leave one player to answer it)
+                    assert raise_rule and lf["street"] == int(Street.FLOP) and lf["raises"] == 2, lf
+                    assert lf["actions"][-1][0] == 2 and lf["choosers"] >= 1
+            reasons = {lf["reason"] for lf in leaves}
+            assert reasons == ({"next_street", "raise_limit"} if raise_rule else {"next_street"}), (mode, root, reasons)
+
+
+def test_raise_limit_spares_the_real_path_up_to_our_decision(trained):
+    spec, _, game, _ = trained[3]
+    st, acts = line_hand(spec, ["r1", "c", "c", "r0.5", "r1"])  # flop: SB bets, BB raises: two raises, BTN to act
+    assert st.street == Street.FLOP and st.raises_this_street == 2 and st.current_player == 0
+    s = make_search(game, st, acts, depth="pluribus")
+    leaves, terminals, decisions = s._leaves(100_000)
+    path = [(p["type"], p["amount"]) for p in s.path()]
+    assert len(path) == 2
+    # nothing on the real path up to our decision is a leaf (our decision comes after the second raise) ...
+    assert not any(lf["actions"] == path[:j] for lf in leaves for j in range(3))
+    # ... and every action of ours ends in a leaf right there (or the hand ends)
+    below = [lf for lf in leaves if lf["actions"][:2] == path]
+    assert below and all(len(lf["actions"]) == 3 and lf["reason"] == "raise_limit" for lf in below)
+    ours = len(s._rollout_policy(path, st.players[0].hole[0], st.players[0].hole[1], 0)[0])
+    assert len(below) <= ours
+    r = s.solve()
+    assert r["visited"] and r["leaves"] > 0
+
+
+def test_continuations_multiply_fold_call_or_raises_by_five_and_renormalise(trained):
+    kinds = [0, 1, 2, 2, 2]
+    p = [0.1, 0.4, 0.2, 0.2, 0.1]
+
+    def py(choice):
+        q = list(p)
+        want = {1: 0, 2: 1, 3: 2}.get(choice)
+        if want is None:
+            return q
+        s = 0.0
+        for i, k in enumerate(kinds):
+            if k == want:
+                q[i] *= 5.0
+            s += q[i]
+        return [x / s for x in q]
+
+    for choice in range(4):
+        assert core.apply_continuation(kinds, p, choice) == py(choice)
+    assert core.apply_continuation(kinds, p, 3) == [0.1 / 3.0, 0.4 / 3.0, 1.0 / 3.0, 1.0 / 3.0, 0.5 / 3.0]
+    # the rollout policy at real states: BlueprintStrategy.policy at the key BlueprintAgent builds
+    # (bucket, history translated deterministically, off-grid sizes included), check / call when the
+    # key is unknown, then the continuation
+    spec, t, game, cbk = trained[2]
+    strategy = t.strategy()
+    grid = spec.grid
+    rng = random.Random(8)
+    checked = unknown = 0
+    for trial in range(60):
+        st, acts = random_hand(spec, rng, rng.choice([Street.FLOP, Street.TURN, Street.RIVER]), off_grid=0.3)
+        root = int(st.street)
+        # search from the root of this round, ask for the policy at the current state
+        s = make_search(game, st, acts, depth="next_street" if root < 3 else "end")
+        k0 = s.root_info()["n_events"]
+        obs = st.observe(st.current_player)
+        for hole in ([obs.hole[0], obs.hole[1]], None):
+            if hole is None:
+                free = [c for c in range(52) if c not in obs.board and c not in obs.hole]
+                hole = rng.sample(free, 2)
+            b = cbk.bucket(hole, list(obs.board))
+            legal = grid.abstract_actions(obs)
+            base = strategy.policy(infoset_key_for_bucket(obs, b, grid), legal)
+            if base is None:
+                unknown += 1
+                base = [1.0 if n == "c" else 0.0 for n in legal]
+            kinds_here = [0 if n == "f" else 1 if n == "c" else 2 for n in legal]
+            for choice in range(4):
+                names, got = s._rollout_policy(acts[k0:], hole[0], hole[1], choice)
+                assert names == legal
+                want = core.apply_continuation(kinds_here, base, choice)
+                assert got == pytest.approx(want, abs=1e-15), (trial, choice)
+                checked += 1
+    assert checked > 400 and unknown < checked / 4
+
+
+def test_leaf_choices_are_shared_by_a_players_indistinguishable_leaves(trained):
+    spec, _, game, _ = trained[2]
+    st, acts = _flop_hand(spec, flop_board=[0, 20, 44])  # a one-suit flop: the other three suits are interchangeable
+    s = make_search(game, st, acts, depth="hu_flop_limit", iterations=4000, time_budget=0.0, threads=2, debug_leaves=20000)
+    r = s.solve()
+    log = s._leaf_log()
+    assert len(log) == 20000 and r["leaves"] > 0
+    groups = {}
+    for e in log:
+        groups.setdefault((e["seat"], e["cls"], e["path"]), []).append(e)
+    # one key per (player, class of its hole on the flop, public path) ...
+    for (seat, cls, path), es in groups.items():
+        assert len({e["key"] for e in es}) == 1
+    # ... whatever the turn card or the other player's hole at that leaf
+    varied = [es for es in groups.values()
+              if len({e["board"][3] for e in es}) > 1 and len({e["combos"][1 - e["seat"]] for e in es}) > 1]
+    assert len(varied) > 10
+    # and different classes, seats or paths never share a key
+    keys = {}
+    for (seat, cls, path), es in groups.items():
+        assert keys.setdefault(es[0]["key"], (seat, cls, path)) == (seat, cls, path)
+    # suit-isomorphic holes (one class) do share it
+    assert any(len({e["combo"] for e in es}) > 1 for es in groups.values())
+
+
+def test_leaf_values_use_the_given_number_of_rollouts(trained):
+    spec, _, game, _ = trained[2]
+    st, acts = line_hand(spec, ["r1", "c"])
+    for n in (3, 1, 5):
+        s = make_search(game, st, acts, depth="hu_flop_limit", iterations=300, time_budget=0.0, threads=2, rollouts=n)
+        r = s.solve()
+        assert r["leaf_evals"] > 0 and r["rollouts"] == n * r["leaf_evals"], (n, r["rollouts"], r["leaf_evals"])
+        assert r["leaves"] > 0 and r["rollout_steps"] >= r["rollouts"]
+    r = make_search(game, st, acts, depth="end", iterations=300, time_budget=0.0, threads=2).solve()
+    assert r["leaves"] == r["leaf_evals"] == r["rollouts"] == 0
+
+
+def test_search_tables_and_presampled_actions(trained, bucketer):
+    """The per-search turn and river bucket tables give the bucketer's buckets; with pre-sampled
+    actions a rollout plays one legal action of positive blueprint probability per infoset and
+    continuation, the same every time."""
+    from negpluribus.abstraction import PotentialAwareBucketer
+    from negpluribus.fast.trainer import core_bucketer, spec_to_dict
+
+    spec, t, _, _ = trained[2]
+    pot = PotentialAwareBucketer(n_buckets=8, samples=6, bins=10).fit(n_situations=120, seed=3)
+    pspec = GameSpec(n_players=2, stack_bb=30, max_street=Street.RIVER, n_buckets=8, max_raises_per_street=2,
+                     preflop_fracs=(1.0,), postflop_fracs=(0.5, 1.0), bucket_kind="potential")
+    pbk = core_bucketer(pot)
+    pt = MCCFRTrainer(pspec, pot, seed=1, backend="cpp", threads=4).train(3000)
+    game = core.SearchGame(spec_to_dict(pspec), pbk, pt.blueprint().lookup)
+    st, acts = line_hand(pspec, ["r1", "c"])
+    s = make_search(game, st, acts, depth="hu_flop_limit")
+    info = s.root_info()
+    assert info["river_table_boards"] == 1176
+    rng = random.Random(4)
+    free = [c for c in range(52) if c not in st.board]
+    for _ in range(300):
+        cards = rng.sample(free, 4)
+        hole, extra = cards[:2], cards[2:]
+        assert s._later_bucket(hole[0], hole[1], list(st.board) + extra[:1]) == pbk.bucket(hole, list(st.board) + extra[:1])
+        assert s._later_bucket(hole[0], hole[1], list(st.board) + extra) == pbk.bucket(hole, list(st.board) + extra)
+    # pre-sampled continuation actions (a game of its own: the choice is per SearchGame)
+    game2 = core.SearchGame(spec_to_dict(spec), core_bucketer(bucketer), t.blueprint().lookup)
+    rng = random.Random(9)
+    checks = 0
+    for trial in range(40):
+        st, acts = random_hand(spec, rng, rng.choice([Street.FLOP, Street.TURN, Street.RIVER]), off_grid=0.0)
+        s = make_search(game2, st, acts)
+        k0 = s.root_info()["n_events"]
+        h = st.players[st.current_player].hole
+        full = {c: s._rollout_policy(acts[k0:], h[0], h[1], c) for c in range(4)}
+        game2.presample(trial)
+        for c in range(4):
+            names, p = s._rollout_policy(acts[k0:], h[0], h[1], c)
+            assert names == full[c][0]
+            if max(full[c][1]) < 1.0 or p != full[c][1]:  # a known key: one action, of positive probability
+                assert sorted(p) == [0.0] * (len(p) - 1) + [1.0]
+                assert full[c][1][p.index(1.0)] > 0.0
+                assert s._rollout_policy(acts[k0:], h[0], h[1], c)[1] == p
+                checks += 1
+        game2.clear_presampled()
+        assert s._rollout_policy(acts[k0:], h[0], h[1], 0) == full[0]
+    assert checks > 40
+
+
+def test_our_average_is_accumulated_every_iteration(trained):
+    """solve()["average"] adds up our decision's strategy once per iteration (our hole's own reach
+    there is fixed), so it exists even when our hole is too unlikely in our range for the opponents'
+    traversals to deal it (the node's accumulated average, "average_table", then stays uniform);
+    where they do deal it, the two agree."""
+    spec, _, game, _ = trained[2]
+    st, acts = line_hand(spec, ["r1", "c", "c", "c", "c", "c", "c", "r1"])  # river: BB checks, SB bets pot
+    assert st.street == Street.RIVER and st.current_player == 1
+    seat = st.current_player
+    s = make_search(game, st, acts, iterations=40_000, time_budget=0.0, threads=2)
+    r = s.solve()
+    tv = 0.5 * sum(abs(a - b) for a, b in zip(r["average"], r["average_table"]))
+    assert abs(sum(r["average"]) - 1) < 1e-9 and tv < 0.15, (r["average"], r["average_table"])
+    ours = s.class_of(core.combo_index(*st.players[seat].hole))
+    w = s.ranges()[seat]
+    s2 = make_search(game, st, acts, iterations=40_000, time_budget=0.0, threads=2)
+    s2.set_reach(seat, [x * 1e-12 if s2.class_of(c) == ours else x for c, x in enumerate(w)])
+    r2 = s2.solve()
+    n = len(r2["average"])
+    assert r2["average_table"] == pytest.approx([1.0 / n] * n)  # never dealt to the opponents' traversals
+    assert abs(sum(r2["average"]) - 1) < 1e-9 and max(r2["average"]) > 1.0 / n + 0.2, r2["average"]
+
+
+def test_a_search_with_leaves_converges_in_its_own_model(trained):
+    """Leaves at the river start: the exact exploitability inside the search's own model (the best
+    responder deviating on the turn and choosing its best continuation at a leaf, before the river
+    card; the river then played by the continuations) falls with iterations, so the leaf values the
+    search learns from are those of the model; a best responder free on the river gains at least as
+    much, and both measure the same profile."""
+    spec, _, game, _ = trained[2]
+    st, acts = line_hand(spec, ["r1", "c", "c", "c"])
+    assert st.street == Street.TURN
+    out = {}
+    for iters in (2_000, 100_000):
+        s = make_search(game, st, acts, iterations=iters, time_budget=0.0, threads=4, depth="next_street")
+        s.solve()
+        for kind in (0, 1):
+            model = s.subgame_exploitability(kind, 7)
+            full = s.subgame_exploitability(kind, 2)
+            assert model[3] == full[3] and model[4] == full[4]  # the same profile
+            assert min(model[1], model[2]) > -1e-9 and model[1] <= full[1] + 1e-9 and model[2] <= full[2] + 1e-9, (model, full)
+        out[iters] = s.subgame_exploitability(0, 7)[0]
+    assert out[100_000] < 0.4 * out[2_000], out
+    s = make_search(game, st, acts, iterations=100, time_budget=0.0, threads=2, depth="end")
+    s.solve()
+    with pytest.raises(RuntimeError, match="leaf game"):
+        s.subgame_exploitability(0, 7)
+
+
+def test_a_frozen_round_is_played_as_the_source_search_says(trained):
+    """freeze_round (a measurement tool): every player plays the root's round as another solved search
+    of the same spot says, and solve() learns only the later rounds.  On a river root everything is
+    frozen: the profile, our strategy and the exact exploitability are the source's.  On a turn root
+    the turn rows are the source's and the river is learned."""
+    spec, _, game, _ = trained[2]
+    st, acts = line_hand(spec, ["r1", "c", "c", "c", "c", "c"])
+    assert st.street == Street.RIVER
+    src = make_search(game, st, acts, iterations=5000, time_budget=0.0, threads=4)
+    rs = src.solve()
+    k = len(src.path())
+    for kind in (0, 1):
+        s = make_search(game, st, acts, iterations=500, time_budget=0.0, threads=4)
+        s.freeze_round(src, kind)
+        assert s.is_frozen
+        r = s.solve()
+        want = rs["average_table"] if kind == 0 else rs["final"]  # the profile's average (the node's)
+        assert r["table_size"] == 0 and r["average"] == want and r["final"] == want
+        assert s.path_strategies(k, 0) == s.path_strategies(k, 1) == src.path_strategies(k, kind)
+        assert s.subgame_exploitability(0, 3) == s.subgame_exploitability(1, 3) == src.subgame_exploitability(kind, 3)
+    other_st, other_acts = line_hand(spec, ["r1", "c", "c", "c", "c", "c"], seed=6)
+    with pytest.raises(ValueError, match="another spot"):
+        make_search(game, other_st, other_acts).freeze_round(src, 0)
+    with pytest.raises(RuntimeError, match="solve the source"):
+        s.freeze_round(make_search(game, st, acts), 0)
+    s.freeze_round(None)
+    assert not s.is_frozen
+    # a turn root: the turn frozen to a search with leaves at the river start, the river learned
+    st, acts = line_hand(spec, ["r1", "c", "c", "c"])
+    assert st.street == Street.TURN
+    src = make_search(game, st, acts, iterations=20_000, time_budget=0.0, threads=4, depth="next_street")
+    rs = src.solve()
+    k = len(src.path())
+    river = {}
+    for iters in (1, 20_000):
+        s = make_search(game, st, acts, iterations=iters, time_budget=0.0, threads=4, depth="end")
+        s.freeze_round(src, 0)
+        r = s.solve()
+        assert r["average"] == rs["average_table"] and s.path_strategies(k, 1) == src.path_strategies(k, 0)
+        assert r["table_size"] > 0 and r["leaves"] == 0
+        river[iters] = s.subgame_exploitability(0, 3)[0]
+    assert river[20_000] < 0.5 * river[1], river  # the river play learned (after one iteration: uniform)
+
+
+def test_bucket_caches_save_load_and_river_batch(bucketer, tmp_path):
+    from negpluribus.abstraction import PotentialAwareBucketer
+    from negpluribus.fast.trainer import core_bucketer
+
+    assert core.canonical_boards(3) == 1755 and core.canonical_boards(4) == 16432
+    cbk = core_bucketer(bucketer)
+    rng = random.Random(2)
+    forms = []
+    for _ in range(300):
+        cards = rng.sample(range(52), 6)
+        forms.append((cards[:2], cards[2:]))
+    values = [cbk.bucket(h, b) for h, b in forms]
+    path = str(tmp_path / "cache.bin")
+    cbk.save_cache(path, [1, 2])
+    fresh = core_bucketer(bucketer)
+    loaded = fresh.load_cache(path)
+    assert [x[0] for x in loaded] == [1, 2] and sum(x[1] for x in loaded) >= 300 and all(x[2] == 0 for x in loaded)
+    assert [fresh.bucket(h, b) for h, b in forms] == values
+    assert fresh.cache_stats()["flop"]["computes"] == 0 and fresh.cache_stats()["turn"]["computes"] == 0  # all served by the cache
+    other = EquityBucketer(bucketer.n_buckets, bucketer.samples)
+    other.boundaries = {k: [x + 1e-9 for x in v] for k, v in bucketer.boundaries.items()}
+    with pytest.raises(RuntimeError, match="other buckets"):
+        core_bucketer(other).load_cache(path)
+    # batch river buckets: the numbers of bucket() for potential-aware buckets; none for E[HS]
+    pot = core_bucketer(PotentialAwareBucketer(n_buckets=8, samples=6, bins=10).fit(n_situations=120, seed=3))
+    for _ in range(4):
+        board = rng.sample(range(52), 5)
+        allb = pot.river_buckets_all(board)
+        for a, b in rng.sample(COMBOS, 200):
+            if a in board or b in board:
+                assert allb[core.combo_index(a, b)] == 255
+            else:
+                assert allb[core.combo_index(a, b)] == pot.bucket([a, b], board)
+    assert cbk.river_buckets_all(rng.sample(range(52), 5)) is None

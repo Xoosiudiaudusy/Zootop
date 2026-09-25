@@ -16,11 +16,12 @@
 // import; in test mode (Trainer::verify_keys) every lookup compares it with the string
 // infoset_key would build, which checks the bijection on every key a test visits.
 //
-// Table.  Power-of-two open addressing with linear probing; 32-byte slots {k1, k2, node, key
-// string}; grown at load 1/2.  find: lock-free (acquire load of the node pointer, then the keys).
+// Table.  Power-of-two open addressing with linear probing; 16-byte slots {k1, node} (k2 and the
+// key string are stored in the node); grown at load 1/2.  find: lock-free (acquire load of the
+// node pointer, then k1 in the slot and k2 in the node).
 // insert: the node and its key string are prepared first (the calling thread's arena), then the
-// empty slot is claimed with one CAS (nullptr -> CLAIMED), the keys and the key pointer are
-// written and the node pointer is published with a release store; a thread that meets a CLAIMED
+// empty slot is claimed with one CAS (nullptr -> CLAIMED), k1 is written and the node pointer
+// is published with a release store; a thread that meets a CLAIMED
 // slot waits for that publication (a few stores).  Slots never become empty again, so every
 // inserter of a key walks the same probe sequence and meets the first claim for it: a node is
 // never duplicated or dropped.  Growth needs exclusive access: when a table passes load 1/2, its
@@ -37,6 +38,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -61,37 +63,102 @@ inline void cpu_relax() {
 
 constexpr int MAX_ACTIONS = 8;
 
+// Per-node lock, held for a handful of arithmetic operations.  Waiters spin with a pause and give
+// their time slice away after a while: with more runnable threads than cores (other programs, or
+// threads > cores) the holder may be preempted, and pure spinning then burns whole time slices
+// (measured: 16 threads on 4 cores lost 46% of the 4-thread throughput with the pure spin).
 struct SpinLock {
     std::atomic<bool> flag{false};
-    void lock() { while (flag.exchange(true, std::memory_order_acquire)) { while (flag.load(std::memory_order_relaxed)) {} } }
+    void lock() {
+        if (!flag.exchange(true, std::memory_order_acquire)) return;
+        int spins = 0;
+        for (;;) {
+            while (flag.load(std::memory_order_relaxed)) {
+                if (++spins < 64) cpu_relax();
+                else { std::this_thread::yield(); spins = 0; }
+            }
+            if (!flag.exchange(true, std::memory_order_acquire)) return;
+        }
+    }
     void unlock() { flag.store(false, std::memory_order_release); }
 };
+
+// One infoset.  In a table a Node is allocated with room for exactly its `n` actions: regret and
+// strategy sum live in `data` ([0, n) and [n, 2n)), and only Node::bytes_for(n) bytes exist, so
+// the average node takes ~40 + 16 * 2.6 bytes instead of the full struct.  A Node declared as a
+// local variable (scratch space) has the full capacity.  The second lane of the numeric key and
+// the key string live here too, so a table slot is only {k1, node} (nodetable.h, FlatNodeTable).
+// Key strings of nodes created by a history-tree traversal are not stored: `key` then points at the
+// HistNode (histtree.h), `key_in_tree` is set and `key_bucket` holds the bucket, and the string is
+// spelled on demand (key_string()).  Imported / string-created nodes keep an arena copy.
+void spell_tree_key(const void* hist_node, int bucket, std::string& out);  // histtree.h
 
 struct Node {
     uint8_t n = 0;
     uint8_t acts[MAX_ACTIONS];
-    double regret[MAX_ACTIONS];
-    double strategy_sum[MAX_ACTIONS];
-    long long visits = 0;
     SpinLock lock;
+    uint8_t key_in_tree = 0;    // 1: `key` is a HistNode*, the string is spelled from it
+    uint16_t key_bucket = 0;    // bucket of a tree-referenced key
+    long long visits = 0;
+    uint64_t k2 = 0;            // NodeKey::k2 of the node (set before it is published)
+    const char* key = nullptr;  // its key string (NUL-terminated, in the table's arena), or see key_in_tree
+    double data[2 * MAX_ACTIONS];
+
+    // make `key` a reference to history node `h` with bucket `b` (call in the insert's init)
+    const char* refer_to_tree(const void* h, int b) {
+        key_in_tree = 1;
+        key_bucket = (uint16_t)b;
+        return static_cast<const char*>(h);
+    }
+    void set_key_string(const char* s) {
+        key = s;
+        key_in_tree = 0;
+    }
+    // the key string; a spelled key lives in a per-thread buffer until the 4th next call
+    const char* key_string() const {
+        if (!key_in_tree) return key;
+        thread_local std::string ring[4];
+        thread_local int next = 0;
+        std::string& out = ring[next];
+        next = (next + 1) & 3;
+        spell_tree_key(static_cast<const void*>(key), key_bucket, out);
+        return out.c_str();
+    }
+
+    double* regret() { return data; }
+    const double* regret() const { return data; }
+    double* strategy_sum() { return data + n; }
+    const double* strategy_sum() const { return data + n; }
+
+    // bytes of a node with k actions (the struct up to data, then 2k doubles)
+    static size_t bytes_for(int k) {
+        static const size_t head = [] {
+            Node probe;
+            return (size_t)(reinterpret_cast<const char*>(&probe.data[0]) - reinterpret_cast<const char*>(&probe));
+        }();
+        return head + sizeof(double) * 2 * (size_t)k;
+    }
 
     void init(const uint8_t* ids, int k) {
         n = (uint8_t)k;
-        for (int i = 0; i < k; i++) { acts[i] = ids[i]; regret[i] = 0.0; strategy_sum[i] = 0.0; }
+        for (int i = 0; i < k; i++) acts[i] = ids[i];
+        for (int i = 0; i < 2 * k; i++) data[i] = 0.0;
         visits = 0;
     }
     // Node.current_strategy() with CPython sum() semantics; caller holds the lock
     void current_strategy(double* out) const {
         double pos[MAX_ACTIONS];
-        for (int i = 0; i < n; i++) pos[i] = regret[i] > 0 ? regret[i] : 0.0;
+        const double* r = regret();
+        for (int i = 0; i < n; i++) pos[i] = r[i] > 0 ? r[i] : 0.0;
         double s = py_sum(pos, n);
         if (s <= 0) { for (int i = 0; i < n; i++) out[i] = 1.0 / n; return; }
         for (int i = 0; i < n; i++) out[i] = pos[i] / s;
     }
     void average_strategy(double* out) const {
-        double s = py_sum(strategy_sum, n);
+        const double* ss = strategy_sum();
+        double s = py_sum(ss, n);
         if (s <= 0) { for (int i = 0; i < n; i++) out[i] = 1.0 / n; return; }
-        for (int i = 0; i < n; i++) out[i] = strategy_sum[i] / s;
+        for (int i = 0; i < n; i++) out[i] = ss[i] / s;
     }
 };
 
@@ -246,17 +313,21 @@ private:
 // node prepared for an insert that another thread won is simply never published).
 class NodeArena {
 public:
-    static constexpr size_t NODES_PER_CHUNK = 1024;
+    static constexpr size_t BYTES_PER_CHUNK = 256 * 1024;
     static constexpr size_t CHARS_PER_CHUNK = 64 * 1024;
 
-    Node* new_node() {
-        if (node_left_ == 0) {
-            node_chunks_.emplace_back(new Node[NODES_PER_CHUNK]);
-            node_next_ = node_chunks_.back().get();
-            node_left_ = NODES_PER_CHUNK;
+    // a node with room for exactly `k` actions (not initialised beyond the header defaults)
+    Node* new_node(int k) {
+        const size_t need = (Node::bytes_for(k) + 7) & ~(size_t)7;
+        if (need > node_left_) {
+            node_chunks_.emplace_back(new uint64_t[BYTES_PER_CHUNK / 8]);
+            node_next_ = reinterpret_cast<char*>(node_chunks_.back().get());
+            node_left_ = BYTES_PER_CHUNK;
         }
-        node_left_--;
-        return node_next_++;
+        Node* p = new (node_next_) Node;  // default member initialisers only; data[] stays untouched
+        node_next_ += need;
+        node_left_ -= need;
+        return p;
     }
     const char* copy_key(const char* s, size_t len) {
         const size_t need = len + 1;
@@ -274,7 +345,7 @@ public:
         char_left_ -= need;
         return p;
     }
-    size_t node_bytes() const { return node_chunks_.size() * NODES_PER_CHUNK * sizeof(Node); }
+    size_t node_bytes() const { return node_chunks_.size() * BYTES_PER_CHUNK; }
     size_t char_bytes() const { return char_bytes_; }
     void clear() {
         node_chunks_.clear();
@@ -285,9 +356,9 @@ public:
     }
 
 private:
-    std::vector<std::unique_ptr<Node[]>> node_chunks_;
+    std::vector<std::unique_ptr<uint64_t[]>> node_chunks_;  // 8-byte aligned
     std::vector<std::unique_ptr<char[]>> char_chunks_;
-    Node* node_next_ = nullptr;
+    char* node_next_ = nullptr;
     char* char_next_ = nullptr;
     size_t node_left_ = 0, char_left_ = 0, char_bytes_ = 0;
 };
@@ -368,6 +439,10 @@ public:
     }
     int arenas() const { return (int)arenas_.size(); }
     void attach(TableGroup* g) { group_ = g; }
+    // dense: grow at load 3/4 instead of 1/2 (half the slot memory on average, longer probes).  For
+    // tables that are mostly reached through cached Node pointers (histtree.h), where a probe
+    // happens only on a cache miss.  Takes effect at the next growth.
+    void set_dense(bool on) { dense_ = on; }
 
     // Find the node of `k` or insert one.  `init(Node&, NodeArena&) -> const char*` fills a new
     // node and returns its key string (copied into the arena); it runs before the node is
@@ -379,7 +454,7 @@ public:
     // table has grown (workers still running may have filled it faster than they parked) and
     // starts over; nothing is claimed while it waits.
     template <class Init>
-    Found get_or_create(const NodeKey& k, int arena, Init&& init) {
+    Found get_or_create(const NodeKey& k, int arena, int n_actions, Init&& init) {
         Node* prepared = nullptr;
         const char* prepared_key = nullptr;
         for (;;) {
@@ -394,8 +469,11 @@ public:
                 if (p == nullptr) {
                     if (!prepared) {
                         NodeArena& a = *arenas_[arena];
-                        prepared = a.new_node();
+                        prepared = a.new_node(n_actions);
                         prepared_key = init(*prepared, a);
+                        if (prepared->n != n_actions) throw std::logic_error("node initialised with another action count");
+                        prepared->k2 = k.k2;
+                        prepared->key = prepared_key;
                     }
                     if (!reserved) {
                         if (size_.fetch_add(1, std::memory_order_acq_rel) + 1 > hard_limit_) {
@@ -408,11 +486,9 @@ public:
                     Node* expected = nullptr;
                     if (s.node.compare_exchange_strong(expected, claimed(), std::memory_order_acq_rel, std::memory_order_acquire)) {
                         s.k1.store(k.k1, std::memory_order_relaxed);
-                        s.k2.store(k.k2, std::memory_order_relaxed);
-                        s.key.store(prepared_key, std::memory_order_relaxed);
                         s.node.store(prepared, std::memory_order_release);
                         if (size_.load(std::memory_order_relaxed) >= grow_at_) request_growth();
-                        return {prepared, prepared_key, true};
+                        return {prepared, prepared->key_string(), true};
                     }
                     p = expected;  // claimed by another thread first: maybe for this very key
                 }
@@ -420,9 +496,9 @@ public:
                     cpu_relax();
                     p = s.node.load(std::memory_order_acquire);
                 }
-                if (s.k1.load(std::memory_order_relaxed) == k.k1 && s.k2.load(std::memory_order_relaxed) == k.k2) {
+                if (s.k1.load(std::memory_order_relaxed) == k.k1 && p->k2 == k.k2) {
                     if (reserved) size_.fetch_sub(1, std::memory_order_acq_rel);
-                    return {p, s.key.load(std::memory_order_relaxed), false};
+                    return {p, p->key_string(), false};
                 }
             }
             if (!full) throw std::runtime_error("node table full");  // unreachable: at most 3/4 of the slots are used
@@ -444,14 +520,15 @@ public:
                 cpu_relax();
                 p = s.node.load(std::memory_order_acquire);
             }
-            if (s.k1.load(std::memory_order_relaxed) == k.k1 && s.k2.load(std::memory_order_relaxed) == k.k2)
-                return {p, s.key.load(std::memory_order_relaxed), false};
+            if (s.k1.load(std::memory_order_relaxed) == k.k1 && p->k2 == k.k2) return {p, p->key_string(), false};
         }
         return {};
     }
 
     size_t size() const { return size_.load(std::memory_order_relaxed); }
     size_t capacity() const { return mask_ + 1; }
+    // changes whenever Node pointers handed out before become invalid (clear())
+    uint64_t epoch() const { return epoch_; }
     size_t slot_bytes() const { return capacity() * sizeof(Slot); }
     size_t node_bytes() const { size_t s = 0; for (auto& a : arenas_) s += a->node_bytes(); return s; }
     size_t key_bytes() const { size_t s = 0; for (auto& a : arenas_) s += a->char_bytes(); return s; }
@@ -463,7 +540,7 @@ public:
         Slot* slots = slots_.get();
         for (size_t i = 0; i < cap; i++) {
             Node* p = slots[i].node.load(std::memory_order_acquire);
-            if (p != nullptr && p != claimed()) f(slots[i].key.load(std::memory_order_relaxed), *p);
+            if (p != nullptr && p != claimed()) f(p->key_string(), *p);
         }
     }
     // the same with the numeric key: f(const NodeKey&, const char* key, Node& node)
@@ -476,8 +553,8 @@ public:
             if (p == nullptr || p == claimed()) continue;
             NodeKey k;
             k.k1 = slots[i].k1.load(std::memory_order_relaxed);
-            k.k2 = slots[i].k2.load(std::memory_order_relaxed);
-            f(k, slots[i].key.load(std::memory_order_relaxed), *p);
+            k.k2 = p->k2;
+            f(k, p->key_string(), *p);
         }
     }
     // the node in slot i, if any (i < capacity(); not concurrent with inserts)
@@ -486,24 +563,25 @@ public:
         Node* p = s.node.load(std::memory_order_acquire);
         if (p == nullptr || p == claimed()) return false;
         k.k1 = s.k1.load(std::memory_order_relaxed);
-        k.k2 = s.k2.load(std::memory_order_relaxed);
-        key = s.key.load(std::memory_order_relaxed);
+        k.k2 = p->k2;
+        key = p->key_string();
         node = p;
         return true;
     }
-    uint64_t k2_at(size_t i) const { return slots_[i].k2.load(std::memory_order_relaxed); }
+    uint64_t k2_at(size_t i) const { return slots_[i].node.load(std::memory_order_relaxed)->k2; }
 
     // room for `more` nodes on top of size() without growing (loads of known size; not concurrent
     // with anything)
     void reserve(size_t more) {
         const size_t want = size() + more;
         size_t cap = capacity();
-        while (want >= cap / 2) cap <<= 1;
+        while (want >= grow_point(cap)) cap <<= 1;
         if (cap != capacity()) rehash(cap);
     }
 
-    // not concurrent with anything
+    // not concurrent with anything; invalidates every Node pointer (epoch() changes)
     void clear() {
+        epoch_++;
         for (auto& a : arenas_) a->clear();
         allocate(initial_);
         grow_requested_.store(false, std::memory_order_relaxed);
@@ -513,7 +591,7 @@ public:
     void grow() {
         size_t cap = capacity();
         const size_t n = size();
-        while (n >= cap / 2) cap <<= 1;
+        while (n >= grow_point(cap)) cap <<= 1;
         rehash(cap);
     }
     bool grow_requested() const { return grow_requested_.load(std::memory_order_relaxed); }
@@ -524,9 +602,10 @@ public:
         size_t i = (size_t)k.k1 & mask;
         for (size_t probes = 0; probes <= mask; probes++, i = (i + 1) & mask) {
             Slot& s = slots_[i];
-            if (s.node.load(std::memory_order_relaxed) == nullptr) return false;
-            if (s.k1.load(std::memory_order_relaxed) == k.k1 && s.k2.load(std::memory_order_relaxed) == k.k2) {
-                s.key.store(arenas_[arena]->copy_key(key.data(), key.size()), std::memory_order_relaxed);
+            Node* p = s.node.load(std::memory_order_relaxed);
+            if (p == nullptr) return false;
+            if (s.k1.load(std::memory_order_relaxed) == k.k1 && p->k2 == k.k2) {
+                p->set_key_string(arenas_[arena]->copy_key(key.data(), key.size()));
                 return true;
             }
         }
@@ -534,11 +613,9 @@ public:
     }
 
 private:
-    struct alignas(32) Slot {
-        std::atomic<uint64_t> k1{0};
-        std::atomic<uint64_t> k2{0};
+    struct alignas(16) Slot {
+        std::atomic<uint64_t> k1{0};             // NodeKey::k1; k2 and the key string are in the node
         std::atomic<Node*> node{nullptr};        // nullptr: empty; claimed(): being written; else published
-        std::atomic<const char*> key{nullptr};   // NUL-terminated key string, written before `node`
     };
     static Node* claimed() { return reinterpret_cast<Node*>(static_cast<uintptr_t>(1)); }
 
@@ -555,14 +632,11 @@ private:
             size_t j = (size_t)k1 & m;
             while (fresh[j].node.load(std::memory_order_relaxed) != nullptr) j = (j + 1) & m;
             fresh[j].k1.store(k1, std::memory_order_relaxed);
-            fresh[j].k2.store(s.k2.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            fresh[j].key.store(s.key.load(std::memory_order_relaxed), std::memory_order_relaxed);
             fresh[j].node.store(p, std::memory_order_relaxed);
         }
         slots_ = std::move(fresh);
         mask_ = m;
-        grow_at_ = cap / 2;
-        hard_limit_ = cap - cap / 4;
+        set_limits(cap);
         grow_requested_.store(false, std::memory_order_relaxed);
     }
 
@@ -571,9 +645,13 @@ private:
         while (c < cap) c <<= 1;
         slots_.reset(new Slot[c]);
         mask_ = c - 1;
-        grow_at_ = c / 2;
-        hard_limit_ = c - c / 4;
+        set_limits(c);
         size_.store(0, std::memory_order_relaxed);
+    }
+    size_t grow_point(size_t cap) const { return dense_ ? cap - cap / 4 : cap / 2; }
+    void set_limits(size_t cap) {
+        grow_at_ = grow_point(cap);
+        hard_limit_ = dense_ ? cap - cap / 8 : cap - cap / 4;
     }
     void request_growth() {
         if (grow_requested_.exchange(true, std::memory_order_acq_rel)) return;
@@ -583,13 +661,15 @@ private:
 
     std::unique_ptr<Slot[]> slots_;
     size_t mask_ = 0;
-    size_t grow_at_ = 0;     // load at which growth is requested (1/2)
-    size_t hard_limit_ = 0;  // most slots ever claimed (3/4)
+    size_t grow_at_ = 0;     // load at which growth is requested (1/2, dense: 3/4)
+    size_t hard_limit_ = 0;  // most slots ever claimed (3/4, dense: 7/8)
+    bool dense_ = false;
     std::atomic<size_t> size_{0};  // published slots + open reservations (exact whenever no insert runs)
     std::atomic<bool> grow_requested_{false};
     std::vector<std::unique_ptr<NodeArena>> arenas_;
     TableGroup* group_ = nullptr;
     size_t initial_;
+    uint64_t epoch_ = 0;
 };
 
 // Lookups by key string (Python, checkpoints).  The stored string must match too, so the answer
@@ -604,7 +684,7 @@ inline FlatNodeTable::Found find_by_string(const FlatNodeTable& t, const KeyCode
 // given.  Two different strings with one numeric key raise instead of sharing a node.
 inline FlatNodeTable::Found get_or_create_by_string(FlatNodeTable& t, const KeyCodec& c, const std::string& key,
                                                     const uint8_t* ids, int k, int arena) {
-    FlatNodeTable::Found f = t.get_or_create(c.of_string(key), arena, [&](Node& n, NodeArena& a) {
+    FlatNodeTable::Found f = t.get_or_create(c.of_string(key), arena, k, [&](Node& n, NodeArena& a) {
         n.init(ids, k);
         return a.copy_key(key.data(), key.size());
     });

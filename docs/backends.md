@@ -1077,3 +1077,59 @@ The backend difference is the algorithm's own seed-to-seed noise at that budget;
   trainers hold a `shared_ptr<Bucketer>` (virtual `bucket`), `fast.trainer.core_bucketer()`
   picks the twin by type, and the module exposes `potential_histogram` / `river_equity_exact`
   as hooks for the Python reference (`NEGPLURIBUS_FAST_EVAL=0` switches them off).
+
+
+## Optimizer session commits, measured on this PC (25.09.2026)
+
+Five commits of the cloud optimizer session (repository Xoosiudiaudusy/Zootop, branch
+opt/bucket-table, written against a snapshot of this repo taken after search part 1) were
+cherry-picked with their authorship: c4db6c5 precomputed bucket tables (Waugh hand index, one byte
+per class: flop 1,286,792, turn 13,960,050, river 123,156,254 classes, about 138 MB per bucketer,
+`scripts/build_bucket_table.py`, enabled by `NEGPLURIBUS_BUCKET_TABLES=<dir>`), 49488e6 dynamic
+hand-out of iterations to threads, a2b94ea MCCFR over a lazily built betting-history tree,
+2ecc230 `scripts/bench_opt.py`, d861f7e RNR over the history tree.  They applied without conflicts.
+
+Checks here: the full suite passes except one pre-existing flaky search test (it fails 2 of 6 runs
+on d4bfb53 too, before these commits); the table of `buckets_hunl100v2_ehs16_s0` built in 241 s
+for the river on 12 threads and matched `bucket()` on 20,000 random hands per street.
+
+Throughput, HU 100bb narrow grid, 16 E[HS] buckets, 12 threads, 1M warm-up then a 2M window,
+runs interleaved while other work shared the machine (two rounds, same numbers within 2%):
+
+| build | iterations/s | nodes/s | ratio |
+|---|---:|---:|---:|
+| master before the commits | 71,128-72,218 | 11.7-12.0 M | 1 |
+| with the commits, no tables | 90,350-90,668 | 14.8-15.0 M | 1.26 |
+| with the commits and the bucket table | 411,727-412,942 | 67.6-67.7 M | 5.75 |
+
+Nodes per iteration are equal (about 164), so the work is the same.  A short window favours the
+tables (the old caches are cold); over a 40M run the ratio will be smaller, to be measured.
+
+### Three more optimizer commits (25.09.2026, afternoon)
+
+525c078 nodes sized to their action count and 16-byte table slots, 0749d81 node key strings
+spelled from the history tree / compact tree / trainer tables grown at load 3/4, 0486413 yielding
+spinlock and cache-line aligned thread contexts.  Cherry-picked with their authorship; one conflict
+in `csrc/search.h` (search part 2 was not in the optimizer's snapshot): the part-2 calls now pass
+the action count to `get_or_create` (`na.n`, `N_CONTINUATIONS`) and use `regret()` /
+`strategy_sum()`.
+
+Checks here:
+- search, one thread, fixed iterations, seed 5, the flop subgame of the search tests: every
+  real-path node for every hole is bit-identical before and after (depth `end`: 1,174 nodes;
+  `hu_flop_limit` and `next_street`: 1,227 nodes, 1,386 leaves, 16,632 rollouts);
+- full suite 255 of 256; the failing test (`test_our_taken_actions_are_fixed_for_our_actual_hole_only`)
+  depends on a 0.6 s time budget and failed on master before these commits too (2 of 2 module runs)
+  while a 14-thread search duel loaded the machine: about 46 iterations fit in the budget.  It is
+  being moved to a fixed iteration count, like `test_our_average_is_accumulated_every_iteration`;
+- memory, HU 100bb wide grid, 16 E[HS] buckets, 1 thread, seed 0, 1M iterations, the same 544,117
+  infosets in both builds:
+
+| build | slots | nodes | key strings | tree | reported total | private memory grown by training |
+|---|---:|---:|---:|---:|---:|---:|
+| before (d244cfb) | 123.3 | 160.2 | 38.7 | not reported | 322.2 B/infoset | 160.9 MB |
+| after (0486413) | 30.8 | 82.4 | 0 | 19.3 | 132.5 B/infoset | 55.7 MB |
+
+(slots per infoset also fall because the trainer table now grows at load 3/4: 1,048,576 slots
+instead of 2,097,152 for the same infosets.)  Throughput of these three commits was not measured
+here: the machine was shared with the search duel.
