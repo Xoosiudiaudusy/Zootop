@@ -7,6 +7,7 @@
 #include <exception>
 #include <memory>
 #include <thread>
+#include <tuple>
 #include <string>
 #include <vector>
 
@@ -15,6 +16,7 @@
 #include "engine.h"
 #include "equity.h"
 #include "evaluator.h"
+#include "exactfeat.h"
 #include "handindex.h"
 #include "mccfr.h"
 #include "persist.h"
@@ -723,6 +725,66 @@ PYBIND11_MODULE(_fastcore, m) {
         }
         return py::make_tuple(std::vector<int>(counts, counts + bins), mean);
     }, "next-street E[HS] histogram (counts over `bins`, mean equity) as abstraction/potential.py computes it");
+
+    // ---- exact potential-aware features (exactfeat.h)
+    m.def("exact_feature", [](const py::sequence& hole, const py::sequence& board, int bins) {
+        std::vector<int> h = to_cards(hole), bd = to_cards(board);
+        if (h.size() != 2 || bd.size() < 3 || bd.size() > 4) throw std::invalid_argument("2 hole cards and a 3..4 card board");
+        if (bins < 1 || bins > 64) throw std::invalid_argument("bins 1..64");
+        int counts[64];
+        double mean;
+        {
+            py::gil_scoped_release nogil;
+            exact_feature(h.data(), bd.data(), (int)bd.size(), bins, counts, mean);
+        }
+        return py::make_tuple(std::vector<int>(counts, counts + bins), mean);
+    }, "exact next-street equity histogram (counts, mean) of one hand, by the definition");
+    m.def("exact_feature_batch", [](const py::sequence& board, int bins) {
+        std::vector<int> bd = to_cards(board);
+        if (bd.size() < 3 || bd.size() > 4) throw std::invalid_argument("a 3..4 card board");
+        py::dict out;
+        std::vector<std::tuple<int, int, std::vector<int>, double>> rows;
+        {
+            py::gil_scoped_release nogil;
+            ExactFeatureBatch batch(bins);
+            batch.compute(bd.data(), (int)bd.size());
+            bool on[52] = {false};
+            for (int c : bd) on[c] = true;
+            int counts[64];
+            for (int a = 0; a < 52; a++)
+                for (int b = a + 1; b < 52; b++) {
+                    if (on[a] || on[b]) continue;
+                    double m;
+                    batch.feature(a, b, counts, m);
+                    rows.emplace_back(a, b, std::vector<int>(counts, counts + bins), m);
+                }
+        }
+        for (auto& r : rows) out[py::make_tuple(std::get<0>(r), std::get<1>(r))] = py::make_tuple(std::get<2>(r), std::get<3>(r));
+        return out;
+    }, "exact features of every hole of one board: {(a, b): (counts, mean)}");
+    m.def("build_exact_features", [](int n_board, int bins, int threads, const std::string& path) {
+        ExactFeatureTable t;
+        {
+            py::gil_scoped_release nogil;
+            build_exact_features(n_board, bins, threads, t);
+            if (!path.empty()) {
+                FILE* f = open_file(path, "wb");
+                if (!f) throw std::runtime_error("cannot write " + path);
+                const uint64_t n = t.mean.size();
+                std::fwrite("NPXF", 1, 4, f);
+                const int32_t hdr[2] = {t.n_board, t.bins};
+                std::fwrite(hdr, sizeof hdr, 1, f);
+                std::fwrite(&n, 8, 1, f);
+                std::fwrite(t.counts.data(), 1, t.counts.size(), f);
+                std::fwrite(t.mean.data(), 8, t.mean.size(), f);
+                std::fclose(f);
+            }
+        }
+        py::dict d;
+        d["classes"] = (unsigned long long)t.mean.size();
+        return d;
+    }, py::arg("n_board"), py::arg("bins"), py::arg("threads"), py::arg("path") = "",
+       "exact features of every flop / turn class; optionally saved: NPXF, n_board, bins, n, counts[n][bins] u8, mean[n] f64");
 
     m.def("count_betting_tree", [](const py::dict& spec_d, long long limit) {
         // size of the abstract betting tree (button 0): decision histories and actions per street,
