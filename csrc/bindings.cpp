@@ -15,6 +15,7 @@
 #include "engine.h"
 #include "equity.h"
 #include "evaluator.h"
+#include "flatcfr.h"
 #include "handindex.h"
 #include "mccfr.h"
 #include "persist.h"
@@ -1045,6 +1046,39 @@ PYBIND11_MODULE(_fastcore, m) {
     // run (without the GIL): a Python thread reading the table while another trains waits instead
     // of racing a table resize.
     using ApiLock = std::lock_guard<std::mutex>;
+
+    // ---- the GPU algorithm on the CPU (flatcfr.h): level-synchronous batched MCCFR on the flat game
+    py::class_<FlatTrainer>(m, "FlatTrainer")
+        .def(py::init([](const py::dict& spec, std::shared_ptr<Bucketer> bk, uint64_t seed, bool linear, int threads) {
+            const Spec sp = spec_from_dict(spec);
+            py::gil_scoped_release nogil;
+            return new FlatTrainer(sp, std::move(bk), seed, linear, threads);
+        }), py::arg("spec"), py::arg("bucketer"), py::arg("seed") = 0, py::arg("linear") = true, py::arg("threads") = 1)
+        .def("train", [](FlatTrainer& t, long long iterations) {
+            py::gil_scoped_release nogil;
+            t.train(iterations);
+        }, py::arg("iterations"))
+        .def_property_readonly("iteration", &FlatTrainer::iteration)
+        .def_readwrite("batch_size", &FlatTrainer::batch_size)
+        .def_readwrite("linear_until", &FlatTrainer::linear_until)
+        .def_readwrite("pass_iterations", &FlatTrainer::pass_iterations)
+        .def("game_stats", [](const FlatTrainer& t) {
+            py::dict d;
+            d["decisions"] = t.game.n_decisions();
+            d["terminals"] = t.game.n_terminals();
+            d["infosets"] = t.game.n_infosets;
+            d["cells"] = t.game.n_cells;
+            d["depth"] = t.game.depth;
+            return d;
+        })
+        .def("export_nodes", [](const FlatTrainer& t) {
+            // {key: (regret, strategy_sum, visits)} of every infoset an update reached
+            py::dict out;
+            t.for_each_touched([&](const std::string& key, const double* r, const double* s, int na, int64_t v) {
+                out[py::str(key)] = py::make_tuple(std::vector<double>(r, r + na), std::vector<double>(s, s + na), v);
+            });
+            return out;
+        });
 
     // ---- trainer
     py::class_<Trainer>(m, "Trainer")

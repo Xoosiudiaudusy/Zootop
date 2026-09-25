@@ -242,23 +242,24 @@ private:
 
 // net chips of relative seat `me` at terminal `h` (HandState::finish, in relative seats):
 // `strength[r]` = the 7-card value of relative seat r (read only when two or more reach showdown)
-inline int terminal_net(const HistTerminal* h, int n, int me, const int64_t* strength) {
+// (the terminal given by its contributions `invested` and fold bits `folded`)
+inline int terminal_net_of(const int32_t* invested, uint16_t folded, int n, int me, const int64_t* strength) {
     int active[MAX_PLAYERS];
     int n_act = 0;
-    for (int r = 0; r < n; r++) if (!(h->folded >> r & 1)) active[n_act++] = r;
+    for (int r = 0; r < n; r++) if (!(folded >> r & 1)) active[n_act++] = r;
     int levels[MAX_PLAYERS];
     int n_levels = 0;
-    for (int r = 0; r < n; r++) if (h->invested[r] > 0) levels[n_levels++] = h->invested[r];
+    for (int r = 0; r < n; r++) if (invested[r] > 0) levels[n_levels++] = invested[r];
     std::sort(levels, levels + n_levels);
     n_levels = (int)(std::unique(levels, levels + n_levels) - levels);
     int won = 0, prev = 0;
     for (int li = 0; li < n_levels; li++) {
         const int lvl = levels[li];
         int portion = 0;
-        for (int r = 0; r < n; r++) portion += std::max(0, std::min(h->invested[r], lvl) - prev);
+        for (int r = 0; r < n; r++) portion += std::max(0, std::min(invested[r], lvl) - prev);
         int eligible[MAX_PLAYERS];
         int n_el = 0;
-        for (int k = 0; k < n_act; k++) if (h->invested[active[k]] >= lvl) eligible[n_el++] = active[k];
+        for (int k = 0; k < n_act; k++) if (invested[active[k]] >= lvl) eligible[n_el++] = active[k];
         if (n_el == 0) for (int k = 0; k < n_act; k++) eligible[n_el++] = active[k];
         if (n_el == 1) {
             if (eligible[0] == me) won += portion;
@@ -275,7 +276,11 @@ inline int terminal_net(const HistTerminal* h, int n, int me, const int64_t* str
         }
         prev = lvl;
     }
-    return won - h->invested[me];
+    return won - invested[me];
+}
+
+inline int terminal_net(const HistTerminal* h, int n, int me, const int64_t* strength) {
+    return terminal_net_of(h->invested, h->folded, n, me, strength);
 }
 
 }  // namespace negp

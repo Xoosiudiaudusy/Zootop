@@ -64,6 +64,16 @@ inline void cpu_relax() {
 
 constexpr int MAX_ACTIONS = 8;
 
+// the current strategy of regrets r[0..n) (regret matching, CPython sum() semantics): shared by
+// Node::current_strategy and the flat trainer (flatcfr.h)
+inline void regret_matching(const double* r, int n, double* out) {
+    double pos[MAX_ACTIONS];
+    for (int i = 0; i < n; i++) pos[i] = r[i] > 0 ? r[i] : 0.0;
+    double s = py_sum(pos, n);
+    if (s <= 0) { for (int i = 0; i < n; i++) out[i] = 1.0 / n; return; }
+    for (int i = 0; i < n; i++) out[i] = pos[i] / s;
+}
+
 // Per-node lock, held for a handful of arithmetic operations.  Waiters spin with a pause and give
 // their time slice away after a while: with more runnable threads than cores (other programs, or
 // threads > cores) the holder may be preempted, and pure spinning then burns whole time slices
@@ -151,14 +161,7 @@ struct Node {
         visits = 0;
     }
     // Node.current_strategy() with CPython sum() semantics; caller holds the lock
-    void current_strategy(double* out) const {
-        double pos[MAX_ACTIONS];
-        const double* r = regret();
-        for (int i = 0; i < n; i++) pos[i] = r[i] > 0 ? r[i] : 0.0;
-        double s = py_sum(pos, n);
-        if (s <= 0) { for (int i = 0; i < n; i++) out[i] = 1.0 / n; return; }
-        for (int i = 0; i < n; i++) out[i] = pos[i] / s;
-    }
+    void current_strategy(double* out) const { regret_matching(regret(), n, out); }
     void average_strategy(double* out) const {
         const double* ss = strategy_sum();
         double s = py_sum(ss, n);
