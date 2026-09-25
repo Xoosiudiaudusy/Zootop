@@ -70,7 +70,7 @@ struct Spec {
 // at the start of the next iteration.  A bucket is a pure function of the cards, so the memo
 // only removes repeated canonical_form() + cache lookups (2-player 100bb river game: about 52 per
 // iteration down to at most 2 seats x 3 streets), never changes a value.
-struct ThreadCtx {
+struct alignas(64) ThreadCtx {  // one cache line boundary per thread: no false sharing between neighbours in ctxs_
     PyRandom rng;
     long long nodes_touched = 0;
     int tid = 0;               // worker index = this thread's arena in the node tables

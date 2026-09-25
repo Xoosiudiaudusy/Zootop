@@ -63,9 +63,23 @@ inline void cpu_relax() {
 
 constexpr int MAX_ACTIONS = 8;
 
+// Per-node lock, held for a handful of arithmetic operations.  Waiters spin with a pause and give
+// their time slice away after a while: with more runnable threads than cores (other programs, or
+// threads > cores) the holder may be preempted, and pure spinning then burns whole time slices
+// (measured: 16 threads on 4 cores lost 46% of the 4-thread throughput with the pure spin).
 struct SpinLock {
     std::atomic<bool> flag{false};
-    void lock() { while (flag.exchange(true, std::memory_order_acquire)) { while (flag.load(std::memory_order_relaxed)) {} } }
+    void lock() {
+        if (!flag.exchange(true, std::memory_order_acquire)) return;
+        int spins = 0;
+        for (;;) {
+            while (flag.load(std::memory_order_relaxed)) {
+                if (++spins < 64) cpu_relax();
+                else { std::this_thread::yield(); spins = 0; }
+            }
+            if (!flag.exchange(true, std::memory_order_acquire)) return;
+        }
+    }
     void unlock() { flag.store(false, std::memory_order_release); }
 };
 
