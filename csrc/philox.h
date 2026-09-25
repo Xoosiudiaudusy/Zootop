@@ -5,7 +5,10 @@
 //
 // Draws used by the batched trainer (batch mode of mccfr.h):
 //   deal of iteration t:        counter (t_lo, t_hi, 0, k), k = 0, 1, ... (4 words per call)
-//   sample j of traverser p:    counter (t_lo, t_hi, 1 + p, j)
+//   sample of traverser p at the history with hash lanes (a, b) (HistHash, nodetable.h):
+//                               counter (t_lo, t_hi, (uint32)b ^ golden * (1 + p), (uint32)a) -- a node is
+//                               reached at most once per (iteration, traverser), and the address does not
+//                               depend on the traversal order (depth-first on the CPU, by levels on the GPU)
 // uniform01 = (hi 26 bits, lo 27 bits of two words) / 2^53 (the numpy / Python recipe); an index below
 // n = (word * n) >> 32 (multiply-shift; bias < n / 2^32).
 #pragma once
@@ -71,6 +74,18 @@ struct PhiloxStream {
         return ((double)a * 67108864.0 + (double)b) * (1.0 / 9007199254740992.0);
     }
 };
+
+// the uniform draw of traverser p at the history (a, b) in iteration t (see the header)
+inline double philox_sample_u01(uint64_t seed, uint64_t t, int p, uint64_t a, uint64_t b) {
+    Philox4x32 c;
+    c.v[0] = (uint32_t)t;
+    c.v[1] = (uint32_t)(t >> 32);
+    c.v[2] = (uint32_t)b ^ (0x9E3779B9u * (uint32_t)(1 + p));
+    c.v[3] = (uint32_t)a;
+    const Philox4x32 r = philox4x32_10(c, (uint32_t)seed, (uint32_t)(seed >> 32));
+    const uint32_t x = r.v[0] >> 5, y = r.v[1] >> 6;
+    return ((double)x * 67108864.0 + (double)y) * (1.0 / 9007199254740992.0);
+}
 
 // the deal of iteration t: Fisher-Yates from the top over 0..51
 inline void philox_deal(uint64_t seed, uint64_t t, int* order) {

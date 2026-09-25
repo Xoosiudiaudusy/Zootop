@@ -386,14 +386,11 @@ private:
         ctx.reset_bucket_memo();
         ctx.button = (int)(t % spec.n_players);
         ctx.upd_seq = 0;
-        for (int traverser = 0; traverser < spec.n_players; traverser++) {
-            PhiloxStream rs(seed, (uint64_t)t, 1u + (uint32_t)traverser);
-            traverse_batched(root_, traverser, weight, t, rs, ctx);
-        }
+        for (int traverser = 0; traverser < spec.n_players; traverser++) traverse_batched(root_, traverser, weight, t, ctx);
     }
 
     // the tree traversal of batched mode: reads the tables, records the updates (see batch_size)
-    double traverse_batched(HistNode* node_h, int traverser, double weight, long long t, PhiloxStream& rs, ThreadCtx& ctx) {
+    double traverse_batched(HistNode* node_h, int traverser, double weight, long long t, ThreadCtx& ctx) {
         const int n = spec.n_players;
         if (node_h->terminal) return tree_terminal_value(static_cast<const HistTerminal*>(node_h), n, traverser, spec.bb, ctx);
         HistDecision* h = static_cast<HistDecision*>(node_h);
@@ -414,7 +411,7 @@ private:
         node->current_strategy(sigma);  // no writer during the traversal phase
         if (seat == traverser) {
             double utils[MAX_ACTIONS];
-            for (int i = 0; i < na; i++) utils[i] = traverse_batched(tree_.child(h, i), traverser, weight, t, rs, ctx);
+            for (int i = 0; i < na; i++) utils[i] = traverse_batched(tree_.child(h, i), traverser, weight, t, ctx);
             double prods[MAX_ACTIONS];
             for (int i = 0; i < na; i++) prods[i] = sigma[i] * utils[i];
             const double u = py_sum(prods, na);
@@ -423,14 +420,14 @@ private:
         }
         for (int i = 0; i < na; i++) ctx.upd.push_back({nk.k1, nk.k2, t, ctx.upd_seq++, (uint16_t)i, 1, weight * sigma[i], node});
         ctx.upd.push_back({nk.k1, nk.k2, t, ctx.upd_seq++, 0, 2, 0.0, node});
-        const double r = rs.uniform01();
+        const double r = philox_sample_u01(seed, (uint64_t)t, traverser, h->hh.a, h->hh.b);
         int a = na - 1;
         double acc = 0.0;
         for (int i = 0; i < na; i++) {
             acc += sigma[i];
             if (r < acc) { a = i; break; }
         }
-        return traverse_batched(tree_.child(h, a), traverser, weight, t, rs, ctx);
+        return traverse_batched(tree_.child(h, a), traverser, weight, t, ctx);
     }
 
     // ---- the traversal on the history tree (histtree.h); same numbers, same random draws as
