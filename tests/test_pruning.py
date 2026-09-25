@@ -60,3 +60,16 @@ def test_relative_pruning_skips_actions_and_off_is_unchanged():
     assert tr.pruned_actions > 0
     s = tr.strategy()
     assert all(abs(sum(p) - 1) < 1e-9 for _, p in s.table.values())
+
+
+def test_floor_and_scaled_threshold():
+    tr = MCCFRTrainer(_spec(), seed=3, backend="cpp", threads=1)
+    tr.set_pruning(20.0, prob=0.95, after=500, last_street=True, scale_t=True, floor=1.033).train(20000)
+    assert tr.pruned_actions > 0
+    t = tr.iteration
+    floor = -1.033 * 20.0 * t
+    assert min(r for n in tr.nodes.values() for r in n.regret) >= floor * 1.0000001
+    with pytest.raises(Exception):
+        tr.set_pruning(1.0, relative=True, scale_t=True)
+    with pytest.raises(Exception):
+        tr.set_pruning(1.0, floor=0.5)

@@ -98,6 +98,9 @@ def main() -> None:
     ap.add_argument("--prune-prob", type=float, default=0.95, help="share of iterations that prune (Pluribus: 0.95)")
     ap.add_argument("--prune-relative", action="store_true",
                     help="--prune-below in bb of regret per unit of the node's own traverser weight (independent of t and bucket count)")
+    ap.add_argument("--prune-scale-t", action="store_true", help="the pruning threshold is --prune-below x t")
+    ap.add_argument("--regret-floor", type=float, default=0.0,
+                    help="clamp regrets at this factor x the pruning threshold (Pluribus: 310/300 = 1.033; 0 = off)")
     ap.add_argument("--linear-until", type=int, default=0,
                     help="C++ backend: Linear CFR weights stop growing after this iteration (Pluribus-style schedule; 0 = always linear)")
     ap.add_argument("--prune-after", type=int, default=0, help="iterations before pruning starts")
@@ -146,8 +149,10 @@ def main() -> None:
     if args.prune_below > 0:
         if not cpp:
             raise SystemExit("--prune-below needs --backend cpp")
-        trainer.set_pruning(args.prune_below, args.prune_prob, args.prune_after, relative=args.prune_relative)
+        trainer.set_pruning(args.prune_below, args.prune_prob, args.prune_after, relative=args.prune_relative,
+                            scale_t=args.prune_scale_t, floor=args.regret_floor)
         print(f"pruning: regret below -{args.prune_below:g}{' bb per unit of node weight' if args.prune_relative else ''}, "
+              f"{' x t' if args.prune_scale_t else ''}{f', floor x{args.regret_floor:g}' if args.regret_floor else ''}, "
               f"{args.prune_prob:.0%} of iterations after {args.prune_after:,}")
     ext = ".bin" if cpp and args.format == "bin" else ".json"
     bp_path = os.path.join(data, f"blueprint_{tag}{ext}")
@@ -228,6 +233,10 @@ def main() -> None:
     else:
         trainer.train(args.iters, log_every=max(1, args.iters // 10))
     print(f"done in {time.perf_counter() - t0:.0f}s, {len(trainer.nodes):,} infosets")
+    if cpp and args.prune_below > 0:
+        touched = trainer.nodes_touched
+        print(f"pruned actions {trainer.pruned_actions:,} ({trainer.pruned_actions / max(1, touched + trainer.pruned_actions):.1%} of "
+              f"nodes touched + pruned), nodes touched {touched:,} ({touched / max(1, trainer.iteration):.1f} per iteration)")
     # the agent's strategy: the average strategy at full precision, as trainer.strategy() had it
     # (C++ backend: the same floats from a C++ lookup, no dict)
     if cpp:

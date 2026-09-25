@@ -148,7 +148,7 @@ class CppMCCFRTrainer(MCCFRTrainer):
         self._view = NodeView(lambda: self._core.n_nodes, self._core.get_node, self._core.keys, self._core.export_nodes)
 
     def set_pruning(self, below: float, prob: float = 0.95, after: int = 0, last_street: bool = False,
-                    relative: bool = False) -> "CppMCCFRTrainer":
+                    relative: bool = False, scale_t: bool = False, floor: float = 0.0) -> "CppMCCFRTrainer":
         """Regret-based pruning as in Pluribus (off by default, ``below=0``): in a share ``prob`` of the
         iterations after ``after``, the traverser skips actions whose accumulated regret is below
         ``-below`` (stored units: bb x iteration weight; Pluribus used 300,000,000 in its units), except
@@ -157,8 +157,11 @@ class CppMCCFRTrainer(MCCFRTrainer):
         unit of the node's own traverser weight (the weight-averaged regret per visit), a threshold that
         does not drift with the iteration count or the number of buckets; nodes created before it was
         turned on are never pruned, and the weight is not saved in checkpoints (it restarts on resume).
-        Changes the algorithm: judge it by the result (exploitability, duels), not bit for bit."""
-        self._core.set_pruning(float(below), float(prob), int(after), bool(last_street), bool(relative))
+        ``scale_t=True``: the threshold is ``below x t`` (Pluribus kept a fixed threshold on regrets growing
+        like t; ours grow like t^2).  ``floor`` (e.g. 1.033, Pluribus -310M against -300M): regrets are
+        clamped at floor x the threshold after every update once t > ``after``, so pruned actions that
+        improve come back.  Changes the algorithm: judge it by the result (exploitability, duels)."""
+        self._core.set_pruning(float(below), float(prob), int(after), bool(last_street), bool(relative), bool(scale_t), float(floor))
         return self
 
     def set_linear_until(self, iterations: int) -> "CppMCCFRTrainer":

@@ -82,6 +82,7 @@ struct alignas(64) ThreadCtx {  // one cache line boundary per thread: no false 
     int button = 0;
     bool prune = false;        // this iteration prunes (Trainer::prune_below)
     double prune_limit = 0.0;  // regrets below this are pruned
+    double floor_base = 0.0;   // < 0: regrets are clamped at this (relative pruning: x the node's weight)
     long long pruned = 0;      // actions skipped
     bool strength_done = false;
     int64_t strength[MAX_PLAYERS];
@@ -176,6 +177,13 @@ public:
     // (the weight-averaged regret per visit), which does not grow with t or with the bucket count;
     // nodes created while it is on carry that weight (Node::tw, 8 bytes), older nodes are never pruned
     bool prune_relative = false;
+    // Pluribus-like scale: the threshold grows with the iteration, -prune_below x t (Pluribus kept its
+    // threshold fixed on regrets that, once the discounting stopped, grow like t; ours grow like t^2)
+    bool prune_scale_t = false;
+    // regret floor (Pluribus: -310M against a -300M threshold, "for every action", so a pruned action
+    // that improves comes back): regrets are clamped at regret_floor x the pruning threshold after
+    // every update (e.g. 1.033); 0: no floor.  Applied in every iteration once t > prune_after.
+    double regret_floor = 0.0;
     double prune_below = 0.0;
     double prune_prob = 0.95;
     long long prune_after = 0;
@@ -283,9 +291,14 @@ private:
         ctx.button = button;
         ctx.prune_limit = 0.0;
         ctx.prune = false;
-        if (prune_below > 0.0 && t > prune_after && ctx.rng.random() < prune_prob) {
-            ctx.prune = true;
-            ctx.prune_limit = -prune_below;
+        ctx.floor_base = 0.0;
+        if (prune_below > 0.0 && t > prune_after) {
+            const double base = prune_scale_t ? -prune_below * (double)t : -prune_below;
+            if (regret_floor > 0.0) ctx.floor_base = regret_floor * base;
+            if (ctx.rng.random() < prune_prob) {
+                ctx.prune = true;
+                ctx.prune_limit = base;
+            }
         }
         for (int traverser = 0; traverser < spec.n_players; traverser++) traverse_tree(root_, traverser, weight, ctx);
     }
@@ -364,6 +377,10 @@ private:
             double u = py_sum(prods, na);
             node->lock.lock();
             for (int i = 0; i < na; i++) if (explore[i]) node->regret()[i] += weight * (utils[i] - u);
+            if (ctx.floor_base < 0.0) {
+                const double fl = prune_relative ? (node->has_tw ? ctx.floor_base * *node->tw() : -1e300) : ctx.floor_base;
+                for (int i = 0; i < na; i++) if (node->regret()[i] < fl) node->regret()[i] = fl;
+            }
             if (node->has_tw) *node->tw() += weight;
             node->lock.unlock();
             return u;
