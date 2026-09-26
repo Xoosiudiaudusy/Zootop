@@ -26,6 +26,8 @@
 #pragma once
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <exception>
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
@@ -77,6 +79,9 @@ public:
     // emulation of the GPU trainer on the host: the kernels' functions (gpukernels.h) in loops, the same
     // steps as GpuFlatTrainer::run_batch (a check of everything but the CUDA calls, on any machine)
     bool emulate_gpu = false;
+    // GPU / emulation mode, wall time since construction: the host's deals, buckets and strengths, and run_batch
+    // (the preparation of batch i + 1 overlaps batch i; ms_wait_prepare: the device side waited for it)
+    double ms_prepare_total = 0.0, ms_device_total = 0.0, ms_wait_prepare = 0.0;
 
     // move the tables to CUDA device `device` and train there from now on (a CUDA build is needed)
     void use_gpu(int device) {
@@ -320,31 +325,69 @@ private:
         for (size_t i = 0; i < sk.size(); i++) apply_run(sk.data(), sv.data(), sk.size(), i, regret.data(), strategy_sum.data(), visits.data(), emu_touched_.data());
     }
 
+    // the FlatIter of iterations lo .. lo + k - 1, on `threads` threads
+    void prepare_batch(long long lo, int k, std::vector<Iter>& out) {
+        out.resize((size_t)k);
+        std::atomic<int> next{0};
+        auto work = [&]() {
+            int order[52];
+            for (int i = next.fetch_add(64); i < k; i = next.fetch_add(64))
+                for (int j = i; j < std::min(k, i + 64); j++) prepare_iter(lo + j, out[(size_t)j], order);
+        };
+        if (threads == 1) {
+            work();
+        } else {
+            std::vector<std::thread> pool;
+            for (int t = 1; t < threads; t++) pool.emplace_back(work);
+            work();
+            for (auto& th : pool) th.join();
+        }
+    }
+
+    // the host prepares batch i + 1 while the device runs batch i (the preparation is a pure function of
+    // the iteration numbers, so the overlap changes the time, never the result)
     void train_gpu(long long target) {
-        const int T = threads;
-        while (iteration_ < target) {
-            const long long lo = iteration_ + 1;
-            const long long hi = std::min(target, (iteration_ / batch_size + 1) * batch_size);
-            const int k = (int)(hi - lo + 1);
-            gpu_iters_.resize((size_t)k);
-            std::atomic<int> next{0};
-            auto work = [&]() {
-                int order[52];
-                for (int i = next.fetch_add(64); i < k; i = next.fetch_add(64))
-                    for (int j = i; j < std::min(k, i + 64); j++) prepare_iter(lo + j, gpu_iters_[(size_t)j], order);
-            };
-            if (T == 1) {
-                work();
-            } else {
-                std::vector<std::thread> pool;
-                for (int t = 1; t < T; t++) pool.emplace_back(work);
-                work();
-                for (auto& th : pool) th.join();
+        using clk = std::chrono::steady_clock;
+        auto ms = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+        auto batch_end = [&](long long done) { return std::min(target, (done / batch_size + 1) * batch_size); };
+        if (iteration_ >= target) return;
+        std::vector<Iter> buf[2];
+        long long lo = iteration_ + 1, hi = batch_end(iteration_);
+        const auto p0 = clk::now();
+        prepare_batch(lo, (int)(hi - lo + 1), buf[0]);
+        ms_prepare_total += ms(p0, clk::now());
+        for (int w = 0;; w ^= 1) {
+            const bool more = hi < target;
+            const long long nlo = hi + 1, nhi = more ? batch_end(hi) : hi;
+            std::exception_ptr prep_error;
+            double prep_ms = 0.0;
+            std::thread prep;
+            if (more) prep = std::thread([&, w]() {
+                try {
+                    const auto a = clk::now();
+                    prepare_batch(nlo, (int)(nhi - nlo + 1), buf[w ^ 1]);
+                    prep_ms = ms(a, clk::now());
+                } catch (...) { prep_error = std::current_exception(); }
+            });
+            const auto d0 = clk::now();
+            try {
+                if (gpu_) gpu_->run_batch(buf[w].data(), (int)(hi - lo + 1), gpu_pass);
+                else emu_run_batch(buf[w].data(), (int)(hi - lo + 1), gpu_pass);
+            } catch (...) {
+                if (prep.joinable()) prep.join();
+                throw;
             }
-            if (gpu_) gpu_->run_batch(gpu_iters_.data(), k, gpu_pass);
-            else emu_run_batch(gpu_iters_.data(), k, gpu_pass);
+            ms_device_total += ms(d0, clk::now());
+            const auto j0 = clk::now();
+            if (prep.joinable()) prep.join();
+            ms_wait_prepare += ms(j0, clk::now());
+            if (prep_error) std::rethrow_exception(prep_error);
+            ms_prepare_total += prep_ms;
             host_stale_ = true;
             iteration_ = hi;
+            if (!more) break;
+            lo = nlo;
+            hi = nhi;
         }
     }
 

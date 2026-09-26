@@ -160,3 +160,68 @@ git push -u origin opt/gpu-report
 - `IDENTICAL` или нет;
 - скорость GPU против CPU;
 - где отчёт.
+
+
+---
+
+# Раунд 2: замер скорости с таблицами корзин
+
+Раунд 1 (отчёт в ветке `opt/gpu-report`) показал две вещи:
+- GPU совпадает с CPU **бит в бит**;
+- скорость упёрлась в CPU: без таблиц корзины E[HS] считаются Монте-Карло, и GPU простаивал (загрузка 0–15 %).
+
+Что изменилось в коде:
+- флаг `/Zc:preprocessor` теперь стоит в CMake, переменная `CL` больше не нужна;
+- CPU готовит раздачи следующей пачки, пока GPU считает текущую;
+- в замере есть разбивка времени.
+
+Правила те же, что в раунде 1. Работай в той же папке `..\zootop-gpu`.
+
+### R2-1. Обновить копию и собрать
+```powershell
+cd ..\zootop-gpu
+git fetch origin opt/gpu
+git checkout --detach origin/opt/gpu
+git log --oneline -1
+Remove-Item Env:CL -ErrorAction SilentlyContinue
+python scripts/build_fast.py --clean *> build2.log
+Select-String -Path build2.log -Pattern "negpluribus:|error|built" | Select-Object -First 20
+```
+Должно быть `GPU trainer ON` и `built`, **без** `$env:CL`. Если снова вылезла ошибка C1189 про препроцессор, запиши это и собери с `$env:CL = "/Zc:preprocessor"`, как в раунде 1.
+
+### R2-2. Контроль бит в бит после изменений
+```powershell
+python -m pytest -q tests/test_flatcfr.py tests/test_batched.py *> tests_gpu2.log
+Get-Content tests_gpu2.log -Tail 5
+```
+
+### R2-3. Таблица корзин для бенча (около 3–10 минут)
+```powershell
+python scripts/gpu_bench.py --write-buckets data\buckets_gpubench.json
+python scripts/build_bucket_table.py --buckets data\buckets_gpubench.json --out data\bucket_tables *> table.log
+Get-Content table.log -Tail 15
+```
+Время построения и итоговые строки идут в отчёт. Скрипт сам сверяет таблицу со старым способом на 20 тыс. рук на каждой улице. Если он написал о расхождении, это важно: запиши и остановись.
+
+### R2-4. Замер с таблицей
+```powershell
+$env:NEGPLURIBUS_BUCKET_TABLES = (Resolve-Path data\bucket_tables).Path
+python scripts/gpu_bench.py --buckets data\buckets_gpubench.json --iters 5000000 *> bench2.log
+Get-Content bench2.log
+```
+Первой строкой должно быть `bucket tables: <путь>`, а не `none`. Параллельно, как в шаге 6 раунда 1, сними загрузку GPU и CPU во время строк `GPU batch ...` (несколько строк на каждую пачку, если успеешь).
+
+Если хватит времени, сделай ещё один прогон с пачками побольше:
+```powershell
+python scripts/gpu_bench.py --buckets data\buckets_gpubench.json --iters 5000000 --skip-check --batches 65536,131072 *> bench3.log
+```
+
+### R2-5. Отчёт
+Файл `GPU_REPORT2.md`: те же разделы, что в раунде 1, только для шагов R2-1…R2-4. Весь `bench2.log` и `bench3.log` — дословно, плюс загрузка.
+```powershell
+git checkout -b opt/gpu-report2
+git add -f GPU_REPORT2.md build2.log tests_gpu2.log table.log bench2.log bench3.log
+git commit -m "GPU run report 2 (bucket tables)"
+git push -u origin opt/gpu-report2
+```
+Файлы `data\bucket_tables\*.npbt` **не коммить**, они большие.

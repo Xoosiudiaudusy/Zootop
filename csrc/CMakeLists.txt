@@ -31,6 +31,10 @@ if(NEGP_CUDA)
     target_compile_definitions(negp_gpu PRIVATE NEGP_WITH_CUDA=1)
     # no fused multiply-add, IEEE division and square root: the doubles of the CPU trainers
     target_compile_options(negp_gpu PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false -prec-div=true -prec-sqrt=true -O3>)
+    if(MSVC)
+      # CCCL (CUB) of CUDA 13 refuses MSVC's traditional preprocessor: the host compiler needs the conforming one
+      target_compile_options(negp_gpu PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
+    endif()
     target_link_libraries(negp_gpu PUBLIC CUDA::cudart_static)
     target_link_libraries(_fastcore PRIVATE negp_gpu)
     target_compile_definitions(_fastcore PRIVATE NEGP_WITH_CUDA=1)

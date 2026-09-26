@@ -78,6 +78,8 @@ def main() -> int:
     ap.add_argument("--batches", default="4096,16384,32768")
     ap.add_argument("--cpu-threads", type=int, default=os.cpu_count() or 4)
     ap.add_argument("--skip-check", action="store_true")
+    ap.add_argument("--buckets", default=None, help="load the E[HS] bucketer from this JSON instead of fitting it")
+    ap.add_argument("--write-buckets", default=None, help="fit the bucketer, save it to this JSON (for build_bucket_table.py), stop")
     ap.add_argument("--emulate", action="store_true",
                     help="run the identity checks with the GPU kernels emulated on the CPU (no device needed), then stop")
     args = ap.parse_args()
@@ -87,12 +89,18 @@ def main() -> int:
     if core is None or not hasattr(core, "cuda_available"):
         print("C++ core missing or too old: python scripts/build_fast.py --clean")
         return 2
+    if args.write_buckets:
+        EquityBucketer(n_buckets=8, samples=150).fit(n_situations=300, seed=0).save(args.write_buckets)
+        print(f"bucketer saved to {args.write_buckets}; now: python scripts/build_bucket_table.py --buckets {args.write_buckets}")
+        return 0
+    tables = os.environ.get("NEGPLURIBUS_BUCKET_TABLES")
+    print(f"bucket tables: {tables or 'none (E[HS] buckets by Monte-Carlo: the host side is slow)'}")
     ok, why = core.cuda_available()
     print(f"cuda_available: {ok} {why}")
     if not ok and not EMULATE:
         return 2
     T = args.cpu_threads
-    bk100 = EquityBucketer(n_buckets=8, samples=150).fit(n_situations=300, seed=0)
+    bk100 = EquityBucketer.load(args.buckets) if args.buckets else EquityBucketer(n_buckets=8, samples=150).fit(n_situations=300, seed=0)
     hu100 = GameSpec(n_players=2, stack_bb=100, max_street=Street.RIVER, preflop_fracs=(1.0,), postflop_fracs=(0.5, 1.0),
                      max_raises_per_street=2, n_buckets=8)
     ft = flat(core, hu100, bk100, 0, 4096, T, True)
@@ -113,15 +121,21 @@ def main() -> int:
     cpu = time.time() - t0
     print(f"  CPU trainer, {T} threads: {cpu:.1f}s = {args.iters / cpu:,.0f} it/s", flush=True)
     for B in [int(x) for x in args.batches.split(",")]:
+        n = (args.iters + B - 1) // B * B  # whole batches: the last batch's device time is typical
         ft = flat(core, hu100, bk100, 0, B, T, True)
         ft.train(B)  # warm-up batch (allocations)
+        s0 = ft.gpu_stats()
         t0 = time.time()
-        ft.train(args.iters)
+        ft.train(n)
         wall = time.time() - t0
         s = ft.gpu_stats()
-        print(f"  GPU batch {B}: {wall:.1f}s = {args.iters / wall:,.0f} it/s (x{cpu / wall:.2f} vs CPU); last batch: "
-              f"{s['items']:,} items, {s['records']:,} records, device {s['ms_traverse']:.1f} ms traverse + {s['ms_apply']:.1f} ms apply "
-              f"= {B / max(1e-9, (s['ms_traverse'] + s['ms_apply']) / 1000):,.0f} it/s device-only", flush=True)
+        prep = (s["ms_prepare_total"] - s0["ms_prepare_total"]) / 1000
+        dev = (s["ms_device_total"] - s0["ms_device_total"]) / 1000
+        wait = (s["ms_wait_prepare"] - s0["ms_wait_prepare"]) / 1000
+        print(f"  GPU batch {B}: {n} it in {wall:.1f}s = {n / wall:,.0f} it/s (x{(n / wall) / (args.iters / cpu):.2f} vs CPU); "
+              f"host deals+buckets {prep:.1f}s (overlapped; waited for it {wait:.1f}s), run_batch {dev:.1f}s; last batch: {s['items']:,} items, {s['records']:,} records, "
+              f"device {s['ms_traverse']:.1f} ms traverse + {s['ms_apply']:.1f} ms apply = "
+              f"{B / max(1e-9, (s['ms_traverse'] + s['ms_apply']) / 1000):,.0f} it/s device-only", flush=True)
     return 0
 
 
