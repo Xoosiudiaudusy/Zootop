@@ -180,7 +180,7 @@ public:
         }
     }
 
-    // every touched infoset: (key, regret, strategy sum, visits)
+    // every touched infoset: (key, action ids, regret, strategy sum, number of actions, visits)
     template <class F>
     void for_each_touched(F&& f) {
         sync();
@@ -192,7 +192,7 @@ public:
                 if (!touched[i]) continue;
                 game.key(d, b, key);
                 const uint64_t c = game.cell_base[d] + (uint64_t)b * (uint64_t)na;
-                f(key, &regret[c], &strategy_sum[c], na, visits[i]);
+                f(key, &game.ids[d * MAX_ACTIONS], &regret[c], &strategy_sum[c], na, visits[i]);
             }
         }
     }

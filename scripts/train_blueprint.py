@@ -107,6 +107,10 @@ def main() -> None:
     ap.add_argument("--linear-until", type=int, default=0,
                     help="C++ backend: Linear CFR weights stop growing after this iteration (Pluribus-style schedule; 0 = always linear)")
     ap.add_argument("--prune-after", type=int, default=0, help="iterations before pruning starts")
+    ap.add_argument("--gpu", type=int, default=-1,
+                    help="train on this CUDA device (flat GPU trainer, needs --backend cpp and --batch; bit-identical to --batch on the CPU)")
+    ap.add_argument("--seconds", type=float, default=0.0,
+                    help="train for this wall time instead of --iters (whole batches with --batch); for equal-time comparisons")
     ap.add_argument("--data-dir", default=DATA, help="where buckets / checkpoints / blueprints go (default data/)")
     args = ap.parse_args()
     no_throttle = disable_power_throttling()  # scheduling only, results unchanged
@@ -201,10 +205,48 @@ def main() -> None:
             if snapshot:
                 s.save(it_path(bp_path))
 
-    print(f"training {args.iters:,} iterations (each = {spec.n_players} traversals)…")
+    if args.gpu >= 0:
+        if not cpp or args.batch <= 0:
+            raise SystemExit("--gpu needs --backend cpp and --batch B")
+        if args.checkpoint_every or args.resume or args.prune_below > 0:
+            raise SystemExit("--gpu: no --checkpoint-every / --resume / pruning yet")
+
+    def train_for(train_step, iteration, what: str) -> None:
+        """--seconds: steps of whole batches until the wall time is used; else --iters in one call"""
+        if args.seconds <= 0:
+            train_step(args.iters)
+            return
+        step = max(args.batch, 1) * max(1, 262144 // max(args.batch, 1)) if args.batch > 0 else 100_000
+        start = time.perf_counter()
+        while time.perf_counter() - start < args.seconds:
+            train_step(step)
+        el = time.perf_counter() - start
+        print(f"{what}: {iteration():,} iterations in {el:.0f}s = {iteration() / el:,.0f} it/s", flush=True)
+
+    what = f"{args.iters:,} iterations" if args.seconds <= 0 else f"{args.seconds:g} seconds"
+    print(f"training {what} (each iteration = {spec.n_players} traversals){' on GPU ' + str(args.gpu) if args.gpu >= 0 else ''}…")
     t0 = time.perf_counter()
+    if args.gpu >= 0:
+        # the flat trainer on the device (gpucfr.h); its tables are then handed to the ordinary trainer,
+        # which writes the checkpoint and the blueprint as usual
+        from negpluribus.fast import core as fast_core
+        from negpluribus.fast.trainer import spec_to_dict
+
+        ft = fast_core().FlatTrainer(spec_to_dict(spec), trainer._core_bucketer, int(args.seed) & 0xFFFFFFFFFFFFFFFF,
+                                     not args.no_linear, trainer.threads)
+        ft.batch_size = args.batch
+        ft.linear_until = args.linear_until
+        ft.use_gpu(args.gpu)
+        print(f"GPU: {ft.gpu_device}; flat game {ft.game_stats()}", flush=True)
+        train_for(ft.train, lambda: ft.iteration, "GPU")
+        trainer._core.import_nodes(ft.export_checkpoint(), True)
+        trainer.iteration = ft.iteration
+    elif args.seconds > 0:
+        train_for(lambda n: trainer.train(n), lambda: trainer.iteration, "CPU")
     cores = CoreMeter()  # busy cores per checkpoint interval: ~4 instead of ~15 means the run is throttled
-    if args.checkpoint_every and args.checkpoint_every < args.iters:
+    if args.gpu >= 0 or args.seconds > 0:
+        pass  # trained above
+    elif args.checkpoint_every and args.checkpoint_every < args.iters:
         # long runs: train in chunks, save after each, and report how much the AVERAGE strategy
         # still moves between checkpoints (mean L1 distance over keys present in both).  With no
         # exact epsilon in multi-street games this is the plateau diagnostic; the paired

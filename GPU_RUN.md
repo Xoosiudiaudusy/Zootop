@@ -309,3 +309,62 @@ git add -f GPU_REPORT4.md build4.log tests_gpu4.log bench6.log bench7.log
 git commit -m "GPU run report 4"
 git push -u origin opt/gpu-report4
 ```
+
+
+---
+
+# Раунд 5: качество на равном времени (дуэль GPU против CPU)
+
+Раунд 4 дал GPU в 2,3–5 раз быстрее CPU при совпадении бит в бит. Теперь главный вопрос: **играет ли стратегия, обученная на GPU за то же время, не хуже**. Большая пачка реже обновляет стратегию, и это может съесть выигрыш в скорости. Ответ даёт только дуэль.
+
+Всё в той же папке `..\zootop-gpu`, таблица корзин от раунда 2 та же. Долгий раунд: 3 обучения по 10 минут и 2 дуэли, в сумме порядка 1–2 часов. **Во время обучения ничем не нагружай ПК**: там замер «за равное время».
+
+### R5-1. Обновить и собрать
+```powershell
+cd ..\zootop-gpu
+git fetch origin opt/gpu
+git checkout --detach origin/opt/gpu
+git log --oneline -1
+python scripts/build_fast.py --clean *> build5.log
+Select-String -Path build5.log -Pattern "negpluribus:|error|built" | Select-Object -First 20
+python -m pytest -q tests/test_flatcfr.py tests/test_batched.py *> tests_gpu5.log
+Get-Content tests_gpu5.log -Tail 3
+```
+
+### R5-2. Три обучения по 600 секунд (одна и та же игра, одни и те же корзины)
+```powershell
+$env:NEGPLURIBUS_BUCKET_TABLES = (Resolve-Path data\bucket_tables).Path
+$D = "data\eq"
+New-Item -ItemType Directory -Force $D | Out-Null
+foreach ($t in "eqcpu","eqgpu4k","eqgpu32k") { Copy-Item data\buckets_gpubench.json "$D\buckets_$t.json" }
+$G = "--players 2 --stack 100 --street river --preflop-fracs 1.0 --postflop-fracs 0.5,1.0 --max-raises 2 --buckets 8 --buckets-kind ehs --backend cpp --eval-deals 0 --no-l1 --seed 0 --seconds 600 --data-dir $D".Split(" ")
+python scripts/train_blueprint.py @G --tag eqcpu *> train_eqcpu.log
+python scripts/train_blueprint.py @G --tag eqgpu4k --gpu 0 --batch 4096 *> train_eqgpu4k.log
+python scripts/train_blueprint.py @G --tag eqgpu32k --gpu 0 --batch 32768 *> train_eqgpu32k.log
+Select-String -Path train_eq*.log -Pattern "iterations in|done in|saved|Error|error"
+```
+В каждом логе должна быть строка вида `CPU: N iterations in 600s = X it/s` или `GPU: ...`, а в конце `saved ...blueprint_<tag>.bin`.
+
+### R5-3. Две дуэли по 200 тыс. раздач (можно запустить обе параллельно в двух окнах)
+```powershell
+$C = "--players 2 --stack 100 --street river --preflop-fracs 1.0 --postflop-fracs 0.5,1.0 --max-raises 2 --buckets $D\buckets_eqcpu.json --deals 200000".Split(" ")
+python scripts/compare_checkpoints.py @C --a $D\blueprint_eqgpu4k.bin --b $D\blueprint_eqcpu.bin --label-a gpu4k --label-b cpu *> duel_gpu4k.log
+python scripts/compare_checkpoints.py @C --a $D\blueprint_eqgpu32k.bin --b $D\blueprint_eqcpu.bin --label-a gpu32k --label-b cpu *> duel_gpu32k.log
+Get-Content duel_gpu4k.log -Tail 15
+Get-Content duel_gpu32k.log -Tail 15
+```
+Если дуэль идёт дольше часа, запиши, сколько она успела пройти, и не прерывай.
+
+### R5-4. Отчёт
+`GPU_REPORT5.md`:
+- итерации и it/s каждого обучения (строки из `train_eq*.log`);
+- итог обеих дуэлей дословно (строки с `vs`, bb/100 и доверительный интервал);
+- время каждой дуэли;
+- замечания.
+```powershell
+git checkout -b opt/gpu-report5
+git add -f GPU_REPORT5.md build5.log tests_gpu5.log train_eq*.log duel_gpu*.log
+git commit -m "GPU run report 5 (equal-time duel)"
+git push -u origin opt/gpu-report5
+```
+Блюпринты и чекпоинты (`data\eq\*.bin`) **не коммить**.

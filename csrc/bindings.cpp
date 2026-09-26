@@ -1101,8 +1101,18 @@ PYBIND11_MODULE(_fastcore, m) {
         .def("export_nodes", [](FlatTrainer& t) {
             // {key: (regret, strategy_sum, visits)} of every infoset an update reached
             py::dict out;
-            t.for_each_touched([&](const std::string& key, const double* r, const double* s, int na, int64_t v) {
+            t.for_each_touched([&](const std::string& key, const uint8_t*, const double* r, const double* s, int na, int64_t v) {
                 out[py::str(key)] = py::make_tuple(std::vector<double>(r, r + na), std::vector<double>(s, s + na), v);
+            });
+            return out;
+        })
+        .def("export_checkpoint", [](FlatTrainer& t) {
+            // {key: (action names, regret, strategy_sum, visits)}: the rows Trainer.import_nodes takes
+            py::dict out;
+            t.for_each_touched([&](const std::string& key, const uint8_t* ids, const double* r, const double* s, int na, int64_t v) {
+                py::list acts;
+                for (int i = 0; i < na; i++) acts.append(t.grid.names[ids[i]]);
+                out[py::str(key)] = py::make_tuple(acts, std::vector<double>(r, r + na), std::vector<double>(s, s + na), v);
             });
             return out;
         });
