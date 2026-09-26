@@ -70,7 +70,8 @@ def core_bucketer(bucketer, cache_caps=None):
         if not hasattr(c, "PotentialBucketer"):
             raise RuntimeError("the built C++ core predates potential-aware buckets; run `python scripts/build_fast.py`")
         centroids = {int(k): [list(cdf) for cdf in v] for k, v in bucketer.centroids.items()}
-        return tabulated(c.PotentialBucketer(bucketer.n_buckets, bucketer.samples, bucketer.bins, centroids, boundaries, caps))
+        return tabulated(c.PotentialBucketer(bucketer.n_buckets, bucketer.samples, bucketer.bins, centroids, boundaries, caps,
+                                             exact=bool(getattr(bucketer, "exact", False))))
     return tabulated(c.Bucketer(bucketer.n_buckets, bucketer.samples, boundaries, caps))
 
 

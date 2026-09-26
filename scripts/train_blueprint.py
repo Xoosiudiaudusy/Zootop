@@ -75,6 +75,8 @@ def main() -> None:
     ap.add_argument("--buckets", type=int, default=8)
     ap.add_argument("--buckets-kind", choices=list(BUCKET_KINDS), default="ehs",
                     help="postflop card abstraction: E[HS] cut points or potential-aware EMD clusters (docs/buckets.md)")
+    ap.add_argument("--exact-features", action="store_true",
+                    help="potential-aware buckets with exact flop / turn features (enumeration) instead of Monte-Carlo runouts")
     ap.add_argument("--fit-situations", type=int, default=1200, help="random situations per street for the bucketer fit")
     ap.add_argument("--iters", type=int, default=30000)
     ap.add_argument("--no-linear", action="store_true", help="plain CFR weighting instead of Linear CFR")
@@ -124,8 +126,10 @@ def main() -> None:
         max_raises_per_street=args.max_raises,
         n_buckets=args.buckets,
         bucket_kind=args.buckets_kind,
+        exact_features=args.exact_features,
     )
-    tag = args.tag or f"{spec.n_players}p_{spec.stack_bb}bb_{args.street}" + ("_pot" if args.buckets_kind == "potential" else "")
+    tag = args.tag or (f"{spec.n_players}p_{spec.stack_bb}bb_{args.street}" + ("_pot" if args.buckets_kind == "potential" else "")
+                       + ("x" if args.exact_features else ""))
     data = args.data_dir
     os.makedirs(data, exist_ok=True)
     bk_path = os.path.join(data, f"buckets_{tag}.json")
@@ -137,6 +141,9 @@ def main() -> None:
             bucketer = load_bucketer(bk_path)
             if bucketer_kind(bucketer) != spec.bucket_kind:
                 raise SystemExit(f"{bk_path} holds {bucketer_kind(bucketer)!r} buckets, the spec wants {spec.bucket_kind!r}; use --tag")
+            if bool(getattr(bucketer, "exact", False)) != args.exact_features:
+                raise SystemExit(f"{bk_path} was fitted {'with' if getattr(bucketer, 'exact', False) else 'without'} exact features; "
+                                 "match --exact-features or use another --tag")
             print("buckets: loaded", bk_path)
         else:
             print(f"buckets: fitting {spec.bucket_kind} ({args.fit_situations} situations per street)…", flush=True)
