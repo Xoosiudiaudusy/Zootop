@@ -386,3 +386,75 @@ git commit -m "GPU run report 5 (equal-time duel, potential-aware exact 64)"
 git push -u origin opt/gpu-report5
 ```
 Большие файлы (`data\eq\*.bin`, `*.npbt`, признаки) **не коммить**.
+
+
+---
+
+# Раунд 6: 3-max, широкая сетка, корзины как в проде — дуэль на равном времени с контролем
+
+По раунду 5: в узком HU разницы не видно, но эта игра, вероятно, успевает сойтись у обоих за 10 минут. Теперь берём игру, которой 20 минут мало:
+- 3 игрока, 100bb;
+- широкая сетка: префлоп 0.5 / 1 / 3 банка, постфлоп 0.5 / 1 / 2 / 4, до 3 рейзов на улицу;
+- potential-aware 64 с точными признаками;
+- таблица корзин та же, что в раунде 5: она от числа игроков не зависит.
+
+Плюс **контроль**: два CPU-обучения с разными сидами. Их дуэль показывает, какой разброс бывает между двумя равными тренерами.
+
+Что изменилось в коде: таблица с GPU передаётся в обычный тренер внутри C++, без Python-словаря. На этой игре плоская таблица занимает 150 млн ячеек, ~3,7 ГБ видеопамяти.
+
+Всё в той же папке `..\zootop-gpu`. Долгий раунд, около 3 часов: 4 обучения по 20 минут и 3 дуэли по ~15–40 минут. **Во время обучений ПК не нагружать.**
+
+### R6-1. Обновить, собрать, тесты
+```powershell
+cd ..\zootop-gpu
+git fetch origin opt/gpu
+git checkout --detach origin/opt/gpu
+git log --oneline -1
+python scripts/build_fast.py --clean *> build6.log
+Select-String -Path build6.log -Pattern "negpluribus:|error|built" | Select-Object -First 20
+python -m pytest -q tests/test_flatcfr.py tests/test_batched.py *> tests_gpu6.log
+Get-Content tests_gpu6.log -Tail 3
+```
+
+### R6-2. Четыре обучения по 1200 секунд
+```powershell
+$env:NEGPLURIBUS_BUCKET_TABLES = (Resolve-Path data\eq\bucket_tables).Path
+$D = "data\eq3"
+New-Item -ItemType Directory -Force $D | Out-Null
+foreach ($t in "cpu0","cpu1","gpu4k","gpu16k") { Copy-Item data\eq\buckets_pa64.json "$D\buckets_$t.json" }
+$G = "--players 3 --stack 100 --street river --preflop-fracs 0.5,1.0,3.0 --postflop-fracs 0.5,1.0,2.0,4.0 --max-raises 3 --buckets 64 --buckets-kind potential --exact-features --backend cpp --eval-deals 0 --no-l1 --seconds 1200 --data-dir $D".Split(" ")
+python scripts/train_blueprint.py @G --seed 0 --tag cpu0 *> train3_cpu0.log
+python scripts/train_blueprint.py @G --seed 1 --tag cpu1 *> train3_cpu1.log
+python scripts/train_blueprint.py @G --seed 0 --tag gpu4k  --gpu 0 --batch 4096  *> train3_gpu4k.log
+python scripts/train_blueprint.py @G --seed 0 --tag gpu16k --gpu 0 --batch 16384 *> train3_gpu16k.log
+Select-String -Path train3_*.log -Pattern "buckets:|GPU:|flat game|iterations in|done in|saved|Error|error"
+```
+Для GPU-обучений в логе есть строка `GPU: ...; flat game {...}` с размером игры. Если видеопамяти не хватит, будет ошибка CUDA `out of memory`: запиши её дословно.
+
+Во время GPU-обучений сними загрузку, как в прошлых раундах: GPU %, память GPU, ватты, CPU %, плюс занятую оперативку ПК (диспетчер задач).
+
+### R6-3. Три дуэли по 1 млн раздач
+Можно по две одновременно, после того как закончены все обучения.
+```powershell
+$C = "--players 3 --stack 100 --street river --preflop-fracs 0.5,1.0,3.0 --postflop-fracs 0.5,1.0,2.0,4.0 --max-raises 3 --buckets $D\buckets_cpu0.json --deals 1000000".Split(" ")
+python scripts/compare_checkpoints.py @C --a "$D\blueprint_cpu1.bin"   --b "$D\blueprint_cpu0.bin" --label-a cpu1   --label-b cpu0 *> duel3_control.log
+python scripts/compare_checkpoints.py @C --a "$D\blueprint_gpu4k.bin"  --b "$D\blueprint_cpu0.bin" --label-a gpu4k  --label-b cpu0 *> duel3_gpu4k.log
+python scripts/compare_checkpoints.py @C --a "$D\blueprint_gpu16k.bin" --b "$D\blueprint_cpu0.bin" --label-a gpu16k --label-b cpu0 *> duel3_gpu16k.log
+Get-ChildItem duel3_*.log | ForEach-Object { "== $_"; Get-Content $_ -Tail 8 }
+```
+Если дуэль идёт дольше полутора часов, запиши, сколько она успела пройти, и не прерывай.
+
+### R6-4. Отчёт
+`GPU_REPORT6.md`:
+- время сборки;
+- для каждого из 4 обучений: итерации, it/s, число инфосетов, строка `flat game` для GPU;
+- загрузка во время GPU-обучений;
+- итоги трёх дуэлей дословно (строки с `vs`, CI, off-map) и время каждой;
+- замечания.
+```powershell
+git checkout -b opt/gpu-report6
+git add -f GPU_REPORT6.md build6.log tests_gpu6.log train3_*.log duel3_*.log
+git commit -m "GPU run report 6 (3-max wide, equal-time duels with a control)"
+git push -u origin opt/gpu-report6
+```
+Большие файлы (`data\eq3\*.bin`) **не коммить**.

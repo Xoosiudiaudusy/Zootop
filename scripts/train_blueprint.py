@@ -246,8 +246,7 @@ def main() -> None:
         ft.use_gpu(args.gpu)
         print(f"GPU: {ft.gpu_device}; flat game {ft.game_stats()}", flush=True)
         train_for(ft.train, lambda: ft.iteration, "GPU")
-        trainer._core.import_nodes(ft.export_checkpoint(), True)
-        trainer.iteration = ft.iteration
+        ft.copy_to(trainer._core)  # in C++: no Python dict of the whole table
     elif args.seconds > 0:
         train_for(lambda n: trainer.train(n), lambda: trainer.iteration, "CPU")
     cores = CoreMeter()  # busy cores per checkpoint interval: ~4 instead of ~15 means the run is throttled

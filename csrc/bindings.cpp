@@ -1199,6 +1199,21 @@ PYBIND11_MODULE(_fastcore, m) {
             });
             return out;
         })
+        .def("copy_to", [](FlatTrainer& ft, Trainer& t) {
+            // the tables into an ordinary Trainer (replacing its nodes) and its iteration count, in C++: what
+            // export_checkpoint + Trainer.import_nodes do, without the Python dict (large games)
+            py::gil_scoped_release nogil;
+            ApiLock lk(t.api_mu);
+            if (ft.spec.n_players != t.spec.n_players) throw std::invalid_argument("copy_to: another game");
+            t.nodes.clear();
+            ft.for_each_touched([&](const std::string& key, const uint8_t* ids, const double* r, const double* s, int na, int64_t v) {
+                Node* n = get_or_create_by_string(t.nodes, t.codec, key, ids, na, t.main_arena()).node;
+                n->init(ids, na);
+                for (int i = 0; i < na; i++) { n->regret()[i] = r[i]; n->strategy_sum()[i] = s[i]; }
+                n->visits = v;
+            });
+            t.set_iteration(ft.iteration());
+        }, py::arg("trainer"))
         .def("export_checkpoint", [](FlatTrainer& t) {
             // {key: (action names, regret, strategy_sum, visits)}: the rows Trainer.import_nodes takes
             py::dict out;
