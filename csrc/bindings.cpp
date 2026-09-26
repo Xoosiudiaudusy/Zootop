@@ -1089,6 +1089,10 @@ PYBIND11_MODULE(_fastcore, m) {
             d["records"] = s.records;
             d["ms_traverse"] = s.ms_traverse;
             d["ms_apply"] = s.ms_apply;
+            d["ms_forward"] = s.ms_forward;
+            d["ms_backward"] = s.ms_backward;
+            d["ms_sort"] = s.ms_sort;
+            d["ms_runs"] = s.ms_runs;
             d["ms_prepare_total"] = t.ms_prepare_total;
             d["ms_device_total"] = t.ms_device_total;
             d["ms_wait_prepare"] = t.ms_wait_prepare;

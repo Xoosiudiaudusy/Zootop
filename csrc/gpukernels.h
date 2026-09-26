@@ -5,21 +5,42 @@
 // any machine against the CPU trainers.
 //
 // Items: one (node, job) per slot of the level arrays; job = (iteration - batch start) * n + traverser.
-// Update records: key = kind (2 bits) | cell or infoset (42 bits) | job (20 bits), value.  Every key is
+// Update records: key = kind (2 bits) | cell or infoset | job (KeyLayout: as many bits as the batch and the
+// table need), value; each item's records go to the slots of an exclusive scan of the record counts.  Every key is
 // unique within a batch (a cell is reached at most once per job), so sorting by key alone fixes the order
 // of the additions: (kind, cell, iteration, traverser), the order of the CPU trainers.
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 
 #include "cfrmath.h"
 #include "philox.h"
 
 namespace negp {
 
-constexpr int KEY_JOB_BITS = 20;
-constexpr int KEY_CELL_BITS = 42;
-constexpr uint64_t KEY_CELL_MASK = (1ULL << KEY_CELL_BITS) - 1;
+// the bit layout of the update keys, fitted to the batch and the table so the radix sort reads as few
+// bits as it needs: job in [0, jb), cell or infoset in [jb, jb + cb), kind in [jb + cb, jb + cb + 2)
+struct KeyLayout {
+    int jb = 1, cb = 1;
+    int bits() const { return jb + cb + 2; }
+};
+NEGP_HD inline uint64_t make_key(const KeyLayout& kl, uint64_t kind, uint64_t cell, uint32_t job) {
+    return (kind << (kl.jb + kl.cb)) | (cell << kl.jb) | (uint64_t)job;
+}
+inline int bits_for(uint64_t n) {  // bits holding 0 .. n - 1 (at least 1)
+    int b = 1;
+    while (b < 64 && (1ULL << b) < n) b++;
+    return b;
+}
+// the layout for `jobs` jobs (iterations x traversers) and `cells` cells / infosets; 0 bits: does not fit
+inline KeyLayout key_layout(uint64_t jobs, uint64_t cells) {
+    KeyLayout kl;
+    kl.jb = bits_for(jobs);
+    kl.cb = bits_for(cells);
+    if (kl.bits() > 64) { kl.jb = kl.cb = 0; }
+    return kl;
+}
 constexpr uint8_t CHOICE_TRAVERSER = 0xFF;  // choice of a traverser node: every child
 
 struct DevGame {
@@ -40,6 +61,8 @@ struct DevLevel {  // the item arrays of all levels of a pass; level L is [off_L
     uint32_t* cnt;     // children
     uint8_t* choice;   // an opponent node's sampled action, CHOICE_TRAVERSER for a traverser node
     double* value;
+    uint32_t* rcnt;    // update records the item writes in the backward pass
+    uint64_t* roff;    // after the scan over all items of the pass: its first record's slot
 };
 
 NEGP_HD inline int item_bucket(const DevGame& g, const FlatIter& it, int d, int seat, int* err) {
@@ -68,6 +91,7 @@ NEGP_HD inline uint32_t item_count(const DevGame& g, DevLevel L, size_t x, const
         const int me = ((p - it.button) % n + n) % n;
         L.value[x] = (double)terminal_net_of(&g.invested[(size_t)tm * n], g.folded[tm], n, me, it.strength) / (double)bb;
         L.cnt[x] = 0;
+        L.rcnt[x] = 0;
         return 0;
     }
     const int d = node;
@@ -76,6 +100,7 @@ NEGP_HD inline uint32_t item_count(const DevGame& g, DevLevel L, size_t x, const
     if (seat == p) {
         L.cnt[x] = (uint32_t)na;
         L.choice[x] = CHOICE_TRAVERSER;
+        L.rcnt[x] = (uint32_t)na;
         return (uint32_t)na;
     }
     const int b = item_bucket(g, it, d, seat, err);
@@ -90,6 +115,7 @@ NEGP_HD inline uint32_t item_count(const DevGame& g, DevLevel L, size_t x, const
     }
     L.choice[x] = (uint8_t)a;
     L.cnt[x] = 1;
+    L.rcnt[x] = (uint32_t)(na + 1);
     return (uint32_t)(na + 1);
 }
 
@@ -122,8 +148,8 @@ NEGP_HD inline uint32_t item_records(const DevGame& g, DevLevel L, size_t x) {
 }
 
 // backward: item x's value from its children; its records at keys[s ..], vals[s ..]
-NEGP_HD inline void item_back(const DevGame& g, DevLevel L, size_t x, size_t next_off, const FlatIter* iters, const double* regret, uint64_t* keys,
-                              double* vals, uint64_t s, int* err) {
+NEGP_HD inline void item_back(const DevGame& g, DevLevel L, size_t x, size_t next_off, const FlatIter* iters, const double* regret, const KeyLayout& kl,
+                              uint64_t* keys, double* vals, uint64_t s, int* err) {
     const int32_t node = L.node[x];
     if (node < 0) return;
     const int n = g.n;
@@ -140,10 +166,10 @@ NEGP_HD inline void item_back(const DevGame& g, DevLevel L, size_t x, size_t nex
     if (L.choice[x] != CHOICE_TRAVERSER) {
         L.value[x] = L.value[fc];
         for (int a = 0; a < na; a++) {
-            keys[s + (uint64_t)a] = (1ULL << 62) | ((c + (uint64_t)a) << KEY_JOB_BITS) | job;
+            keys[s + (uint64_t)a] = make_key(kl, 1, c + (uint64_t)a, job);
             vals[s + (uint64_t)a] = it.weight * sigma[a];
         }
-        keys[s + (uint64_t)na] = (2ULL << 62) | ((g.info_base[d] + (uint64_t)b) << KEY_JOB_BITS) | job;
+        keys[s + (uint64_t)na] = make_key(kl, 2, g.info_base[d] + (uint64_t)b, job);
         vals[s + (uint64_t)na] = 0.0;
         return;
     }
@@ -155,28 +181,29 @@ NEGP_HD inline void item_back(const DevGame& g, DevLevel L, size_t x, size_t nex
     const double u = py_sum(prods, na);
     L.value[x] = u;
     for (int a = 0; a < na; a++) {
-        keys[s + (uint64_t)a] = ((c + (uint64_t)a) << KEY_JOB_BITS) | job;
+        keys[s + (uint64_t)a] = make_key(kl, 0, c + (uint64_t)a, job);
         vals[s + (uint64_t)a] = it.weight * (utils[a] - u);
     }
 }
 
 // after the sort (keys[0 .. m) increasing): the record i that starts a (kind, cell) run adds the run's
 // values to its cell in key order; every other record does nothing
-NEGP_HD inline void apply_run(const uint64_t* keys, const double* vals, size_t m, size_t i, double* regret, double* ssum, int64_t* visits,
-                              uint8_t* touched) {
-    const uint64_t head = keys[i] >> KEY_JOB_BITS;
-    if (i > 0 && (keys[i - 1] >> KEY_JOB_BITS) == head) return;
-    const int kind = (int)(head >> KEY_CELL_BITS);
-    const uint64_t cell = head & KEY_CELL_MASK;
+NEGP_HD inline void apply_run(const uint64_t* keys, const double* vals, size_t m, size_t i, const KeyLayout& kl, double* regret, double* ssum,
+                              int64_t* visits, uint8_t* touched) {
+    const int jb = kl.jb;
+    const uint64_t head = keys[i] >> jb;
+    if (i > 0 && (keys[i - 1] >> jb) == head) return;
+    const int kind = (int)(head >> kl.cb);
+    const uint64_t cell = head & ((1ULL << kl.cb) - 1);
     size_t j = i;
     if (kind == 2) {
-        while (j < m && (keys[j] >> KEY_JOB_BITS) == head) j++;
+        while (j < m && (keys[j] >> jb) == head) j++;
         visits[cell] += (int64_t)(j - i);
         return;
     }
     double* t = kind == 0 ? regret : ssum;
     double v = t[cell];
-    for (; j < m && (keys[j] >> KEY_JOB_BITS) == head; j++) v += vals[j];
+    for (; j < m && (keys[j] >> jb) == head; j++) v += vals[j];
     t[cell] = v;
     touched[cell] = 1;
 }

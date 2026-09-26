@@ -48,11 +48,9 @@ __global__ void k_init(DevLevel L, uint32_t m, uint32_t job0) {
 }
 
 __global__ void k_count(DevGame g, DevLevel L, size_t off, uint32_t m, const FlatIter* iters, const double* regret, uint64_t seed, int bb,
-                        unsigned long long* n_rec, int* err) {
+                        int* err) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= m) return;
-    const uint32_t r = item_count(g, L, off + i, iters, regret, seed, bb, err);
-    if (r) atomicAdd(n_rec, (unsigned long long)r);
+    if (i < m) item_count(g, L, off + i, iters, regret, seed, bb, err);
 }
 
 __global__ void k_emit(DevGame g, DevLevel L, size_t off, uint32_t m, size_t next_off) {
@@ -60,20 +58,20 @@ __global__ void k_emit(DevGame g, DevLevel L, size_t off, uint32_t m, size_t nex
     if (i < m) item_emit(g, L, off + i, next_off);
 }
 
-// records go to slots taken with an atomic counter: their order in the buffer varies, their keys do not
+// an item's records go to the slots base + roff[x] (exclusive scan of the record counts of the pass)
 __global__ void k_back(DevGame g, DevLevel L, size_t off, uint32_t m, size_t next_off, const FlatIter* iters, const double* regret,
-                       uint64_t* keys, double* vals, unsigned long long* rec_at, int* err) {
+                       KeyLayout kl, uint64_t* keys, double* vals, uint64_t base, int* err) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= m) return;
-    const uint32_t r = item_records(g, L, off + i);
-    if (r == 0) return;
-    const unsigned long long s = atomicAdd(rec_at, (unsigned long long)r);
-    item_back(g, L, off + i, next_off, iters, regret, keys, vals, (uint64_t)s, err);
+    const size_t x = off + i;
+    if (L.rcnt[x] == 0) return;
+    item_back(g, L, x, next_off, iters, regret, kl, keys, vals, base + L.roff[x], err);
 }
 
-__global__ void k_apply(const uint64_t* keys, const double* vals, size_t m, double* regret, double* ssum, int64_t* visits, uint8_t* touched) {
+__global__ void k_apply(const uint64_t* keys, const double* vals, size_t m, KeyLayout kl, double* regret, double* ssum, int64_t* visits,
+                        uint8_t* touched) {
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < m) apply_run(keys, vals, m, i, regret, ssum, visits, touched);
+    if (i < m) apply_run(keys, vals, m, i, kl, regret, ssum, visits, touched);
 }
 
 inline unsigned blocks(size_t m) { return (unsigned)((m + THREADS - 1) / THREADS); }
@@ -104,15 +102,16 @@ struct GpuFlatTrainer::Impl {
     Buf<uint32_t> job, first, cnt;
     Buf<uint8_t> choice;
     Buf<double> value;
+    Buf<uint32_t> rcnt;
+    Buf<uint64_t> roff;
     Buf<uint64_t> keys, keys_alt;
     Buf<double> vals, vals_alt;
     Buf<unsigned char> temp;
-    unsigned long long* counters = nullptr;  // [0] records counted, [1] records written
     int* err = nullptr;
-    cudaEvent_t ev[3] = {nullptr, nullptr, nullptr};
+    cudaEvent_t ev[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
     GpuStats st;
 
-    DevLevel level() { return DevLevel{node.p, job.p, first.p, cnt.p, choice.p, value.p}; }
+    DevLevel level() { return DevLevel{node.p, job.p, first.p, cnt.p, choice.p, value.p, rcnt.p, roff.p}; }
     void reserve_items(size_t n, size_t keep) {
         node.reserve(n, keep);
         job.reserve(n, keep);
@@ -120,6 +119,8 @@ struct GpuFlatTrainer::Impl {
         cnt.reserve(n, keep);
         choice.reserve(n, keep);
         value.reserve(n, keep);
+        rcnt.reserve(n, keep);
+        roff.reserve(n, keep);
     }
     template <class T>
     T* keep(T* p) { game_arrays.push_back(p); return p; }
@@ -130,7 +131,6 @@ struct GpuFlatTrainer::Impl {
         if (ssum) cudaFree(ssum);
         if (visits) cudaFree(visits);
         if (touched) cudaFree(touched);
-        if (counters) cudaFree(counters);
         if (err) cudaFree(err);
         for (auto& e : ev) if (e) cudaEventDestroy(e);
     }
@@ -147,7 +147,6 @@ bool GpuFlatTrainer::available(std::string& why) {
 
 GpuFlatTrainer::GpuFlatTrainer(const FlatGameView& v, int bb, uint64_t seed, int device) : impl_(new Impl) {
     Impl& m = *impl_;
-    if (v.n_cells > KEY_CELL_MASK || v.n_infosets > KEY_CELL_MASK) throw std::invalid_argument("GPU trainer: too many cells for the update keys");
     m.device = device;
     CK(cudaSetDevice(device));
     m.bb = bb;
@@ -175,7 +174,6 @@ GpuFlatTrainer::GpuFlatTrainer(const FlatGameView& v, int bb, uint64_t seed, int
     CK(cudaMemset(m.ssum, 0, v.n_cells * sizeof(double)));
     CK(cudaMemset(m.visits, 0, v.n_infosets * sizeof(int64_t)));
     CK(cudaMemset(m.touched, 0, v.n_cells));
-    CK(cudaMalloc(&m.counters, 2 * sizeof(unsigned long long)));
     CK(cudaMalloc(&m.err, sizeof(int)));
     CK(cudaMemset(m.err, 0, sizeof(int)));
     for (auto& e : m.ev) CK(cudaEventCreate(&e));
@@ -187,14 +185,20 @@ void GpuFlatTrainer::run_batch(const FlatIter* its, int k, int pass) {
     Impl& m = *impl_;
     CK(cudaSetDevice(m.device));
     const int n = m.g.n;
-    if ((uint64_t)k * (uint64_t)n >= (1ULL << KEY_JOB_BITS)) throw std::invalid_argument("GPU trainer: batch too large for the update keys");
+    const KeyLayout kl = key_layout((uint64_t)k * (uint64_t)n, std::max(m.n_cells, m.n_infosets));
+    if (kl.bits() == 0 || kl.jb == 0) throw std::invalid_argument("GPU trainer: batch x table too large for 64-bit update keys");
     if (pass < 1) pass = k;
     m.iters.reserve((size_t)k);
     CK(cudaMemcpy(m.iters.p, its, (size_t)k * sizeof(FlatIter), cudaMemcpyHostToDevice));
     m.st = GpuStats();
     size_t n_rec = 0;  // records of the batch so far
-    CK(cudaEventRecord(m.ev[0]));
+    auto elapsed = [&](int a, int b) {
+        float t = 0;
+        CK(cudaEventElapsedTime(&t, m.ev[a], m.ev[b]));
+        return (double)t;
+    };
     for (int lo = 0; lo < k; lo += pass) {
+        CK(cudaEventRecord(m.ev[0]));
         const int it_n = std::min(pass, k - lo);
         const uint32_t jobs = (uint32_t)it_n * (uint32_t)n;
         // level 0: the roots of the pass's jobs (job ids are batch relative)
@@ -202,10 +206,9 @@ void GpuFlatTrainer::run_batch(const FlatIter* its, int k, int pass) {
         m.reserve_items(jobs, 0);
         k_init<<<blocks(jobs), THREADS>>>(m.level(), jobs, (uint32_t)lo * (uint32_t)n);
         CK(cudaGetLastError());
-        CK(cudaMemset(m.counters, 0, 2 * sizeof(unsigned long long)));
         for (size_t L = 0; size[L] > 0; L++) {
             const uint32_t cur = (uint32_t)size[L];
-            k_count<<<blocks(cur), THREADS>>>(m.g, m.level(), off[L], cur, m.iters.p, m.regret, m.seed, m.bb, m.counters, m.err);
+            k_count<<<blocks(cur), THREADS>>>(m.g, m.level(), off[L], cur, m.iters.p, m.regret, m.seed, m.bb, m.err);
             CK(cudaGetLastError());
             size_t tb = 0;
             CK(cub::DeviceScan::ExclusiveSum(nullptr, tb, m.cnt.p + off[L], m.first.p + off[L], cur));
@@ -223,22 +226,34 @@ void GpuFlatTrainer::run_batch(const FlatIter* its, int k, int pass) {
             size.push_back(nxt);
         }
         m.st.items += off.back();
-        // records of this pass
-        unsigned long long cnt_rec = 0;
-        CK(cudaMemcpy(&cnt_rec, m.counters, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+        // records of this pass: slots from one exclusive scan of the record counts of all its items
+        const size_t items = off.back();
+        size_t tb = 0;
+        CK(cub::DeviceScan::ExclusiveSum(nullptr, tb, m.rcnt.p, m.roff.p, (int64_t)items));
+        m.temp.reserve(tb);
+        CK(cub::DeviceScan::ExclusiveSum(m.temp.p, tb, m.rcnt.p, m.roff.p, (int64_t)items));
+        uint64_t last_off = 0;
+        uint32_t last_rc = 0;
+        CK(cudaMemcpy(&last_off, m.roff.p + items - 1, sizeof(uint64_t), cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(&last_rc, m.rcnt.p + items - 1, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        const uint64_t cnt_rec = last_off + last_rc;
+        CK(cudaEventRecord(m.ev[1]));
         m.keys.reserve(n_rec + cnt_rec, n_rec);
         m.vals.reserve(n_rec + cnt_rec, n_rec);
-        const unsigned long long start = n_rec;
-        CK(cudaMemcpy(m.counters + 1, &start, sizeof(unsigned long long), cudaMemcpyHostToDevice));
         for (size_t L = size.size() - 1; L-- > 0;) {
             if (size[L] == 0) continue;
-            k_back<<<blocks(size[L]), THREADS>>>(m.g, m.level(), off[L], (uint32_t)size[L], off[L + 1], m.iters.p, m.regret, m.keys.p, m.vals.p,
-                                                 m.counters + 1, m.err);
+            k_back<<<blocks(size[L]), THREADS>>>(m.g, m.level(), off[L], (uint32_t)size[L], off[L + 1], m.iters.p, m.regret, kl, m.keys.p, m.vals.p,
+                                                 (uint64_t)n_rec, m.err);
             CK(cudaGetLastError());
         }
+        CK(cudaEventRecord(m.ev[2]));
+        CK(cudaEventSynchronize(m.ev[2]));
+        m.st.ms_forward += elapsed(0, 1);
+        m.st.ms_backward += elapsed(1, 2);
         n_rec += cnt_rec;
     }
-    CK(cudaEventRecord(m.ev[1]));
+    CK(cudaEventRecord(m.ev[2]));
+    CK(cudaEventRecord(m.ev[3]));
     // sort and apply
     if (n_rec) {
         m.keys_alt.reserve(n_rec);
@@ -246,22 +261,23 @@ void GpuFlatTrainer::run_batch(const FlatIter* its, int k, int pass) {
         cub::DoubleBuffer<uint64_t> kb(m.keys.p, m.keys_alt.p);
         cub::DoubleBuffer<double> vb(m.vals.p, m.vals_alt.p);
         size_t tb = 0;
-        CK(cub::DeviceRadixSort::SortPairs(nullptr, tb, kb, vb, (int64_t)n_rec));
+        // only the key bits in use: fewer radix passes
+        CK(cub::DeviceRadixSort::SortPairs(nullptr, tb, kb, vb, (int64_t)n_rec, 0, kl.bits()));
         m.temp.reserve(tb);
-        CK(cub::DeviceRadixSort::SortPairs(m.temp.p, tb, kb, vb, (int64_t)n_rec));
-        k_apply<<<blocks(n_rec), THREADS>>>(kb.Current(), vb.Current(), n_rec, m.regret, m.ssum, m.visits, m.touched);
+        CK(cub::DeviceRadixSort::SortPairs(m.temp.p, tb, kb, vb, (int64_t)n_rec, 0, kl.bits()));
+        CK(cudaEventRecord(m.ev[3]));
+        k_apply<<<blocks(n_rec), THREADS>>>(kb.Current(), vb.Current(), n_rec, kl, m.regret, m.ssum, m.visits, m.touched);
         CK(cudaGetLastError());
     }
-    CK(cudaEventRecord(m.ev[2]));
-    CK(cudaEventSynchronize(m.ev[2]));
+    CK(cudaEventRecord(m.ev[4]));
+    CK(cudaEventSynchronize(m.ev[4]));
     int e = 0;
     CK(cudaMemcpy(&e, m.err, sizeof(int), cudaMemcpyDeviceToHost));
     if (e) throw std::runtime_error("GPU trainer: a bucket outside its node's rows");
-    float a = 0, b = 0;
-    CK(cudaEventElapsedTime(&a, m.ev[0], m.ev[1]));
-    CK(cudaEventElapsedTime(&b, m.ev[1], m.ev[2]));
-    m.st.ms_traverse = a;
-    m.st.ms_apply = b;
+    m.st.ms_sort = elapsed(2, 3);
+    m.st.ms_runs = elapsed(3, 4);
+    m.st.ms_traverse = m.st.ms_forward + m.st.ms_backward;
+    m.st.ms_apply = m.st.ms_sort + m.st.ms_runs;
     m.st.records = n_rec;
 }
 

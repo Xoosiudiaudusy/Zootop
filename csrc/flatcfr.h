@@ -255,8 +255,8 @@ private:
 
     void emu_run_batch(const Iter* its, int k, int pass) {
         const int n = spec.n_players;
-        if ((uint64_t)k * (uint64_t)n >= (1ULL << KEY_JOB_BITS)) throw std::invalid_argument("batch too large for the update keys");
-        if (game.n_cells > KEY_CELL_MASK) throw std::invalid_argument("too many cells for the update keys");
+        const KeyLayout kl = key_layout((uint64_t)k * (uint64_t)n, std::max(game.n_cells, game.n_infosets));
+        if (kl.jb == 0) throw std::invalid_argument("batch x table too large for 64-bit update keys");
         if (emu_touched_.size() != game.n_cells) {  // first batch: every cell of a touched infoset
             emu_touched_.assign(game.n_cells, 0);
             for (size_t d = 0; d < game.n_decisions(); d++)
@@ -272,14 +272,16 @@ private:
         std::vector<uint32_t> job, first, cnt;
         std::vector<uint8_t> choice;
         std::vector<double> value;
+        std::vector<uint32_t> rcnt;
+        std::vector<uint64_t> roff;
         std::vector<uint64_t> keys;
         std::vector<double> vals;
         int err = 0;
         auto grow = [&](size_t m) {
             if (node.size() >= m) return;
-            node.resize(m); job.resize(m); first.resize(m); cnt.resize(m); choice.resize(m); value.resize(m);
+            node.resize(m); job.resize(m); first.resize(m); cnt.resize(m); choice.resize(m); value.resize(m); rcnt.resize(m); roff.resize(m);
         };
-        auto lv = [&]() { return DevLevel{node.data(), job.data(), first.data(), cnt.data(), choice.data(), value.data()}; };
+        auto lv = [&]() { return DevLevel{node.data(), job.data(), first.data(), cnt.data(), choice.data(), value.data(), rcnt.data(), roff.data()}; };
         for (int lo = 0; lo < k; lo += pass) {
             const uint32_t jobs = (uint32_t)std::min(pass, k - lo) * (uint32_t)n;
             std::vector<size_t> off{0}, size{jobs};
@@ -297,18 +299,22 @@ private:
                 off.push_back(next_off);
                 size.push_back(acc);
             }
-            // backward; the items of a level take their record slots in reverse order (on the device the
-            // order is whatever the atomics give): the keys, not the slots, fix the result
+            // record slots: exclusive scan of the record counts of all items of the pass (as on the device);
+            // the backward pass then runs its items in reverse order: the slots, not the order, place the records
+            const size_t items = off.back();
+            uint64_t acc = 0;
+            for (size_t i = 0; i < items; i++) { roff[i] = acc; acc += rcnt[i]; }
+            if (acc != n_rec) throw std::logic_error("emulation: record count mismatch");
             const uint64_t base = keys.size();
             keys.resize(base + n_rec);
             vals.resize(base + n_rec);
             uint64_t at = base;
             for (size_t L = size.size() - 1; L-- > 0;)
                 for (size_t i = size[L]; i-- > 0;) {
-                    const uint32_t r = item_records(g, lv(), off[L] + i);
-                    if (!r) continue;
-                    item_back(g, lv(), off[L] + i, off[L + 1], its, regret.data(), keys.data(), vals.data(), at, &err);
-                    at += r;
+                    const size_t x = off[L] + i;
+                    if (!rcnt[x]) continue;
+                    item_back(g, lv(), x, off[L + 1], its, regret.data(), kl, keys.data(), vals.data(), base + roff[x], &err);
+                    at += rcnt[x];
                 }
             if (at != base + n_rec) throw std::logic_error("emulation: record count mismatch");
         }
@@ -316,13 +322,16 @@ private:
         // the radix sort (keys unique: any sort gives this order), then the runs
         std::vector<size_t> perm(keys.size());
         for (size_t i = 0; i < perm.size(); i++) perm[i] = i;
+        const uint64_t used = kl.bits() >= 64 ? ~0ULL : (1ULL << kl.bits()) - 1;
+        for (uint64_t kk : keys)
+            if (kk & ~used) throw std::logic_error("emulation: a key outside its layout");
         std::sort(perm.begin(), perm.end(), [&](size_t a, size_t b) { return keys[a] < keys[b]; });
         std::vector<uint64_t> sk(keys.size());
         std::vector<double> sv(keys.size());
         for (size_t i = 0; i < perm.size(); i++) { sk[i] = keys[perm[i]]; sv[i] = vals[perm[i]]; }
         for (size_t i = 1; i < sk.size(); i++)
             if (sk[i] == sk[i - 1]) throw std::logic_error("emulation: duplicate update key");
-        for (size_t i = 0; i < sk.size(); i++) apply_run(sk.data(), sv.data(), sk.size(), i, regret.data(), strategy_sum.data(), visits.data(), emu_touched_.data());
+        for (size_t i = 0; i < sk.size(); i++) apply_run(sk.data(), sv.data(), sk.size(), i, kl, regret.data(), strategy_sum.data(), visits.data(), emu_touched_.data());
     }
 
     // the FlatIter of iterations lo .. lo + k - 1, on `threads` threads

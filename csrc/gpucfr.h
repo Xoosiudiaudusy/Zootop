@@ -41,8 +41,9 @@ struct FlatGameView {
 struct GpuStats {
     uint64_t items = 0;      // (node, job) items of the last batch, terminals included
     uint64_t records = 0;    // updates of the last batch
-    double ms_traverse = 0;  // device time of the last batch: traversal ...
-    double ms_apply = 0;     // ... and sort + application
+    double ms_traverse = 0;  // device time of the last batch: traversal (= forward + backward) ...
+    double ms_apply = 0;     // ... and sort + application (= sort + runs)
+    double ms_forward = 0, ms_backward = 0, ms_sort = 0, ms_runs = 0;
 };
 
 class GpuFlatTrainer {

@@ -225,3 +225,52 @@ git commit -m "GPU run report 2 (bucket tables)"
 git push -u origin opt/gpu-report2
 ```
 Файлы `data\bucket_tables\*.npbt` **не коммить**, они большие.
+
+
+---
+
+# Раунд 3: замер после ускорения ядер
+
+По раунду 2: с таблицами GPU быстрее CPU в 1,2–2,1 раза, GPU загружен на 80–96 %, но берёт всего ~90 Вт из 250. Похоже, он стоит в очереди, а не считает.
+
+Что изменилось в коде:
+- убраны атомарные счётчики в одну ячейку, через них шёл каждый элемент;
+- сортировка читает только нужные биты ключа;
+- в замере есть разбивка времени устройства: `fwd` / `back` / `sort` / `add`.
+
+Правила те же. Папка та же, `..\zootop-gpu`. Таблица корзин от раунда 2 уже лежит в `data\bucket_tables`, её не пересобирать.
+
+### R3-1. Обновить и собрать
+```powershell
+cd ..\zootop-gpu
+git fetch origin opt/gpu
+git checkout --detach origin/opt/gpu
+git log --oneline -1
+python scripts/build_fast.py --clean *> build3.log
+Select-String -Path build3.log -Pattern "negpluribus:|error|built" | Select-Object -First 20
+```
+
+### R3-2. Бит в бит
+```powershell
+python -m pytest -q tests/test_flatcfr.py tests/test_batched.py *> tests_gpu3.log
+Get-Content tests_gpu3.log -Tail 5
+```
+
+### R3-3. Замер (как в раунде 2)
+```powershell
+$env:NEGPLURIBUS_BUCKET_TABLES = (Resolve-Path data\bucket_tables).Path
+python scripts/gpu_bench.py --buckets data\buckets_gpubench.json --iters 5000000 *> bench4.log
+Get-Content bench4.log
+python scripts/gpu_bench.py --buckets data\buckets_gpubench.json --iters 5000000 --skip-check --batches 65536,131072 *> bench5.log
+Get-Content bench5.log
+```
+Во время строк `GPU batch ...` сними загрузку так же, как в раунде 2: GPU %, память, ватты, CPU %.
+
+### R3-4. Отчёт
+Файл `GPU_REPORT3.md` в том же стиле: оба лога дословно, загрузка, замечания.
+```powershell
+git checkout -b opt/gpu-report3
+git add -f GPU_REPORT3.md build3.log tests_gpu3.log bench4.log bench5.log
+git commit -m "GPU run report 3"
+git push -u origin opt/gpu-report3
+```
