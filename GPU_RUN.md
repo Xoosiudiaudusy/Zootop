@@ -313,15 +313,15 @@ git push -u origin opt/gpu-report4
 
 ---
 
-# Раунд 5: качество на равном времени (дуэль GPU против CPU)
+# Раунд 5: качество на равном времени (дуэль GPU против CPU), корзины как в проде
 
 Раунд 4 дал GPU в 2,3–5 раз быстрее CPU при совпадении бит в бит. Теперь главный вопрос: **играет ли стратегия, обученная на GPU за то же время, не хуже**. Большая пачка реже обновляет стратегию. Основная пачка — 4096, более крупные проверяем с шагом ×2 до 32768 включительно. Ответ даёт только дуэль.
 
-Игра: HU 100bb, узкая сетка, E[HS]-8 — экспериментальная игра, та же, что в прежних дуэлях. Всё в той же папке `..\zootop-gpu`, таблица корзин от раунда 2 та же.
+Игра: HU 100bb, узкая сетка (экспериментальная). Корзины как в проде: **potential-aware, 64 корзины, точные признаки** (`exact=True`). Всё в той же папке `..\zootop-gpu`.
 
-Долгий раунд: 5 обучений по 10 минут и 4 дуэли. **Во время обучения ничем не нагружай ПК**: там замер «за равное время».
+Долгий раунд: подготовка корзин (~5–10 мин), 5 обучений по 10 минут, 4 дуэли. **Во время обучения ничем не нагружай ПК**: там замер «за равное время».
 
-### R5-1. Обновить и собрать
+### R5-1. Обновить, собрать, тесты
 ```powershell
 cd ..\zootop-gpu
 git fetch origin opt/gpu
@@ -329,30 +329,43 @@ git checkout --detach origin/opt/gpu
 git log --oneline -1
 python scripts/build_fast.py --clean *> build5.log
 Select-String -Path build5.log -Pattern "negpluribus:|error|built" | Select-Object -First 20
-python -m pytest -q tests/test_flatcfr.py tests/test_batched.py *> tests_gpu5.log
+python -m pytest -q tests/test_flatcfr.py tests/test_batched.py tests/test_exact_features.py tests/test_exact_bucketer.py *> tests_gpu5.log
 Get-Content tests_gpu5.log -Tail 3
 ```
 
-### R5-2. Пять обучений по 600 секунд (одна игра, одни корзины)
+### R5-2. Корзины: подбор, точные признаки, таблица
+Время каждой команды запиши (`Measure-Command` или по часам).
 ```powershell
-$env:NEGPLURIBUS_BUCKET_TABLES = (Resolve-Path data\bucket_tables).Path
 $D = "data\eq"
 New-Item -ItemType Directory -Force $D | Out-Null
-foreach ($t in "eqcpu","eqgpu4k","eqgpu8k","eqgpu16k","eqgpu32k") { Copy-Item data\buckets_gpubench.json "$D\buckets_$t.json" }
-$G = "--players 2 --stack 100 --street river --preflop-fracs 1.0 --postflop-fracs 0.5,1.0 --max-raises 2 --buckets 8 --buckets-kind ehs --backend cpp --eval-deals 0 --no-l1 --seed 0 --seconds 600 --data-dir $D".Split(" ")
+python -c "from negpluribus.abstraction import make_bucketer; make_bucketer('potential', 64, None, exact=True).fit(n_situations=4800, seed=0, verbose=True).save(r'$D\buckets_pa64.json')" *> fit.log
+python -c "from negpluribus.fast import core; c=core(); print(c.build_exact_features(3, 10, 16, r'$D\exact_features_flop_b10.bin')); print(c.build_exact_features(4, 10, 16, r'$D\exact_features_turn_b10.bin'))" *> features.log
+python scripts/build_bucket_table.py --buckets $D\buckets_pa64.json --features-dir $D --out $D\bucket_tables *> table5.log
+Get-Content fit.log -Tail 3; Get-Content features.log; Get-Content table5.log -Tail 8
+```
+В `table5.log` должно быть `0 mismatches` на каждой улице и `written ...npbt`. Если есть расхождения, запиши и остановись.
+
+### R5-3. Пять обучений по 600 секунд
+```powershell
+$env:NEGPLURIBUS_BUCKET_TABLES = (Resolve-Path $D\bucket_tables).Path
+foreach ($t in "eqcpu","eqgpu4k","eqgpu8k","eqgpu16k","eqgpu32k") { Copy-Item $D\buckets_pa64.json "$D\buckets_$t.json" }
+$G = "--players 2 --stack 100 --street river --preflop-fracs 1.0 --postflop-fracs 0.5,1.0 --max-raises 2 --buckets 64 --buckets-kind potential --exact-features --backend cpp --eval-deals 0 --no-l1 --seed 0 --seconds 600 --data-dir $D".Split(" ")
 python scripts/train_blueprint.py @G --tag eqcpu *> train_eqcpu.log
 python scripts/train_blueprint.py @G --tag eqgpu4k  --gpu 0 --batch 4096  *> train_eqgpu4k.log
 python scripts/train_blueprint.py @G --tag eqgpu8k  --gpu 0 --batch 8192  *> train_eqgpu8k.log
 python scripts/train_blueprint.py @G --tag eqgpu16k --gpu 0 --batch 16384 *> train_eqgpu16k.log
 python scripts/train_blueprint.py @G --tag eqgpu32k --gpu 0 --batch 32768 *> train_eqgpu32k.log
-Select-String -Path train_eq*.log -Pattern "iterations in|done in|saved|Error|error"
+Select-String -Path train_eq*.log -Pattern "buckets:|iterations in|done in|saved|Error|error"
 ```
-В каждом логе должна быть строка вида `CPU: N iterations in 600s = X it/s` или `GPU: ...`, а в конце `saved ...blueprint_<tag>.bin`.
+В каждом логе должно быть:
+- `buckets: loaded ...buckets_<tag>.json`;
+- строка вида `CPU: N iterations in 600s = X it/s` или `GPU: ...`;
+- в конце `saved ...blueprint_<tag>.bin`.
 
-### R5-3. Четыре дуэли по 200 тыс. раздач, каждый GPU против CPU
-Можно запускать по две одновременно в разных окнах, после того как все обучения закончены:
+### R5-4. Четыре дуэли по 200 тыс. раздач, каждый GPU против CPU
+Можно по две одновременно в разных окнах, после того как все обучения закончены. `NEGPLURIBUS_BUCKET_TABLES` оставь заданной, иначе корзины в дуэли будут считаться очень медленно.
 ```powershell
-$C = "--players 2 --stack 100 --street river --preflop-fracs 1.0 --postflop-fracs 0.5,1.0 --max-raises 2 --buckets $D\buckets_eqcpu.json --deals 200000".Split(" ")
+$C = "--players 2 --stack 100 --street river --preflop-fracs 1.0 --postflop-fracs 0.5,1.0 --max-raises 2 --buckets $D\buckets_pa64.json --deals 200000".Split(" ")
 foreach ($b in "4k","8k","16k","32k") {
   python scripts/compare_checkpoints.py @C --a "$D\blueprint_eqgpu$b.bin" --b "$D\blueprint_eqcpu.bin" --label-a "gpu$b" --label-b cpu *> "duel_gpu$b.log"
 }
@@ -360,16 +373,16 @@ Get-ChildItem duel_gpu*.log | ForEach-Object { "== $_"; Get-Content $_ -Tail 15 
 ```
 Если дуэль идёт дольше часа, запиши, сколько она успела пройти, и не прерывай.
 
-### R5-4. Отчёт
+### R5-5. Отчёт
 `GPU_REPORT5.md`:
-- итерации и it/s каждого из 5 обучений (строки из `train_eq*.log`);
-- итог всех 4 дуэлей дословно (строки с `vs`, bb/100 и доверительный интервал);
-- время каждой дуэли;
+- время подбора корзин, признаков и таблицы, итоги сверки таблицы;
+- итерации и it/s каждого из 5 обучений;
+- итог всех 4 дуэлей дословно (строки с `vs`, bb/100 и доверительный интервал) и время каждой;
 - замечания.
 ```powershell
 git checkout -b opt/gpu-report5
-git add -f GPU_REPORT5.md build5.log tests_gpu5.log train_eq*.log duel_gpu*.log
-git commit -m "GPU run report 5 (equal-time duel)"
+git add -f GPU_REPORT5.md build5.log tests_gpu5.log fit.log features.log table5.log train_eq*.log duel_gpu*.log
+git commit -m "GPU run report 5 (equal-time duel, potential-aware exact 64)"
 git push -u origin opt/gpu-report5
 ```
-Блюпринты и чекпоинты (`data\eq\*.bin`) **не коммить**.
+Большие файлы (`data\eq\*.bin`, `*.npbt`, признаки) **не коммить**.
