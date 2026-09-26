@@ -274,3 +274,38 @@ git add -f GPU_REPORT3.md build3.log tests_gpu3.log bench4.log bench5.log
 git commit -m "GPU run report 3"
 git push -u origin opt/gpu-report3
 ```
+
+
+---
+
+# Раунд 4: стратегии один раз на пачку, 32-битные ключи
+
+По раунду 3: +6–12 %. По разбивке видно, что время съедают прямой и обратный проходы и сортировка.
+
+Что изменилось в коде:
+- стратегия каждой строки таблицы считается один раз в начале пачки: раньше каждый элемент заново делал регрет-матчинг с делениями в double;
+- ключи сортировки теперь 32-битные, около 20 бит вместо 36, сортировка устойчивая: порядок внутри ячейки задаёт сам буфер.
+
+Всё то же, что в раунде 3, только новые имена файлов:
+```powershell
+cd ..\zootop-gpu
+git fetch origin opt/gpu
+git checkout --detach origin/opt/gpu
+git log --oneline -1
+python scripts/build_fast.py --clean *> build4.log
+Select-String -Path build4.log -Pattern "negpluribus:|error|built" | Select-Object -First 20
+python -m pytest -q tests/test_flatcfr.py tests/test_batched.py *> tests_gpu4.log
+Get-Content tests_gpu4.log -Tail 5
+$env:NEGPLURIBUS_BUCKET_TABLES = (Resolve-Path data\bucket_tables).Path
+python scripts/gpu_bench.py --buckets data\buckets_gpubench.json --iters 5000000 *> bench6.log
+Get-Content bench6.log
+python scripts/gpu_bench.py --buckets data\buckets_gpubench.json --iters 5000000 --skip-check --batches 65536,131072 *> bench7.log
+Get-Content bench7.log
+```
+Загрузку во время `GPU batch ...` снимай как раньше. Отчёт — `GPU_REPORT4.md`:
+```powershell
+git checkout -b opt/gpu-report4
+git add -f GPU_REPORT4.md build4.log tests_gpu4.log bench6.log bench7.log
+git commit -m "GPU run report 4"
+git push -u origin opt/gpu-report4
+```

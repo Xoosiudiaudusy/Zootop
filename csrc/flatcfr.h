@@ -252,11 +252,17 @@ private:
     std::vector<Iter> gpu_iters_;
 
     std::vector<uint8_t> emu_touched_;  // emulation: touched per cell (the device's layout)
+    std::vector<int32_t> emu_info_dec_;  // emulation: infoset -> decision
 
     void emu_run_batch(const Iter* its, int k, int pass) {
         const int n = spec.n_players;
-        const KeyLayout kl = key_layout((uint64_t)k * (uint64_t)n, std::max(game.n_cells, game.n_infosets));
-        if (kl.jb == 0) throw std::invalid_argument("batch x table too large for 64-bit update keys");
+        const KeyLayout kl = key_layout(std::max(game.n_cells, game.n_infosets));
+        if (kl.cb == 0) throw std::invalid_argument("table too large for 32-bit update keys");
+        if (emu_info_dec_.size() != game.n_infosets) {
+            emu_info_dec_.resize(game.n_infosets);
+            for (size_t d = 0; d < game.n_decisions(); d++)
+                for (int b = 0; b < game.n_cache[d]; b++) emu_info_dec_[game.info_base[d] + (uint64_t)b] = (int32_t)d;
+        }
         if (emu_touched_.size() != game.n_cells) {  // first batch: every cell of a touched infoset
             emu_touched_.assign(game.n_cells, 0);
             for (size_t d = 0; d < game.n_decisions(); d++)
@@ -267,15 +273,18 @@ private:
         if (pass < 1) pass = k;
         DevGame g{game.rel.data(), game.n_board.data(), game.na.data(), game.child_base.data(), game.child.data(), game.hh_a.data(),
                   game.hh_b.data(), game.info_base.data(), game.cell_base.data(), game.n_cache.data(), game.invested.data(),
-                  game.folded.data(), n};
+                  game.folded.data(), emu_info_dec_.data(), n};
+        std::vector<double> sigma_tab(game.n_cells);  // the strategies of the batch
+        for (size_t i = 0; i < game.n_infosets; i++) row_sigma(g, regret.data(), sigma_tab.data(), i);
         std::vector<int32_t> node;
         std::vector<uint32_t> job, first, cnt;
         std::vector<uint8_t> choice;
         std::vector<double> value;
         std::vector<uint32_t> rcnt;
         std::vector<uint64_t> roff;
-        std::vector<uint64_t> keys;
+        std::vector<uint32_t> keys;
         std::vector<double> vals;
+        std::vector<uint32_t> rec_job;  // emulation only: the job of every record, to check the order claim
         int err = 0;
         auto grow = [&](size_t m) {
             if (node.size() >= m) return;
@@ -290,7 +299,7 @@ private:
             uint64_t n_rec = 0;
             for (size_t L = 0; size[L] > 0; L++) {
                 const size_t o = off[L], m = size[L];
-                for (size_t i = 0; i < m; i++) n_rec += item_count(g, lv(), o + i, its, regret.data(), seed, spec.bb, &err);
+                for (size_t i = 0; i < m; i++) n_rec += item_count(g, lv(), o + i, its, sigma_tab.data(), seed, spec.bb, &err);
                 uint32_t acc = 0;  // exclusive scan
                 for (size_t i = 0; i < m; i++) { first[o + i] = acc; acc += cnt[o + i]; }
                 const size_t next_off = o + m;
@@ -308,29 +317,31 @@ private:
             const uint64_t base = keys.size();
             keys.resize(base + n_rec);
             vals.resize(base + n_rec);
+            rec_job.resize(base + n_rec);
             uint64_t at = base;
             for (size_t L = size.size() - 1; L-- > 0;)
                 for (size_t i = size[L]; i-- > 0;) {
                     const size_t x = off[L] + i;
                     if (!rcnt[x]) continue;
-                    item_back(g, lv(), x, off[L + 1], its, regret.data(), kl, keys.data(), vals.data(), base + roff[x], &err);
+                    item_back(g, lv(), x, off[L + 1], its, sigma_tab.data(), kl, keys.data(), vals.data(), base + roff[x], &err);
+                    for (uint32_t r = 0; r < rcnt[x]; r++) rec_job[base + roff[x] + r] = job[x];
                     at += rcnt[x];
                 }
             if (at != base + n_rec) throw std::logic_error("emulation: record count mismatch");
         }
         if (err) throw std::runtime_error("GPU emulation: a bucket outside its node's rows");
-        // the radix sort (keys unique: any sort gives this order), then the runs
+        // the stable radix sort by key, then the runs; checked here: within a key, the jobs increase
         std::vector<size_t> perm(keys.size());
         for (size_t i = 0; i < perm.size(); i++) perm[i] = i;
-        const uint64_t used = kl.bits() >= 64 ? ~0ULL : (1ULL << kl.bits()) - 1;
-        for (uint64_t kk : keys)
+        const uint32_t used = kl.bits() >= 32 ? ~0u : (1u << kl.bits()) - 1u;
+        for (uint32_t kk : keys)
             if (kk & ~used) throw std::logic_error("emulation: a key outside its layout");
-        std::sort(perm.begin(), perm.end(), [&](size_t a, size_t b) { return keys[a] < keys[b]; });
-        std::vector<uint64_t> sk(keys.size());
+        std::stable_sort(perm.begin(), perm.end(), [&](size_t a, size_t b) { return keys[a] < keys[b]; });
+        std::vector<uint32_t> sk(keys.size());
         std::vector<double> sv(keys.size());
         for (size_t i = 0; i < perm.size(); i++) { sk[i] = keys[perm[i]]; sv[i] = vals[perm[i]]; }
         for (size_t i = 1; i < sk.size(); i++)
-            if (sk[i] == sk[i - 1]) throw std::logic_error("emulation: duplicate update key");
+            if (sk[i] == sk[i - 1] && rec_job[perm[i]] <= rec_job[perm[i - 1]]) throw std::logic_error("emulation: records of a cell out of job order");
         for (size_t i = 0; i < sk.size(); i++) apply_run(sk.data(), sv.data(), sk.size(), i, kl, regret.data(), strategy_sum.data(), visits.data(), emu_touched_.data());
     }
 
