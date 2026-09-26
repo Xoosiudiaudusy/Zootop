@@ -25,7 +25,9 @@ from negpluribus.agents.blueprint import BlueprintAgent  # noqa: E402
 from negpluribus.cfr import GameSpec  # noqa: E402
 from negpluribus.engine import Street  # noqa: E402
 from negpluribus.eval import duplicate_match  # noqa: E402
+from negpluribus.fast import core  # noqa: E402
 from negpluribus.fast.blueprint import load_blueprint  # noqa: E402
+from negpluribus.fast.tables import CoreBuckets  # noqa: E402
 from negpluribus.fast.power import disable_power_throttling  # noqa: E402
 
 DATA = os.path.join(os.path.dirname(__file__), "..", "data")
@@ -56,6 +58,7 @@ def main() -> None:
     ap.add_argument("--label-b", default="B")
     ap.add_argument("--deals", type=int, default=3000)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--python-buckets", action="store_true", help="bucket with the Python bucketer (slow; the C++ one gives the same buckets)")
     args = ap.parse_args()
     disable_power_throttling()  # scheduling only, results unchanged
 
@@ -66,6 +69,11 @@ def main() -> None:
     bk_path = args.buckets or os.path.join(DATA, f"buckets_{args.spec}.json")
     bk_a = load_bucketer(args.buckets_a or bk_path)
     bk_b = load_bucketer(args.buckets_b or bk_path)
+    if not args.python_buckets and core() is not None:
+        # buckets from the C++ bucketer (and the table under NEGPLURIBUS_BUCKET_TABLES): the same numbers,
+        # checked on random hands; the Python bucketer computes every new hand (exact features: ~40 ms each)
+        bk_a, bk_b = CoreBuckets(bk_a), CoreBuckets(bk_b)
+        print(f"buckets: C++{' + table ' + os.environ['NEGPLURIBUS_BUCKET_TABLES'] if os.environ.get('NEGPLURIBUS_BUCKET_TABLES') else ''}")
     spec = GameSpec(
         n_players=n, stack_bb=stack, max_street=STREETS[street],
         preflop_fracs=tuple(float(x) for x in args.preflop_fracs.split(",") if x.strip()),

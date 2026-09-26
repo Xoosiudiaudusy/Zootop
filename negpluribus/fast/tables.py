@@ -73,3 +73,33 @@ def tabulated(core_bucketer, directory: Optional[str] = None):
     if not os.path.exists(path):
         return core_bucketer
     return core().TabulatedBucketer(core_bucketer, load_tables(path, core_bucketer))
+
+
+class CoreBuckets:
+    """A fitted Python bucketer whose ``bucket()`` answers from its C++ twin (``core_bucketer``), and so
+    from the bucket table when ``NEGPLURIBUS_BUCKET_TABLES`` holds one: the same buckets, checked on
+    construction on ``check`` random hands per street against the Python bucketer itself.  Everything
+    else (``n_buckets``, ``kind``, ...) is the Python bucketer's.  For play and evaluation, where the
+    Python bucketer would compute every new hand's features (exact potential-aware: ~40 ms each)."""
+
+    def __init__(self, bucketer, check: int = 20, seed: int = 12345):
+        import random
+
+        from .trainer import core_bucketer
+
+        self._py = bucketer
+        self._core = core_bucketer(bucketer)
+        rng = random.Random(seed)
+        for n_board in (0, 3, 4, 5):
+            for _ in range(check):
+                cards = rng.sample(range(52), 2 + n_board)
+                hole, board = cards[:2], cards[2:]
+                a, b = bucketer.bucket(hole, board), self._core.bucket(hole, board)
+                if a != b:
+                    raise RuntimeError(f"C++ bucket {b} != Python bucket {a} for hole {hole} board {board}")
+
+    def bucket(self, hole, board) -> int:
+        return self._core.bucket(hole, board)
+
+    def __getattr__(self, name):
+        return getattr(self._py, name)
