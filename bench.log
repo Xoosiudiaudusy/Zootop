@@ -1,0 +1,10 @@
+cuda_available: True 
+device: NVIDIA GeForce RTX 5070 (sm_120); HU100 flat game {'decisions': 7712, 'terminals': 13074, 'infosets': 63628, 'cells': 171593, 'depth': 15}
+identity (GPU vs the batched CPU reference):
+  push/fold 10bb: 3000 it, batch 256: infosets 1987, differing 0, extra 0 -> IDENTICAL  [0.1s]
+  HU 100bb: 100000 it, batch 4096: infosets 63455, differing 0, extra 0 -> IDENTICAL  [7.8s]
+speed on HU 100bb, 1000000 iterations:
+  CPU trainer, 16 threads: 13.0s = 76,667 it/s
+  GPU batch 4096: 14.2s = 70,581 it/s (x0.92 vs CPU); last batch: 153,603 items, 370,036 records, device 2.1 ms traverse + 0.2 ms apply = 1,817,485 it/s device-only
+  GPU batch 16384: 13.1s = 76,110 it/s (x0.99 vs CPU); last batch: 148,286 items, 350,221 records, device 2.2 ms traverse + 0.2 ms apply = 6,979,185 it/s device-only
+  GPU batch 32768: 12.7s = 78,691 it/s (x1.03 vs CPU); last batch: 4,261,170 items, 9,961,393 records, device 10.0 ms traverse + 6.5 ms apply = 1,989,632 it/s device-only
