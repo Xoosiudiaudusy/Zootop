@@ -1,0 +1,7 @@
+bucket tables: C:\Project Manchatten\zootop-gpu\data\bucket_tables
+cuda_available: True 
+device: NVIDIA GeForce RTX 5070 (sm_120); HU100 flat game {'decisions': 7712, 'terminals': 13074, 'infosets': 63628, 'cells': 171593, 'depth': 15}
+speed on HU 100bb, 5000000 iterations:
+  CPU trainer, 16 threads: 9.2s = 543,626 it/s
+  GPU batch 65536: 5046272 it in 4.3s = 1,184,533 it/s (x2.18 vs CPU); host deals+buckets 1.3s (overlapped; waited for it 0.0s), run_batch 4.2s; last batch: 17,774,367 items, 42,075,653 records, device 18.0 fwd + 18.9 back + 13.6 sort + 7.3 add ms = 1,134,145 it/s device-only
+  GPU batch 131072: 5111808 it in 3.9s = 1,303,451 it/s (x2.40 vs CPU); host deals+buckets 1.2s (overlapped; waited for it 0.0s), run_batch 3.9s; last batch: 31,436,586 items, 72,734,251 records, device 30.6 fwd + 33.1 back + 23.5 sort + 14.1 add ms = 1,294,533 it/s device-only
