@@ -253,6 +253,8 @@ private:
 
     std::vector<uint8_t> emu_touched_;  // emulation: touched per cell (the device's layout)
     std::vector<int32_t> emu_info_dec_;  // emulation: infoset -> decision
+    std::vector<double> emu_sigma_;      // emulation: the strategy table, kept between batches
+    std::vector<uint8_t> emu_dirty_;     // emulation: per cell, its row's strategy must be recomputed
 
     void emu_run_batch(const Iter* its, int k, int pass) {
         const int n = spec.n_players;
@@ -274,8 +276,12 @@ private:
         DevGame g{game.rel.data(), game.n_board.data(), game.na.data(), game.child_base.data(), game.child.data(), game.hh_a.data(),
                   game.hh_b.data(), game.info_base.data(), game.cell_base.data(), game.n_cache.data(), game.invested.data(),
                   game.folded.data(), emu_info_dec_.data(), n};
-        std::vector<double> sigma_tab(game.n_cells);  // the strategies of the batch
-        for (size_t i = 0; i < game.n_infosets; i++) row_sigma(g, regret.data(), sigma_tab.data(), i);
+        if (emu_sigma_.size() != game.n_cells) {  // first batch: every row computed
+            emu_sigma_.assign(game.n_cells, 0.0);
+            emu_dirty_.assign(game.n_cells, 1);
+        }
+        std::vector<double>& sigma_tab = emu_sigma_;  // the strategies of the batch (rows changed since: recomputed)
+        for (size_t i = 0; i < game.n_infosets; i++) row_sigma(g, regret.data(), sigma_tab.data(), emu_dirty_.data(), i);
         std::vector<int32_t> node;
         std::vector<uint32_t> job, first, cnt;
         std::vector<uint8_t> choice;
@@ -342,7 +348,7 @@ private:
         for (size_t i = 0; i < perm.size(); i++) { sk[i] = keys[perm[i]]; sv[i] = vals[perm[i]]; }
         for (size_t i = 1; i < sk.size(); i++)
             if (sk[i] == sk[i - 1] && rec_job[perm[i]] <= rec_job[perm[i - 1]]) throw std::logic_error("emulation: records of a cell out of job order");
-        for (size_t i = 0; i < sk.size(); i++) apply_run(sk.data(), sv.data(), sk.size(), i, kl, regret.data(), strategy_sum.data(), visits.data(), emu_touched_.data());
+        for (size_t i = 0; i < sk.size(); i++) apply_run(sk.data(), sv.data(), sk.size(), i, kl, regret.data(), strategy_sum.data(), visits.data(), emu_touched_.data(), emu_dirty_.data());
     }
 
     // the FlatIter of iterations lo .. lo + k - 1, on `threads` threads

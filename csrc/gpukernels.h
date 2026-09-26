@@ -55,12 +55,17 @@ struct DevGame {
     int n;
 };
 
-// the current strategy of infoset row i (regret matching of the batch-start regrets) into sigma[its cells]
-NEGP_HD inline void row_sigma(const DevGame& g, const double* regret, double* sigma, size_t i) {
+// the current strategy of infoset row i (regret matching of the batch-start regrets) into sigma[its cells],
+// only when the row's regrets changed since it was last computed (dirty[its first cell], set by apply_run):
+// a row whose regrets did not change keeps the same strategy, so only the rows the last batch updated are
+// recomputed (3-max wide 64: 150M cells, a batch changes a small share of them)
+NEGP_HD inline void row_sigma(const DevGame& g, const double* regret, double* sigma, uint8_t* dirty, size_t i) {
     const int d = g.info_dec[i];
     const int na = g.na[d];
     const uint64_t c = g.cell_base[d] + (uint64_t)(i - g.info_base[d]) * (uint64_t)na;
+    if (!dirty[c]) return;
     regret_matching(&regret[c], na, &sigma[c]);
+    dirty[c] = 0;
 }
 
 struct DevLevel {  // the item arrays of all levels of a pass; level L is [off_L, off_L + m_L)
@@ -196,7 +201,7 @@ NEGP_HD inline void item_back(const DevGame& g, DevLevel L, size_t x, size_t nex
 // after the stable sort (keys[0 .. m) non-decreasing, each key's records in job order): the record i that
 // starts a run of equal keys adds the run's values to its cell in order; every other record does nothing
 NEGP_HD inline void apply_run(const uint32_t* keys, const double* vals, size_t m, size_t i, const KeyLayout& kl, double* regret, double* ssum,
-                              int64_t* visits, uint8_t* touched) {
+                              int64_t* visits, uint8_t* touched, uint8_t* dirty) {
     const uint32_t key = keys[i];
     if (i > 0 && keys[i - 1] == key) return;
     const int kind = (int)(key >> kl.cb);
@@ -212,6 +217,7 @@ NEGP_HD inline void apply_run(const uint32_t* keys, const double* vals, size_t m
     for (; j < m && keys[j] == key; j++) v += vals[j];
     t[cell] = v;
     touched[cell] = 1;
+    if (kind == 0) dirty[cell] = 1;  // its row's strategy is recomputed before the next batch
 }
 
 }  // namespace negp

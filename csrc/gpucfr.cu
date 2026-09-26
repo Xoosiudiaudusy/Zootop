@@ -47,9 +47,9 @@ __global__ void k_init(DevLevel L, uint32_t m, uint32_t job0) {
     if (i < m) item_init(L, i, job0);
 }
 
-__global__ void k_sigma(DevGame g, const double* regret, double* sigma, size_t m) {
+__global__ void k_sigma(DevGame g, const double* regret, double* sigma, uint8_t* dirty, size_t m) {
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < m) row_sigma(g, regret, sigma, i);
+    if (i < m) row_sigma(g, regret, sigma, dirty, i);
 }
 
 __global__ void k_count(DevGame g, DevLevel L, size_t off, uint32_t m, const FlatIter* iters, const double* sigma, uint64_t seed, int bb,
@@ -74,9 +74,9 @@ __global__ void k_back(DevGame g, DevLevel L, size_t off, uint32_t m, size_t nex
 }
 
 __global__ void k_apply(const uint32_t* keys, const double* vals, size_t m, KeyLayout kl, double* regret, double* ssum, int64_t* visits,
-                        uint8_t* touched) {
+                        uint8_t* touched, uint8_t* dirty) {
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < m) apply_run(keys, vals, m, i, kl, regret, ssum, visits, touched);
+    if (i < m) apply_run(keys, vals, m, i, kl, regret, ssum, visits, touched, dirty);
 }
 
 inline unsigned blocks(size_t m) { return (unsigned)((m + THREADS - 1) / THREADS); }
@@ -101,6 +101,7 @@ struct GpuFlatTrainer::Impl {
     double *regret = nullptr, *ssum = nullptr, *sigma = nullptr;  // sigma: the strategies of the batch
     int64_t* visits = nullptr;
     uint8_t* touched = nullptr;
+    uint8_t* dirty = nullptr;  // per cell: its row's strategy must be recomputed (gpukernels.h, row_sigma)
     // per batch
     Buf<FlatIter> iters;
     Buf<int32_t> node;
@@ -137,6 +138,7 @@ struct GpuFlatTrainer::Impl {
         if (sigma) cudaFree(sigma);
         if (visits) cudaFree(visits);
         if (touched) cudaFree(touched);
+        if (dirty) cudaFree(dirty);
         if (err) cudaFree(err);
         for (auto& e : ev) if (e) cudaEventDestroy(e);
     }
@@ -187,6 +189,8 @@ GpuFlatTrainer::GpuFlatTrainer(const FlatGameView& v, int bb, uint64_t seed, int
     CK(cudaMemset(m.ssum, 0, v.n_cells * sizeof(double)));
     CK(cudaMemset(m.visits, 0, v.n_infosets * sizeof(int64_t)));
     CK(cudaMemset(m.touched, 0, v.n_cells));
+    CK(cudaMalloc(&m.dirty, std::max<uint64_t>(1, v.n_cells)));
+    CK(cudaMemset(m.dirty, 1, v.n_cells));
     CK(cudaMalloc(&m.err, sizeof(int)));
     CK(cudaMemset(m.err, 0, sizeof(int)));
     for (auto& e : m.ev) CK(cudaEventCreate(&e));
@@ -212,7 +216,7 @@ void GpuFlatTrainer::run_batch(const FlatIter* its, int k, int pass) {
     };
     // the strategies of the batch (the tables do not change until its end)
     CK(cudaEventRecord(m.ev[0]));
-    if (m.n_infosets) k_sigma<<<blocks(m.n_infosets), THREADS>>>(m.g, m.regret, m.sigma, m.n_infosets);
+    if (m.n_infosets) k_sigma<<<blocks(m.n_infosets), THREADS>>>(m.g, m.regret, m.sigma, m.dirty, m.n_infosets);
     CK(cudaGetLastError());
     for (int lo = 0; lo < k; lo += pass) {
         if (lo > 0) CK(cudaEventRecord(m.ev[0]));
@@ -283,7 +287,7 @@ void GpuFlatTrainer::run_batch(const FlatIter* its, int k, int pass) {
         m.temp.reserve(tb);
         CK(cub::DeviceRadixSort::SortPairs(m.temp.p, tb, kb, vb, (int64_t)n_rec, 0, kl.bits()));
         CK(cudaEventRecord(m.ev[3]));
-        k_apply<<<blocks(n_rec), THREADS>>>(kb.Current(), vb.Current(), n_rec, kl, m.regret, m.ssum, m.visits, m.touched);
+        k_apply<<<blocks(n_rec), THREADS>>>(kb.Current(), vb.Current(), n_rec, kl, m.regret, m.ssum, m.visits, m.touched, m.dirty);
         CK(cudaGetLastError());
     }
     CK(cudaEventRecord(m.ev[4]));
@@ -305,6 +309,7 @@ void GpuFlatTrainer::upload(const double* regret, const double* ssum, const int6
     CK(cudaMemcpy(m.ssum, ssum, m.n_cells * sizeof(double), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(m.visits, visits, m.n_infosets * sizeof(int64_t), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(m.touched, touched, m.n_cells, cudaMemcpyHostToDevice));
+    CK(cudaMemset(m.dirty, 1, m.n_cells));  // new regrets: every strategy is recomputed
 }
 
 void GpuFlatTrainer::download(double* regret, double* ssum, int64_t* visits, uint8_t* touched) const {
