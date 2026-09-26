@@ -3,6 +3,7 @@
     python scripts/build_fast.py --clean          # with the CUDA Toolkit 12.8+ installed (sm_120 = RTX 50xx)
     python scripts/gpu_bench.py                   # checks + speed on HU 100bb (narrow grid, E[HS]-8)
     python scripts/gpu_bench.py --iters 2000000 --batches 4096,16384,32768 --cpu-threads 16
+    python scripts/gpu_bench.py --emulate          # the same checks with the kernels emulated on the CPU
 
 1. cuda_available(), device name.
 2. Identity: push/fold 10bb (3000 iterations, batch 256) and HU 100bb (--check-iters, batch 4096): the GPU
@@ -30,10 +31,15 @@ from negpluribus.engine import Street  # noqa: E402
 from negpluribus.fast.trainer import core_bucketer, spec_to_dict  # noqa: E402
 
 
+EMULATE = False  # --emulate: the GPU kernels' code on the host instead of the device
+
+
 def flat(core, spec, bk, seed, batch, threads, gpu):
     ft = core.FlatTrainer(spec_to_dict(spec), core_bucketer(bk), seed, True, threads)
     ft.batch_size = batch
-    if gpu:
+    if gpu and EMULATE:
+        ft.emulate_gpu = True
+    elif gpu:
         ft.use_gpu(0)
     return ft
 
@@ -72,29 +78,35 @@ def main() -> int:
     ap.add_argument("--batches", default="4096,16384,32768")
     ap.add_argument("--cpu-threads", type=int, default=os.cpu_count() or 4)
     ap.add_argument("--skip-check", action="store_true")
+    ap.add_argument("--emulate", action="store_true",
+                    help="run the identity checks with the GPU kernels emulated on the CPU (no device needed), then stop")
     args = ap.parse_args()
+    global EMULATE
+    EMULATE = args.emulate
     core = fast.core()
     if core is None or not hasattr(core, "cuda_available"):
         print("C++ core missing or too old: python scripts/build_fast.py --clean")
         return 2
     ok, why = core.cuda_available()
     print(f"cuda_available: {ok} {why}")
-    if not ok:
+    if not ok and not EMULATE:
         return 2
     T = args.cpu_threads
     bk100 = EquityBucketer(n_buckets=8, samples=150).fit(n_situations=300, seed=0)
     hu100 = GameSpec(n_players=2, stack_bb=100, max_street=Street.RIVER, preflop_fracs=(1.0,), postflop_fracs=(0.5, 1.0),
                      max_raises_per_street=2, n_buckets=8)
     ft = flat(core, hu100, bk100, 0, 4096, T, True)
-    print(f"device: {ft.gpu_device}; HU100 flat game {ft.game_stats()}", flush=True)
+    print(f"device: {'EMULATION on the CPU' if EMULATE else ft.gpu_device}; HU100 flat game {ft.game_stats()}", flush=True)
     if not args.skip_check:
-        print("identity (GPU vs the batched CPU reference):")
+        print(f"identity ({'emulated kernels' if EMULATE else 'GPU'} vs the batched CPU reference):")
         pf = GameSpec(n_players=2, stack_bb=10, max_street=Street.PREFLOP, preflop_fracs=(1.0,))
         good = check(core, "push/fold 10bb", pf, EquityBucketer(n_buckets=8), 4, 256, 3000, T)
         good &= check(core, "HU 100bb", hu100, bk100, 0, 4096, args.check_iters, T)
         if not good:
             print("GPU != CPU: stop here and send this output")
             return 1
+    if EMULATE:
+        return 0
     print(f"speed on HU 100bb, {args.iters} iterations:")
     t0 = time.time()
     MCCFRTrainer(hu100, bucketer=bk100, seed=0, backend="cpp", threads=T).train(args.iters)

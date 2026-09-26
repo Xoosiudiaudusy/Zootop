@@ -1,0 +1,162 @@
+# Задание: собрать и проверить GPU-тренер на ПК (для помощника-нейросети)
+
+Тебя попросили собрать проект, запустить проверки GPU-тренера, **зафиксировать результат в отчёте** и отдать его.
+Разрабатывать, чинить алгоритм или «улучшать» код не нужно. Твоя задача — точно выполнить шаги и честно записать, что получилось.
+
+## Контекст в двух словах
+- Проект: покерный бот NegativePluribus (6-max NLHE, как Pluribus). Ядро на C++17 (pybind11-модуль `negpluribus/_fastcore*.pyd`) плюс Python.
+- Обучение идёт через MCCFR (Linear CFR). Сделан тренер на GPU (CUDA). Его написали в облаке **без видеокарты**: код собирается, но на настоящем GPU ещё ни разу не запускался.
+- Главный критерий: GPU обязан давать **ровно те же числа, бит в бит**, что CPU-эталон (пакетный режим `Trainer` и `FlatTrainer`). Любое расхождение — это баг, его нужно зафиксировать, а не обходить.
+- Код GPU-тренера (ветка `opt/gpu`):
+  - `csrc/gpucfr.cu` — CUDA;
+  - `csrc/gpukernels.h` — работа ядер;
+  - `csrc/cfrmath.h` — общая арифметика;
+  - `csrc/flatcfr.h`, `csrc/flatgame.h` — плоский формат и CPU-версия;
+  - `scripts/gpu_bench.py` — проверка и замер;
+  - `tests/test_flatcfr.py` — тесты.
+- Железо пользователя: i5-14400F (16 потоков), 32 ГБ, **RTX 5070** (sm_120), Windows + MSVC. CUDA Toolkit, CMake и Visual Studio установлены, проект на этом ПК уже собирали.
+
+## Правила
+1. **Не меняй код** в `csrc/`, `negpluribus/`, `scripts/`, `tests/`. Если сборка падает, запиши ошибку в отчёт. Допустимы только настройки окружения: переменные среды, другой генератор CMake, флаги в командной строке. Каждое такое действие опиши в отчёте.
+2. Не трогай основную рабочую копию пользователя: работай в **отдельной папке** (git worktree, шаг 1). Не делай commit или push в `main`, `master`, `core`, `opt/gpu` и другие существующие ветки.
+3. Отчёт положи в файл, а push делай **только** в новую ветку `opt/gpu-report` (шаг 9). Если push не получается, просто оставь файл: пользователь перешлёт его сам.
+4. Выполняй шаги по порядку. Если шаг упал, запиши вывод и переходи к следующему, если он от упавшего не зависит.
+5. В отчёт вставляй **дословный вывод** команд (ошибки целиком, длинные логи — последние 60 строк и все строки с `error`). Ничего не пересказывай своими словами вместо вывода.
+
+## Шаги (PowerShell, из папки `zootop` пользователя)
+
+### 0. Окружение
+```powershell
+nvidia-smi
+nvcc --version
+cmake --version
+python --version
+python -c "import pybind11, sys; print(pybind11.__version__, sys.executable)"
+git status --short | Select-Object -First 5
+```
+Все выводы идут в отчёт. Если `nvcc` не найден в PATH, найди его (обычно `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.x\bin\nvcc.exe`) и запиши путь.
+CUDA должна быть **12.8 или новее**: более ранние версии не умеют sm_120 (RTX 50xx).
+
+### 1. Отдельная копия ветки `opt/gpu`
+```powershell
+git fetch origin opt/gpu
+git worktree add ..\zootop-gpu origin/opt/gpu
+cd ..\zootop-gpu
+git log --oneline -3
+```
+Если папка `..\zootop-gpu` уже есть, выполни `cd ..\zootop-gpu; git fetch origin opt/gpu; git checkout --detach origin/opt/gpu`.
+В `git log` первой строкой должен идти коммит с `GPU run instructions` или новее. Хеш верхнего коммита запиши в отчёт.
+
+### 2. Сборка
+```powershell
+python scripts/build_fast.py --clean *> build.log
+Select-String -Path build.log -Pattern "negpluribus:|error|built" | Select-Object -First 40
+```
+Нужны две строки: `negpluribus: GPU trainer ON (...)` и `built ...`.
+- Если видно `GPU trainer OFF`, CMake не нашёл CUDA. Попробуй по очереди, фиксируя, что помогло:
+  1. `$env:CUDACXX = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.X\bin\nvcc.exe"` (подставь свою версию), затем снова `python scripts/build_fast.py --clean`.
+  2. Из «x64 Native Tools Command Prompt for VS 2022»: `python scripts/build_fast.py --clean --generator Ninja` (если Ninja нет: `pip install ninja`).
+- Если ошибка компиляции `gpucfr.cu`, в отчёт идут все строки `error` из `build.log` и 30 строк вокруг первой ошибки. Дальше GPU-шаги не выполнить, но шаг 3 всё равно сделай: он покажет, работает ли CPU-часть.
+
+### 3. Видит ли модуль GPU
+```powershell
+python -c "import negpluribus._fastcore as f; print(f.__file__); print(f.cuda_available())"
+```
+Ожидается `(True, '')`. Если `False`, запиши причину, она напечатана вторым элементом.
+
+### 4. Тесты flat/GPU (основная проверка бит в бит)
+```powershell
+python -m pytest -v tests/test_flatcfr.py tests/test_batched.py *> tests_gpu.log
+Get-Content tests_gpu.log -Tail 40
+```
+Когда GPU доступен, у каждого теста есть три варианта: `[cpu]`, `[emu]`, `[gpu]`. `[gpu]` сравнивает GPU с CPU-эталоном бит в бит.
+Отдельно перечисли в отчёте, какие варианты прошли и какие упали. Если упал `[gpu]`, приложи полный текст ошибки или assert.
+
+### 5. Проверка и замер скорости
+Таблицы корзин сильно ускоряют CPU-часть. Они не в git, поэтому ищи их в **исходной** папке пользователя (`..\zootop`), а не в worktree: переменная `NEGPLURIBUS_BUCKET_TABLES`, папки вроде `..\zootop\data\bucket_tables`, файлы таблиц корзин. Если нашёл, задай переменную, иначе пропусти (запиши, что таблиц не было):
+```powershell
+echo $env:NEGPLURIBUS_BUCKET_TABLES
+# если пусто и таблицы есть:  $env:NEGPLURIBUS_BUCKET_TABLES = "<путь к папке с таблицами>"
+```
+Запуск (занимает несколько минут):
+```powershell
+python scripts/gpu_bench.py *> bench.log
+Get-Content bench.log
+```
+Скрипт печатает:
+- устройство;
+- проверку `IDENTICAL` / `MISMATCH` для push/fold и HU 100bb;
+- скорость обычного CPU-тренера на всех потоках;
+- скорость GPU при пачках 4096 / 16384 / 32768.
+
+Весь вывод идёт в отчёт.
+- Если напечатано `MISMATCH`, скрипт остановится. Тогда запусти эмуляцию: те же ядра на CPU. Она показывает, в чём баг: в коде ядер или в вызовах CUDA.
+  ```powershell
+  python scripts/gpu_bench.py --emulate --check-iters 20000 *> bench_emu.log
+  Get-Content bench_emu.log
+  ```
+- Если скрипт упал с ошибкой CUDA, повтори с `$env:CUDA_LAUNCH_BLOCKING = "1"`: ошибка укажет точное ядро. Приложи оба вывода.
+- Если всё `IDENTICAL`, но замер идёт очень долго (больше 20 минут), останови его (Ctrl+C) и запусти меньший: `python scripts/gpu_bench.py --iters 200000 --skip-check`.
+
+### 6. Загрузка во время замера (по желанию, если легко)
+Пока идёт замер GPU (строки `GPU batch ...`), в другом окне выполни `nvidia-smi --query-gpu=utilization.gpu,memory.used,power.draw --format=csv -l 1`. Запиши в отчёт несколько типичных строк, а также загрузку CPU из диспетчера задач. Это покажет, во что упирается скорость: в видеокарту или в процессор.
+
+### 7. Весь набор тестов (контроль, что ничего не сломано)
+```powershell
+python -m pytest -q *> tests_all.log
+Get-Content tests_all.log -Tail 15
+```
+Занимает около 5 минут. Известное исключение: `tests/test_search_core.py::test_our_average_is_accumulated_every_iteration` иногда падает под нагрузкой (гонка потоков в поиске), к GPU он отношения не имеет. Остальные падения перечисли в отчёте.
+
+### 8. Отчёт
+Создай файл `GPU_REPORT.md` в папке `..\zootop-gpu` по шаблону:
+
+```markdown
+# Отчёт о прогоне GPU-тренера на ПК (дата, время)
+Исполнитель: <какая нейросеть>. Коммит opt/gpu: <хеш из шага 1>.
+
+## Окружение (шаг 0)
+<дословные выводы: nvidia-smi (шапка с драйвером и GPU), nvcc --version, cmake, python, pybind11>
+
+## Сборка (шаг 2)
+Итог: GPU trainer ON / OFF / ошибка. Что пришлось сделать для сборки: <ничего / переменные / генератор>.
+<строки из build.log>
+
+## cuda_available (шаг 3)
+<вывод>
+
+## Тесты flat/GPU (шаг 4)
+| тест | cpu | emu | gpu |
+|---|---|---|---|
+| push_fold | ✅/❌ | … | … |
+| three_player_flop | … | … | … |
+| river_potential | … | … | … |
+test_batched.py: <итог>. Ошибки: <дословно>
+
+## Проверка и скорость (шаг 5)
+Таблицы корзин: использовались / нет (путь).
+<полный bench.log>
+
+## Загрузка (шаг 6)
+<строки nvidia-smi, загрузка CPU> или «не делалось»
+
+## Весь набор тестов (шаг 7)
+<итоговая строка pytest и список упавших>
+
+## Замечания исполнителя
+<всё необычное: предупреждения, долгие шаги, что пробовал; без догадок о причинах, если не проверено>
+```
+
+### 9. Отдать отчёт
+```powershell
+git checkout -b opt/gpu-report
+git add -f GPU_REPORT.md build.log tests_gpu.log bench.log tests_all.log bench_emu.log
+git commit -m "GPU run report from the user's PC"
+git push -u origin opt/gpu-report
+```
+Если push не прошёл (нет прав или сети), ничего не форси. Скажи пользователю, где лежит `GPU_REPORT.md`, чтобы он переслал файл.
+В конце покажи пользователю краткий итог в 3–5 строк:
+- собралось ли;
+- `IDENTICAL` или нет;
+- скорость GPU против CPU;
+- где отчёт.
