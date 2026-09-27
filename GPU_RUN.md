@@ -522,3 +522,36 @@ git commit -m "GPU run report 7 (equal iterations)"
 git push -u origin opt/gpu-report7
 ```
 Большие файлы (`data\eq3\*.bin`) **не коммить**.
+
+
+---
+
+# Раунд 8 (~1 час): проверка дуэльного стенда 3-max (просьба сенсея)
+
+Вопросы:
+1. Даёт ли стенд ноль, когда блюпринт играет против двух **своих же** копий? Если нет, ошибка в стенде или в свёртке «(A против двух B − B против двух A)/2».
+2. Откуда в раунде 7 взялись положительные числа в **обоих** направлениях (+0,4…+1,1) у пар «GPU против CPU» равной силы? В раунде 6 пара «CPU сид 1 против CPU сид 0» дала +0,08 / −0,00.
+
+Нужны блюпринты раундов 6–7 в `data\eq3`; ничего не обучаем, только три дуэли по 1 млн раздач.
+
+```powershell
+cd ..\zootop-gpu
+git fetch origin opt/gpu
+git checkout --detach origin/opt/gpu
+python scripts/build_fast.py *> build8.log
+$env:NEGPLURIBUS_BUCKET_TABLES = (Resolve-Path data\eq\bucket_tables).Path
+$D = "data\eq3"
+$C = "--players 3 --stack 100 --street river --preflop-fracs 0.5,1.0,3.0 --postflop-fracs 0.5,1.0,2.0,4.0 --max-raises 3 --buckets $D\buckets_cpu0.json --deals 1000000".Split(" ")
+# две дуэли одновременно (в разных окнах или через Start-Process), затем третья:
+python scripts/compare_checkpoints.py @C --a "$D\blueprint_cpu0.bin" --b "$D\blueprint_cpu0.bin" --label-a cpu0 --label-b cpu0copy *> r8_duel_self.log
+python scripts/compare_checkpoints.py @C --a "$D\blueprint_gpu16k_79M.bin" --b "$D\blueprint_gpu16k_79M_s1.bin" --label-a gpu16k_s0 --label-b gpu16k_s1 *> r8_duel_gpu_gpu.log
+python scripts/compare_checkpoints.py @C --a "$D\blueprint_gpu16k_79M_s1.bin" --b "$D\blueprint_cpu0.bin" --label-a gpu16k_s1 --label-b cpu0 *> r8_duel_gpus1_cpu0.log
+Get-ChildItem r8_duel_*.log | ForEach-Object { "== $_"; Get-Content $_ -Tail 6 }
+```
+Отчёт `GPU_REPORT8.md`: строки с `vs` всех трёх дуэлей дословно, время каждой.
+```powershell
+git checkout -b opt/gpu-report8
+git add -f GPU_REPORT8.md r8_duel_*.log
+git commit -m "GPU run report 8 (3-max duel stand check)"
+git push -u origin opt/gpu-report8
+```
