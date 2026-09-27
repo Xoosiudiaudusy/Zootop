@@ -1,0 +1,55 @@
+round 7 summary 2026-09-27T18:58:16
+== r7_train_cpu_767M.log
+CPU: 767,295,488 iterations in 11896s = 64,502 it/s
+done in 11896s, 53,807,591 infosets
+saved data\eq3\blueprint_cpu_767M.bin
+== r7_train_gpu16k_79M.log
+GPU: NVIDIA GeForce RTX 5070 (sm_120); flat game {'decisions': 984764, 'terminals': 1340978, 'infosets': 63360686, 'cells': 149690679, 'depth': 24}
+GPU: 79,200,000 iterations in 119s = 663,422 it/s
+done in 136s, 45,034,329 infosets
+saved data\eq3\blueprint_gpu16k_79M.bin
+== r7_train_gpu16k_79M_s1.log
+GPU: NVIDIA GeForce RTX 5070 (sm_120); flat game {'decisions': 984764, 'terminals': 1340978, 'infosets': 63360686, 'cells': 149690679, 'depth': 24}
+GPU: 79,200,000 iterations in 120s = 662,237 it/s
+done in 136s, 45,066,242 infosets
+saved data\eq3\blueprint_gpu16k_79M_s1.bin
+== r7_train_gpu4k_767M.log
+GPU: NVIDIA GeForce RTX 5070 (sm_120); flat game {'decisions': 984764, 'terminals': 1340978, 'infosets': 63360686, 'cells': 149690679, 'depth': 24}
+GPU: 767,295,488 iterations in 1737s = 441,833 it/s
+done in 1757s, 54,207,553 infosets
+saved data\eq3\blueprint_gpu4k_767M.bin
+== r7_train_gpu4k_79M.log
+GPU: NVIDIA GeForce RTX 5070 (sm_120); flat game {'decisions': 984764, 'terminals': 1340978, 'infosets': 63360686, 'cells': 149690679, 'depth': 24}
+GPU: 79,200,000 iterations in 181s = 437,970 it/s
+done in 198s, 45,082,858 infosets
+saved data\eq3\blueprint_gpu4k_79M.bin
+== r7_duel_cpu_767M_vs_cpu0.log
+cpu_767M: 53,807,591 infosets (data\eq3\blueprint_cpu_767M.bin)
+cpu0: 44,443,144 infosets (data\eq3\blueprint_cpu0.bin)
+  cpu_767M vs cpu0:   +4.72 bb/100  (95% CI +/-1.03, 3000000 hands, off-map 0.0%, 827s)
+  cpu0 vs cpu_767M:   -3.90 bb/100  (95% CI +/-1.02, 3000000 hands, off-map 0.0%, 840s)
+== r7_duel_gpu16k_767M_vs_cpu_767M.log
+gpu16k_767M: 54,015,459 infosets (data\eq3\blueprint_gpu16k.bin)
+cpu_767M: 53,807,591 infosets (data\eq3\blueprint_cpu_767M.bin)
+  gpu16k_767M vs cpu_767M:   +0.79 bb/100  (95% CI +/-0.93, 3000000 hands, off-map 0.0%, 860s)
+  cpu_767M vs gpu16k_767M:   +1.09 bb/100  (95% CI +/-0.93, 3000000 hands, off-map 0.0%, 858s)
+== r7_duel_gpu16k_79M_s1_vs_cpu1.log
+gpu16k_79M_s1: 45,066,242 infosets (data\eq3\blueprint_gpu16k_79M_s1.bin)
+cpu1: 44,519,012 infosets (data\eq3\blueprint_cpu1.bin)
+  gpu16k_79M_s1 vs cpu1:   +0.39 bb/100  (95% CI +/-1.09, 3000000 hands, off-map 0.0%, 829s)
+  cpu1 vs gpu16k_79M_s1:   +0.63 bb/100  (95% CI +/-1.10, 3000000 hands, off-map 0.0%, 831s)
+== r7_duel_gpu16k_79M_vs_cpu0.log
+gpu16k_79M: 45,034,329 infosets (data\eq3\blueprint_gpu16k_79M.bin)
+cpu0: 44,443,144 infosets (data\eq3\blueprint_cpu0.bin)
+  gpu16k_79M vs cpu0:   +0.92 bb/100  (95% CI +/-1.09, 3000000 hands, off-map 0.0%, 847s)
+  cpu0 vs gpu16k_79M:   +0.43 bb/100  (95% CI +/-1.09, 3000000 hands, off-map 0.0%, 861s)
+== r7_duel_gpu4k_767M_vs_cpu_767M.log
+gpu4k_767M: 54,207,553 infosets (data\eq3\blueprint_gpu4k_767M.bin)
+cpu_767M: 53,807,591 infosets (data\eq3\blueprint_cpu_767M.bin)
+  gpu4k_767M vs cpu_767M:   +0.93 bb/100  (95% CI +/-0.93, 3000000 hands, off-map 0.0%, 862s)
+  cpu_767M vs gpu4k_767M:   +0.95 bb/100  (95% CI +/-0.93, 3000000 hands, off-map 0.0%, 863s)
+== r7_duel_gpu4k_79M_vs_cpu0.log
+gpu4k_79M: 45,082,858 infosets (data\eq3\blueprint_gpu4k_79M.bin)
+cpu0: 44,443,144 infosets (data\eq3\blueprint_cpu0.bin)
+  gpu4k_79M vs cpu0:   +0.86 bb/100  (95% CI +/-1.09, 3000000 hands, off-map 0.0%, 848s)
+  cpu0 vs gpu4k_79M:   +0.54 bb/100  (95% CI +/-1.09, 3000000 hands, off-map 0.0%, 863s)

@@ -1,0 +1,6 @@
+buckets: C++ + table C:\Project Manchatten\zootop-gpu\data\eq\bucket_tables
+game: 3 players, 100bb stacks, betting through river, grid preflop (0.5, 1.0, 3.0) / postflop (0.5, 1.0, 2.0, 4.0) + all-in, 64 postflop buckets (potential)
+gpu4k_767M: 54,207,553 infosets (data\eq3\blueprint_gpu4k_767M.bin)
+cpu_767M: 53,807,591 infosets (data\eq3\blueprint_cpu_767M.bin)
+  gpu4k_767M vs cpu_767M:   +0.93 bb/100  (95% CI +/-0.93, 3000000 hands, off-map 0.0%, 862s)
+  cpu_767M vs gpu4k_767M:   +0.95 bb/100  (95% CI +/-0.93, 3000000 hands, off-map 0.0%, 863s)
