@@ -555,3 +555,41 @@ git add -f GPU_REPORT8.md r8_duel_*.log
 git commit -m "GPU run report 8 (3-max duel stand check)"
 git push -u origin opt/gpu-report8
 ```
+
+
+---
+
+## Раунд 8 на другой машине: ноутбук с Ubuntu, видеокарта не нужна
+
+Раунд 8 — только дуэли: процессор, Python и C++-ядро. Ни CUDA, ни GPU не нужны. Подойдёт любая машина с 16 ГБ RAM и Linux или Windows. Файлы блюпринтов и таблиц переносимы между Windows и Linux.
+
+**Какие файлы перенести с ПК.** Из `zootop-gpu`, всего ~13 ГБ; флешка или сеть, пути сохранить:
+```
+data/eq3/blueprint_cpu0.bin
+data/eq3/blueprint_gpu16k_79M.bin
+data/eq3/blueprint_gpu16k_79M_s1.bin
+data/eq3/buckets_cpu0.json
+data/eq/bucket_tables/buckets_potential_64_c9f2f5b5fb1a0b80.npbt
+```
+
+**На ноутбуке (Ubuntu):**
+```bash
+sudo apt install -y build-essential cmake git python3-venv python3-dev
+git clone <адрес репозитория zootop> zootop-gpu && cd zootop-gpu
+git fetch origin opt/gpu && git checkout --detach origin/opt/gpu
+python3 -m venv .venv && . .venv/bin/activate
+pip install pybind11 numpy pytest
+python scripts/build_fast.py          # "GPU trainer OFF" здесь нормально: CUDA не нужна
+# сюда положить перенесённые файлы в data/eq3 и data/eq/bucket_tables
+export NEGPLURIBUS_BUCKET_TABLES=$PWD/data/eq/bucket_tables
+D=data/eq3
+C="--players 3 --stack 100 --street river --preflop-fracs 0.5,1.0,3.0 --postflop-fracs 0.5,1.0,2.0,4.0 --max-raises 3 --buckets $D/buckets_cpu0.json --deals 1000000"
+# по одной (две параллельно не влезут в 16 ГБ: каждая держит два блюпринта, ~9 ГБ)
+python scripts/compare_checkpoints.py $C --a $D/blueprint_cpu0.bin --b $D/blueprint_cpu0.bin --label-a cpu0 --label-b cpu0copy > r8_duel_self.log 2>&1
+python scripts/compare_checkpoints.py $C --a $D/blueprint_gpu16k_79M.bin --b $D/blueprint_gpu16k_79M_s1.bin --label-a gpu16k_s0 --label-b gpu16k_s1 > r8_duel_gpu_gpu.log 2>&1
+python scripts/compare_checkpoints.py $C --a $D/blueprint_gpu16k_79M_s1.bin --b $D/blueprint_cpu0.bin --label-a gpu16k_s1 --label-b cpu0 > r8_duel_gpus1_cpu0.log 2>&1
+tail -n 6 r8_duel_*.log
+```
+- В начале каждого лога должна быть строка `buckets: C++ + table ...`. Если её нет, таблица не нашлась и дуэль будет очень медленной: проверь путь в `NEGPLURIBUS_BUCKET_TABLES`.
+- Python 3.10+ достаточно (Ubuntu 22.04 / 24.04). Время — примерно 30–45 минут на дуэль, всего 1,5–2,5 часа. На время дуэлей закрыть браузер (память).
+- Отчёт такой же: `GPU_REPORT8.md` с тремя парами строк `vs` дословно и временем; push в `opt/gpu-report8` или просто прислать логи.
