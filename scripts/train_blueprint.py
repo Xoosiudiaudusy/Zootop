@@ -247,6 +247,10 @@ def main() -> None:
         print(f"GPU: {ft.gpu_device}; flat game {ft.game_stats()}", flush=True)
         train_for(ft.train, lambda: ft.iteration, "GPU")
         ft.copy_to(trainer._core)  # in C++: no Python dict of the whole table
+        del ft  # frees the flat tables (host and device) before the checkpoint / blueprint are written
+        import gc
+
+        gc.collect()
     elif args.seconds > 0:
         train_for(lambda n: trainer.train(n), lambda: trainer.iteration, "CPU")
     cores = CoreMeter()  # busy cores per checkpoint interval: ~4 instead of ~15 means the run is throttled
@@ -297,7 +301,8 @@ def main() -> None:
     # (C++ backend: the same floats from a C++ lookup, no dict)
     if cpp:
         save_outputs(snapshot=False)
-        strat = trainer.blueprint(rounded=False)
+        # the in-memory blueprint only for the evaluation below (a large game's copy may not fit in RAM)
+        strat = trainer.blueprint(rounded=False) if args.eval_deals > 0 else None
     else:
         strat = trainer.strategy()
         save_outputs(snapshot=False, strat=strat)
