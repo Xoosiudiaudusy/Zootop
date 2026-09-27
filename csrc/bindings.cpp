@@ -1471,7 +1471,7 @@ PYBIND11_MODULE(_fastcore, m) {
                          const std::vector<std::pair<int, int>>& actions, const std::vector<int>& board, int seat,
                          const std::vector<int>& hole, long long iterations, double time_budget, int threads, uint64_t seed,
                          double focus, double min_prob, bool linear, const py::object& overrides, const py::object& depth,
-                         int rollouts, double bias, int debug_leaves) {
+                         int rollouts, double bias, int debug_leaves, bool legacy_traverse) {
             HandInput h;
             h.stacks = stacks;
             h.button = button;
@@ -1503,12 +1503,14 @@ PYBIND11_MODULE(_fastcore, m) {
             p.rollouts = rollouts;
             p.bias = bias;
             p.debug_leaves = debug_leaves;
+            p.legacy_traverse = legacy_traverse;
             py::gil_scoped_release nogil;
             return new SubgameSearch(std::shared_ptr<const SearchGame>(game), h, p);
         }), py::arg("game"), py::arg("stacks"), py::arg("button"), py::arg("actions"), py::arg("board"), py::arg("seat"),
             py::arg("hole"), py::arg("iterations") = 0, py::arg("time_budget") = 2.0, py::arg("threads") = 15, py::arg("seed") = 0,
             py::arg("focus") = 0.5, py::arg("min_prob") = 1e-3, py::arg("linear") = true, py::arg("overrides") = py::none(),
             py::arg("depth") = "end", py::arg("rollouts") = 3, py::arg("bias") = 5.0, py::arg("debug_leaves") = 0,
+            py::arg("legacy_traverse") = false,
             "the subgame of the hand so far: root at the start of the current round, ranges by Bayes over the blueprint; "
             "depth 'end' / 'pluribus' / 'hu_flop_limit' / 'next_street' (leaves: four continuations, `rollouts` rollouts each)")
         .def("solve", [](SubgameSearch& s) {

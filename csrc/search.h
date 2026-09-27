@@ -288,6 +288,7 @@ struct SearchParams {
     int rollouts = 3;          // rollouts per leaf value (Depth-Limited Solving 2018: three)
     double bias = 5.0;         // the continuations' factor (Pluribus: 5)
     int debug_leaves = 0;      // tests: log this many leaf choices made inside the solver
+    bool legacy_traverse = false;  // tests: traverse with the engine at every node instead of the public tree (same numbers)
 };
 
 struct LeafInfo {  // tests: one leaf of the public tree
@@ -485,7 +486,7 @@ public:
                                        std::chrono::duration<double>(params_.time_budget > 0 ? params_.time_budget : 0.0));
         std::vector<int> traversers;
         for (int s = 0; s < root_.n; s++) if (root_.players[s].can_act()) traversers.push_back(s);
-        if (!frozen_) build_troot();  // the public tree of this solve (its node caches point into table_)
+        if (!frozen_ && !params_.legacy_traverse) build_troot();  // the public tree of this solve (its node caches point into table_)
         // our decision (our actual hole's class at the end of the real path): its strategy is added up
         // once per iteration, which is the average our hole plays (its own reach there is fixed)
         NodeActions our_na;
@@ -509,7 +510,7 @@ public:
                     for (int trav : traversers) {
                         const bool focused = trav == hand_.our_seat && ctx.rng.uniform() < params_.focus;
                         deal(ctx, focused);
-                        if (frozen_) {
+                        if (frozen_ || params_.legacy_traverse) {
                             HandState st(root_);
                             st.deck = ctx.deck;
                             for (int s = 0; s < st.n; s++) {
@@ -2087,10 +2088,17 @@ private:
         int k = 0, seat = -1, street = 0, n_board = 0, path_index = -1;
         PathHash ph;
         NodeActions na;
-        // terminal: what HandState::finish needs besides the cards
+        // terminal: what HandState::finish needs besides the cards, prepared once: the contribution
+        // levels (sorted, distinct), the portion of each and its eligible seats in the order the odd
+        // chips go (seat after the button first); a pot without showdown is a fixed value per seat
         int n_act = 0;
         bool folded[MAX_PLAYERS];
         int32_t invested[MAX_PLAYERS];
+        double fixed_value[MAX_PLAYERS];  // n_act <= 1: the net result per seat in bb
+        int n_levels = 0;
+        int portion[MAX_PLAYERS];
+        int n_el[MAX_PLAYERS];
+        int8_t el[MAX_PLAYERS][MAX_PLAYERS];
         std::unique_ptr<std::atomic<TNode*>[]> child;
         std::unique_ptr<std::atomic<Node*>[]> cache;
         int n_cache = 0;
@@ -2116,6 +2124,7 @@ private:
                 t->invested[s] = st.players[s].invested;
                 if (!st.players[s].folded) t->n_act++;
             }
+            prepare_terminal(*t);
         } else if (is_leaf(st, k, on_path)) {
             t->leaf = true;
         } else {
@@ -2125,7 +2134,7 @@ private:
             if (t->path_node) t->path_index = path_[(size_t)k].index;
             t->child.reset(new std::atomic<TNode*>[(size_t)t->na.n]);
             for (int i = 0; i < t->na.n; i++) t->child[(size_t)i].store(nullptr, std::memory_order_relaxed);
-            t->n_cache = st.street == root_street_ ? n_classes_ : std::max(1, game_->bucketer->identity().n_buckets);
+            t->n_cache = st.street == root_street_ ? n_classes_ : tree_buckets_;
             if (st.street == PREFLOP && st.street != root_street_) t->n_cache = 169;
             t->cache.reset(new std::atomic<Node*>[(size_t)t->n_cache]);
             for (int i = 0; i < t->n_cache; i++) t->cache[(size_t)i].store(nullptr, std::memory_order_relaxed);
@@ -2170,21 +2179,56 @@ private:
         return c;
     }
 
+    int tree_buckets_ = 1;  // card parts cached per node past the root's street: the bucketer's bucket count
+
+    // the card-independent part of HandState::finish at terminal t (see TNode)
+    void prepare_terminal(TNode& t) const {
+        const int n = root_.n;
+        const int button = root_.button;
+        int active[MAX_PLAYERS];
+        int n_act = 0;
+        for (int i = 0; i < n; i++) if (!t.folded[i]) active[n_act++] = i;
+        int levels[MAX_PLAYERS];
+        int n_levels = 0;
+        for (int i = 0; i < n; i++) if (t.invested[i] > 0) levels[n_levels++] = t.invested[i];
+        std::sort(levels, levels + n_levels);
+        n_levels = (int)(std::unique(levels, levels + n_levels) - levels);
+        t.n_levels = n_levels;
+        int prev = 0;
+        int won_fixed[MAX_PLAYERS] = {0};
+        for (int li = 0; li < n_levels; li++) {
+            const int lvl = levels[li];
+            int portion = 0;
+            for (int i = 0; i < n; i++) portion += std::max(0, std::min(t.invested[i], lvl) - prev);
+            int eligible[MAX_PLAYERS];
+            int n_el = 0;
+            for (int j = 0; j < n_act; j++) if (t.invested[active[j]] >= lvl) eligible[n_el++] = active[j];
+            if (n_el == 0) for (int j = 0; j < n_act; j++) eligible[n_el++] = active[j];
+            // winners are a subsequence of the eligible seats; HandState::finish stable-sorts them by
+            // (seat - button - 1) mod n, distinct per seat, so sorting the eligible seats once gives the same order
+            std::stable_sort(eligible, eligible + n_el, [&](int x, int y) { return ((x - button - 1) % n + n) % n < ((y - button - 1) % n + n) % n; });
+            t.portion[li] = portion;
+            t.n_el[li] = n_el;
+            for (int j = 0; j < n_el; j++) t.el[li][j] = (int8_t)eligible[j];
+            if (n_el == 1) won_fixed[eligible[0]] += portion;
+            prev = lvl;
+        }
+        for (int s = 0; s < n; s++) t.fixed_value[s] = (double)(won_fixed[s] - t.invested[s]) / (double)game_->spec.bb;
+    }
+
     void build_troot() {
+        tree_buckets_ = std::max(1, game_->bucketer->identity().n_buckets);
         tnodes_.clear();
         HandState st(root_);
         troot_ = make_tnode(nullptr, 0, st, PathHash(), 0, true);
     }
 
-    // HandState::finish + net for `seat`, from the stored contributions and the deal's cards
+    // HandState::finish + net for `seat`, from the prepared terminal and the deal's cards
     double tree_net(const TNode* t, int seat, Ctx& ctx) const {
+        if (t->n_act <= 1) return t->fixed_value[seat];
         const int n = root_.n;
-        int active[MAX_PLAYERS];
-        int n_act = 0;
-        for (int i = 0; i < n; i++) if (!t->folded[i]) active[n_act++] = i;
-        if (n_act > 1 && ctx.str_board != t->n_board) {
-            for (int s = 0; s < n; s++) {
-                if (t->folded[s]) continue;  // (strengths of folded seats are never read)
+        if (ctx.str_board != t->n_board) {
+            for (int s = 0; s < n; s++) {  // every seat: with 3+ players another terminal of this board has other folds
                 int cards[7];
                 cards[0] = ctx.holes[s][0];
                 cards[1] = ctx.holes[s][1];
@@ -2193,34 +2237,26 @@ private:
             }
             ctx.str_board = t->n_board;
         }
-        int levels[MAX_PLAYERS];
-        int n_levels = 0;
-        for (int i = 0; i < n; i++) if (t->invested[i] > 0) levels[n_levels++] = t->invested[i];
-        std::sort(levels, levels + n_levels);
-        n_levels = (int)(std::unique(levels, levels + n_levels) - levels);
-        int won = 0, prev = 0;
-        const int button = root_.button;
-        for (int li = 0; li < n_levels; li++) {
-            const int lvl = levels[li];
-            int portion = 0;
-            for (int i = 0; i < n; i++) portion += std::max(0, std::min(t->invested[i], lvl) - prev);
-            int eligible[MAX_PLAYERS];
-            int n_el = 0;
-            for (int j = 0; j < n_act; j++) if (t->invested[active[j]] >= lvl) eligible[n_el++] = active[j];
-            if (n_el == 0) for (int j = 0; j < n_act; j++) eligible[n_el++] = active[j];
+        int won = 0;
+        for (int li = 0; li < t->n_levels; li++) {
+            const int n_el = t->n_el[li];
+            const int8_t* el = t->el[li];
             if (n_el == 1) {
-                if (eligible[0] == seat) won += portion;
-            } else {
-                int64_t best = -1;
-                for (int j = 0; j < n_el; j++) best = std::max(best, ctx.str[eligible[j]]);
-                int ws[MAX_PLAYERS];
-                int n_ws = 0;
-                for (int j = 0; j < n_el; j++) if (ctx.str[eligible[j]] == best) ws[n_ws++] = eligible[j];
-                const int share = portion / n_ws, odd = portion % n_ws;
-                std::stable_sort(ws, ws + n_ws, [&](int x, int y) { return ((x - button - 1) % n + n) % n < ((y - button - 1) % n + n) % n; });
-                for (int i = 0; i < n_ws; i++) if (ws[i] == seat) won += share + (i < odd ? 1 : 0);
+                if (el[0] == seat) won += t->portion[li];
+                continue;
             }
-            prev = lvl;
+            int64_t best = -1;
+            for (int j = 0; j < n_el; j++) best = std::max(best, ctx.str[el[j]]);
+            int n_ws = 0, mine = -1;
+            for (int j = 0; j < n_el; j++)
+                if (ctx.str[el[j]] == best) {
+                    if (el[j] == seat) mine = n_ws;
+                    n_ws++;
+                }
+            if (mine >= 0) {
+                const int share = t->portion[li] / n_ws, odd = t->portion[li] % n_ws;
+                won += share + (mine < odd ? 1 : 0);
+            }
         }
         return (double)(won - t->invested[seat]) / (double)game_->spec.bb;
     }
