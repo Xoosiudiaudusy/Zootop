@@ -91,3 +91,41 @@ def test_river_potential_is_the_reference(tiny_potential, mode):
 def test_cuda_available_reports_a_reason():
     ok, why = core.cuda_available()
     assert ok or why
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_checkpoint_and_resume_continue_bit_for_bit(tmp_path, mode):
+    """A run stopped at a batch boundary, written as an ordinary checkpoint (copy_to + save_checkpoint), loaded
+    back (load_checkpoint + copy_from) and continued gives the tables of the run that never stopped."""
+    from negpluribus.abstraction import EquityBucketer
+
+    spec = GameSpec(n_players=2, stack_bb=10, max_street=Street.PREFLOP, preflop_fracs=(1.0,))
+    bk = EquityBucketer(n_buckets=8)
+
+    def flat(tr):
+        ft = core.FlatTrainer(spec_to_dict(spec), tr._core_bucketer, 4, True, 2)
+        ft.batch_size = 256
+        if mode == "emu":
+            ft.emulate_gpu = True
+        elif mode == "gpu":
+            ft.use_gpu(0)
+        return ft
+
+    a = MCCFRTrainer(spec, bucketer=bk, seed=4, backend="cpp", threads=2)
+    fa = flat(a)
+    fa.train(3 * 256)
+    fa.copy_to(a._core)
+    b = MCCFRTrainer(spec, bucketer=bk, seed=4, backend="cpp", threads=2)
+    fb = flat(b)
+    fb.train(256)
+    fb.copy_to(b._core)
+    path = str(tmp_path / "ck.bin")
+    b.save_checkpoint(path)
+    c = MCCFRTrainer(spec, bucketer=bk, seed=4, backend="cpp", threads=2)
+    c.load_checkpoint(path)
+    fc = flat(c)
+    assert fc.copy_from(c._core) == len(c.nodes) and fc.iteration == 256
+    fc.train(2 * 256)
+    fc.copy_to(c._core)
+    assert c.iteration == a.iteration == 768
+    assert c._core.export_nodes() == a._core.export_nodes()

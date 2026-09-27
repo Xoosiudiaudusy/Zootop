@@ -33,6 +33,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "abstraction.h"
@@ -180,6 +181,56 @@ public:
         }
     }
 
+    // ---- loading tables back (resume from a checkpoint): the rows of an ordinary Trainer's table
+    // Clears the tables, then load_row() for every node, then end_load(iteration).  A key names its row:
+    // "street|position|n_active|b<bucket>|history" -> (decision, bucket).
+    void begin_load() {
+        sync();
+        std::fill(regret.begin(), regret.end(), 0.0);
+        std::fill(strategy_sum.begin(), strategy_sum.end(), 0.0);
+        std::fill(visits.begin(), visits.end(), 0);
+        std::fill(touched.begin(), touched.end(), 0);
+        if (key_index_.empty()) {
+            std::string k;
+            for (size_t d = 0; d < game.n_decisions(); d++) {
+                game.key(d, 0, k);
+                key_index_.emplace(key_without_bucket(k), (int32_t)d);
+            }
+        }
+    }
+    // false: the key is not a row of this game, or its actions differ
+    bool load_row(const std::string& key, const uint8_t* ids, int na, const double* r, const double* ss, int64_t v) {
+        int b = -1;
+        const std::string base = key_without_bucket(key, &b);
+        auto it = key_index_.find(base);
+        if (it == key_index_.end() || b < 0) return false;
+        const size_t d = (size_t)it->second;
+        if (b >= game.n_cache[d] || na != game.na[d]) return false;
+        for (int a = 0; a < na; a++) if (ids[a] != game.ids[d * MAX_ACTIONS + (size_t)a]) return false;
+        const uint64_t c = game.cell_base[d] + (uint64_t)b * (uint64_t)na;
+        for (int a = 0; a < na; a++) { regret[c + (uint64_t)a] = r[a]; strategy_sum[c + (uint64_t)a] = ss[a]; }
+        const uint64_t i = game.info_base[d] + (uint64_t)b;
+        visits[i] = v;
+        touched[i] = 1;
+        return true;
+    }
+    void end_load(long long iteration) {
+        iteration_ = iteration;
+        host_stale_ = false;
+        // the device / the emulation start again from the host tables
+        emu_touched_.clear();
+        emu_sigma_.clear();
+        emu_dirty_.clear();
+        if (gpu_) {
+            std::vector<uint8_t> tc(game.n_cells, 0);
+            for (size_t d = 0; d < game.n_decisions(); d++)
+                for (int b = 0; b < game.n_cache[d]; b++)
+                    if (touched[game.info_base[d] + (uint64_t)b])
+                        for (int a = 0; a < game.na[d]; a++) tc[game.cell_base[d] + (uint64_t)b * game.na[d] + (uint64_t)a] = 1;
+            gpu_->upload(regret.data(), strategy_sum.data(), visits.data(), tc.data());
+        }
+    }
+
     // every touched infoset: (key, action ids, regret, strategy sum, number of actions, visits)
     template <class F>
     void for_each_touched(F&& f) {
@@ -222,6 +273,24 @@ private:
 
     HistTree tree_;
     long long iteration_ = 0;
+    std::unordered_map<std::string, int32_t> key_index_;  // key without its bucket -> decision (begin_load)
+
+    // "street|position|n_active|b<bucket>|history" without "|b<bucket>"; *bucket = the bucket (-1: not found)
+    static std::string key_without_bucket(const std::string& key, int* bucket = nullptr) {
+        size_t p = 0;
+        for (int k = 0; k < 3; k++) {
+            p = key.find('|', p);
+            if (p == std::string::npos) { if (bucket) *bucket = -1; return key; }
+            p++;
+        }
+        // p: after the third '|', at 'b'
+        if (p >= key.size() || key[p] != 'b') { if (bucket) *bucket = -1; return key; }
+        size_t q = p + 1;
+        int b = 0;
+        while (q < key.size() && key[q] >= '0' && key[q] <= '9') b = b * 10 + (key[q++] - '0');
+        if (bucket) *bucket = q > p + 1 ? b : -1;
+        return key.substr(0, p - 1) + key.substr(q);
+    }
 
     uint64_t info_of_cell(const Rec& u) const { return game.info_base[u.d] + u.info; }
 

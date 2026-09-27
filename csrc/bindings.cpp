@@ -1214,6 +1214,25 @@ PYBIND11_MODULE(_fastcore, m) {
             });
             t.set_iteration(ft.iteration());
         }, py::arg("trainer"))
+        .def("copy_from", [](FlatTrainer& ft, Trainer& t) {
+            // an ordinary Trainer's tables (a loaded checkpoint) into the flat tables and the device: resume.
+            // Returns the number of rows loaded; throws if a node is not a row of this game
+            py::gil_scoped_release nogil;
+            ApiLock lk(t.api_mu);
+            if (ft.spec.n_players != t.spec.n_players) throw std::invalid_argument("copy_from: another game");
+            ft.begin_load();
+            long long n = 0;
+            std::string bad;
+            t.nodes.for_each([&](const char* key, Node& node) {
+                if (!bad.empty()) return;
+                const std::string k(key);
+                if (ft.load_row(k, node.acts, node.n, node.regret(), node.strategy_sum(), node.visits)) n++;
+                else bad = k;
+            });
+            if (!bad.empty()) throw std::runtime_error("copy_from: node '" + bad + "' is not a row of the flat game (other game or actions)");
+            ft.end_load(t.iteration());
+            return n;
+        }, py::arg("trainer"))
         .def("export_checkpoint", [](FlatTrainer& t) {
             // {key: (action names, regret, strategy_sum, visits)}: the rows Trainer.import_nodes takes
             py::dict out;

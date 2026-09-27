@@ -26,6 +26,7 @@ After training the script prints:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import sys
@@ -219,8 +220,8 @@ def main() -> None:
     if args.gpu >= 0:
         if not cpp or args.batch <= 0:
             raise SystemExit("--gpu needs --backend cpp and --batch B")
-        if args.checkpoint_every or args.resume or args.prune_below > 0:
-            raise SystemExit("--gpu: no --checkpoint-every / --resume / pruning yet")
+        if args.prune_below > 0:
+            raise SystemExit("--gpu: no pruning on the GPU")
 
     def train_for(train_step, iteration, what: str) -> None:
         """--seconds: steps of whole batches until the wall time is used; else --iters in one call"""
@@ -255,12 +256,72 @@ def main() -> None:
         else:
             ft.use_gpu(args.gpu)
         print(f"GPU: {'EMULATED on the CPU' if args.gpu_emulate else ft.gpu_device}; flat game {ft.game_stats()}", flush=True)
-        train_for(ft.train, lambda: ft.iteration, "GPU")
+        run_info = {"seed": int(args.seed), "batch": int(args.batch), "linear": not args.no_linear, "linear_until": int(args.linear_until)}
+        info_path = ck_path + ".gpu.json"  # what a GPU checkpoint was trained with (checked on --resume)
+        if trainer.iteration > 0:  # --resume loaded a checkpoint: its tables go to the device
+            if os.path.exists(info_path):
+                with open(info_path, encoding="utf-8") as f:
+                    saved = json.load(f)
+                diff = {k: (saved.get(k), v) for k, v in run_info.items() if saved.get(k) != v}
+                if diff:
+                    raise SystemExit(f"--resume --gpu: the checkpoint was trained with other settings {diff} (saved, now); "
+                                     "use the same --seed / --batch / --linear-until, or another --tag")
+            else:
+                print("GPU: resuming from a checkpoint without GPU run info (a CPU checkpoint?): continuing from its tables")
+            t_load = time.perf_counter()
+            n_rows = ft.copy_from(trainer._core)
+            trainer._core.import_nodes({}, True)  # the table lives in the flat trainer now
+            print(f"GPU: resumed {n_rows:,} infosets at iteration {ft.iteration:,} ({time.perf_counter() - t_load:.1f}s)", flush=True)
+            if ft.iteration % args.batch:
+                print(f"GPU: note: iteration {ft.iteration:,} is not a multiple of the batch {args.batch:,}: the first batch is shorter "
+                      "(a run resumed from a GPU checkpoint of the same batch continues bit for bit)")
+        ck_every = args.checkpoint_every
+        if ck_every and ck_every % args.batch:
+            ck_every = (ck_every // args.batch + 1) * args.batch
+            print(f"GPU: --checkpoint-every rounded up to {ck_every:,} (a multiple of the batch: resumed runs form the same batches)")
+
+        def gpu_checkpoint() -> None:
+            t_save = time.perf_counter()
+            ft.copy_to(trainer._core)
+            save_outputs(snapshot=True)
+            with open(info_path, "w", encoding="utf-8") as f:
+                json.dump(dict(run_info, iteration=int(ft.iteration)), f)
+            n_inf = trainer.n_nodes
+            trainer._core.import_nodes({}, True)  # free the copy until the next checkpoint
+            print(f"  checkpoint {ft.iteration:,}: {n_inf:,} infosets, {time.perf_counter() - t0:.0f}s, "
+                  f"saved in {time.perf_counter() - t_save:.1f}s", flush=True)
+
+        start_it = ft.iteration
+        target = start_it + args.iters
+        next_ck = (ft.iteration // ck_every + 1) * ck_every if ck_every else None
+        big_step = args.batch * max(1, 262144 // args.batch)
+        start = time.perf_counter()
+        while True:
+            if args.seconds > 0:
+                if time.perf_counter() - start >= args.seconds:
+                    break
+                step = big_step
+            else:
+                if ft.iteration >= target:
+                    break
+                step = target - ft.iteration
+            if next_ck is not None:
+                step = min(step, next_ck - ft.iteration)
+            ft.train(step)
+            if next_ck is not None and ft.iteration >= next_ck:
+                if not (args.seconds <= 0 and ft.iteration >= target):  # the final save below covers the last one
+                    gpu_checkpoint()
+                next_ck += ck_every
+        el = max(time.perf_counter() - start, 1e-9)
+        print(f"GPU: {ft.iteration - start_it:,} iterations in {el:.0f}s = {(ft.iteration - start_it) / el:,.0f} it/s "
+              f"(now at iteration {ft.iteration:,})", flush=True)
         ft.copy_to(trainer._core)  # in C++: no Python dict of the whole table
         del ft  # frees the flat tables (host and device) before the checkpoint / blueprint are written
         import gc
 
         gc.collect()
+        with open(info_path, "w", encoding="utf-8") as f:
+            json.dump(dict(run_info, iteration=int(trainer.iteration)), f)
     elif args.seconds > 0:
         train_for(lambda n: trainer.train(n), lambda: trainer.iteration, "CPU")
     cores = CoreMeter()  # busy cores per checkpoint interval: ~4 instead of ~15 means the run is throttled
