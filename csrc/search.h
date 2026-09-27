@@ -48,6 +48,12 @@
 #include "nodetable.h"
 #include "persist.h"
 
+#if defined(_MSC_VER)
+#define NEGP_NOINLINE __declspec(noinline)
+#else
+#define NEGP_NOINLINE __attribute__((noinline))
+#endif
+
 namespace negp {
 
 constexpr int N_COMBOS = 1326;
@@ -2166,7 +2172,11 @@ private:
 
     TNode* tchild(TNode* t, int a) {
         TNode* c = t->child[(size_t)a].load(std::memory_order_acquire);
-        if (c) return c;
+        return c ? c : new_tchild(t, a);
+    }
+    // (out of line: the replay's state and path buffers would otherwise be set up at every tchild call)
+    NEGP_NOINLINE TNode* new_tchild(TNode* t, int a) {
+        TNode* c;
         std::lock_guard<std::mutex> lk(tree_mu_);
         c = t->child[(size_t)a].load(std::memory_order_relaxed);
         if (c) return c;
@@ -2268,13 +2278,15 @@ private:
         return m;
     }
 
+    NEGP_NOINLINE double tree_leaf_value(const TNode* t, int traverser, double weight, double w_imp, bool focused, Ctx& ctx) {
+        HandState st = replay_tnode(t, ctx.deck, ctx.holes);
+        return leaf_value(st, t->ph, traverser, weight, w_imp, focused, ctx);
+    }
+
     // traverse() on the public tree (no frozen round)
     double traverse_tree(TNode* t, int traverser, double weight, double w_imp, bool focused, Ctx& ctx) {
         if (t->terminal) return tree_net(t, traverser, ctx);
-        if (t->leaf) {
-            HandState st = replay_tnode(t, ctx.deck, ctx.holes);
-            return leaf_value(st, t->ph, traverser, weight, w_imp, focused, ctx);
-        }
+        if (t->leaf) return tree_leaf_value(t, traverser, weight, w_imp, focused, ctx);
         const int seat = t->seat;
         const NodeActions& na = t->na;
         const int card = tree_card_part(t, seat, ctx);
