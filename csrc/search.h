@@ -160,6 +160,24 @@ inline void apply_continuation(const int* kind, int n, int choice, double bias, 
 }
 
 // ------------------------------------------------------------------ inputs and outputs
+// The bucket tables of a search root's board: the river buckets of every board the subgame can reach
+// from a flop or turn root (Bucketer::river_buckets_all, built at once; base -1 when the abstraction has
+// no batch), and, for a flop root, the turn buckets of every combo per turn card (filled on first use
+// from the bucketer).  They depend only on the bucketer and the board, so SearchGame keeps those of its
+// last boards and every search on one of those boards shares them (a lookup instead of a rebuild: the
+// agent searches a board several times, and every flop search used to rebuild 1,176 river boards).
+struct SearchBoardTables {
+    std::vector<int> board;                       // the root board, in the order given
+    std::once_flag river_once;
+    int river_base = -1;                          // the root board's size (3 or 4); -1: no river table
+    std::vector<int32_t> river_slot;              // 52 x 52: base 4 the fifth card, base 3 the smaller x 52 + the larger extra card
+    std::vector<uint8_t> river_b;                 // boards x 1326
+    std::once_flag turn_init;
+    bool turn_on = false;
+    std::vector<uint8_t> turn_b;                  // 52 x 1326 (flop roots)
+    std::unique_ptr<std::once_flag[]> turn_once;  // per turn card
+};
+
 struct SearchGame {
     Spec spec;
     BetGrid grid;
@@ -168,6 +186,28 @@ struct SearchGame {
     // optional (Pluribus' compression of the continuations): per blueprint record and continuation,
     // the index among the record's actions of one action drawn in advance; empty: off
     std::vector<uint8_t> presampled;
+
+    // the bucket tables of the last boards searched (SearchBoardTables); tables_keep boards are kept
+    size_t tables_keep = 8;
+    std::shared_ptr<SearchBoardTables> board_tables(const std::vector<int>& board) const {
+        std::lock_guard<std::mutex> lk(tables_mu_);
+        for (size_t i = 0; i < tables_.size(); i++)
+            if (tables_[i]->board == board) {
+                std::shared_ptr<SearchBoardTables> t = tables_[i];
+                tables_.erase(tables_.begin() + (long)i);
+                tables_.push_back(t);  // most recent last
+                return t;
+            }
+        std::shared_ptr<SearchBoardTables> t = std::make_shared<SearchBoardTables>();
+        t->board = board;
+        tables_.push_back(t);
+        while (tables_.size() > std::max<size_t>(1, tables_keep)) tables_.erase(tables_.begin());
+        return t;
+    }
+    void clear_board_tables() const {
+        std::lock_guard<std::mutex> lk(tables_mu_);
+        tables_.clear();
+    }
 
     SearchGame(const Spec& s, std::shared_ptr<Bucketer> bk, std::shared_ptr<const BlueprintTable> bp)
         : spec(s), grid(s.grid()), bucketer(std::move(bk)), blueprint(std::move(bp)) {
@@ -215,6 +255,10 @@ struct SearchGame {
         }
         presampled = std::move(out);
     }
+
+private:
+    mutable std::mutex tables_mu_;
+    mutable std::vector<std::shared_ptr<SearchBoardTables>> tables_;
 };
 
 struct LikelihoodOverride {  // replaces sigma = blueprint for one seat's actions on one street
@@ -316,6 +360,7 @@ public:
         if (game_->blueprint)
             for (size_t i = 0; i < grid_to_bp_.size(); i++)
                 grid_to_bp_[i] = game_->blueprint->name_index(game_->grid.names[i].data(), game_->grid.names[i].size());
+        bt_ = game_->board_tables(hand_.board);
         build_river_table();
         init_turn_table();
     }
@@ -336,7 +381,7 @@ public:
     int n_classes() const { return n_classes_; }
     double range_seconds() const { return range_seconds_; }
     double river_table_seconds() const { return river_seconds_; }
-    int river_table_boards() const { return (int)(river_.b.size() / N_COMBOS); }
+    int river_table_boards() const { return (int)(bt_->river_b.size() / N_COMBOS); }
     int limit_street() const { return limit_street_; }
     int raise_limit() const { return raise_limit_; }
     NodeActions actions_at(const HandState& st, int k) const {
@@ -1256,46 +1301,34 @@ private:
         HistHash hh;
     };
 
-    // river buckets of every board the subgame can reach from a flop or turn root, computed at once
-    // (Bucketer::river_buckets_all; empty when the abstraction has no batch)
-    struct RiverTable {
-        int base = -1;                // the root board's size (3 or 4)
-        std::vector<int32_t> slot;    // 52 x 52: base 4 the fifth card, base 3 the smaller x 52 + the larger extra card
-        std::vector<uint8_t> b;       // boards x 1326
-    };
-    RiverTable river_;
-    double river_seconds_ = 0.0;
-
-    // flop roots: turn buckets of every combo per turn card, filled on first use from the bucketer
-    // (its cache when warm): a lookup instead of a canonical form and a cache probe per rollout step
-    struct TurnTable {
-        bool on = false;
-        std::vector<uint8_t> b;                       // 52 x 1326
-        std::unique_ptr<std::once_flag[]> once;       // per turn card
-    };
-    mutable TurnTable turn_;
+    // the bucket tables of the root's board, shared through the game (SearchBoardTables)
+    std::shared_ptr<SearchBoardTables> bt_;
+    double river_seconds_ = 0.0;  // seconds this search spent building the river table (0: shared)
 
     void init_turn_table() {
-        turn_ = TurnTable();
         if (root_.n_board != 3 || game_->spec.max_street < TURN) return;
-        turn_.b.assign((size_t)52 * N_COMBOS, 255);
-        turn_.once.reset(new std::once_flag[52]);
-        turn_.on = true;
+        SearchBoardTables& t = *bt_;
+        std::call_once(t.turn_init, [&t]() {
+            t.turn_b.assign((size_t)52 * N_COMBOS, 255);
+            t.turn_once.reset(new std::once_flag[52]);
+            t.turn_on = true;
+        });
     }
     int turn_bucket(const int* hole, const int* board4) const {
+        SearchBoardTables& tb = *bt_;
         const int t = board4[3];
-        std::call_once(turn_.once[(size_t)t], [&]() {
+        std::call_once(tb.turn_once[(size_t)t], [&]() {
             const ComboTable& ct = combo_table();
             bool on[52] = {false};
             for (int i = 0; i < 4; i++) on[board4[i]] = true;
-            uint8_t* row = &turn_.b[(size_t)t * N_COMBOS];
+            uint8_t* row = &tb.turn_b[(size_t)t * N_COMBOS];
             for (int c = 0; c < N_COMBOS; c++) {
                 if (on[ct.c0[c]] || on[ct.c1[c]]) continue;
                 const int h[2] = {ct.c0[c], ct.c1[c]};
                 row[c] = (uint8_t)game_->bucketer->bucket(h, board4, 4);
             }
         });
-        return turn_.b[(size_t)t * N_COMBOS + (size_t)combo_index(hole[0], hole[1])];
+        return tb.turn_b[(size_t)t * N_COMBOS + (size_t)combo_index(hole[0], hole[1])];
     }
     int limit_street_ = RIVER;   // the last street searched; the start of the next one is a leaf
     int raise_limit_ = 0;        // > 0: right after this many raises on the root street is a leaf too
@@ -1333,8 +1366,11 @@ private:
     }
 
     void build_river_table() {
+        river_seconds_ = 0.0;
+        std::call_once(bt_->river_once, [&]() { build_river_table_once(*bt_); });
+    }
+    void build_river_table_once(SearchBoardTables& rt) {
         const auto t0 = std::chrono::steady_clock::now();
-        river_ = RiverTable();
         const int base = root_.n_board;
         if (base != 3 && base != 4) return;
         if (game_->spec.max_street < RIVER) return;  // no river decisions, in the subgame or in rollouts
@@ -1370,31 +1406,32 @@ private:
         work();
         for (auto& th : pool) th.join();
         if (unsupported.load()) return;
-        river_.base = base;
-        river_.slot.assign(52 * 52, -1);
+        rt.river_slot.assign(52 * 52, -1);
         for (size_t i = 0; i < extras.size(); i++) {
             const int key = base == 4 ? extras[i].second : extras[i].first * 52 + extras[i].second;
-            river_.slot[(size_t)key] = (int32_t)i;
+            rt.river_slot[(size_t)key] = (int32_t)i;
         }
-        river_.b = std::move(b);
+        rt.river_b = std::move(b);
+        rt.river_base = base;
         river_seconds_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     }
 
     // bucket of `hole` on a board past the root's street: the river table on the river when it
     // exists, else the bucketer (and its cache)
     int later_bucket(const int* hole, const int* board, int n_board) const {
-        if (n_board == 5 && river_.base > 0) {
+        const SearchBoardTables& rt = *bt_;
+        if (n_board == 5 && rt.river_base > 0) {
             int key;
-            if (river_.base == 4) {
+            if (rt.river_base == 4) {
                 key = board[4];
             } else {
                 const int t = std::min(board[3], board[4]), r = std::max(board[3], board[4]);
                 key = t * 52 + r;
             }
-            const int32_t i = river_.slot[(size_t)key];
-            if (i >= 0) return river_.b[(size_t)i * N_COMBOS + (size_t)combo_index(hole[0], hole[1])];
+            const int32_t i = rt.river_slot[(size_t)key];
+            if (i >= 0) return rt.river_b[(size_t)i * N_COMBOS + (size_t)combo_index(hole[0], hole[1])];
         }
-        if (n_board == 4 && turn_.on) return turn_bucket(hole, board);
+        if (n_board == 4 && rt.turn_on) return turn_bucket(hole, board);
         return game_->bucketer->bucket(hole, board, n_board);
     }
 

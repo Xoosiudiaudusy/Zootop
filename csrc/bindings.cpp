@@ -1461,7 +1461,10 @@ PYBIND11_MODULE(_fastcore, m) {
         }, py::arg("seed") = 0, py::arg("bias") = 5.0,
            "draw one action per blueprint infoset and continuation; rollouts then play it (Pluribus' compression)")
         .def("clear_presampled", [](SearchGame& g) { g.presampled.clear(); g.presampled.shrink_to_fit(); })
-        .def_property_readonly("presampled_bytes", [](const SearchGame& g) { return g.presampled.capacity(); });
+        .def_property_readonly("presampled_bytes", [](const SearchGame& g) { return g.presampled.capacity(); })
+        .def_readwrite("tables_keep", &SearchGame::tables_keep,
+                       "bucket tables (river, turn) of this many recent root boards are kept and shared by the searches")
+        .def("clear_board_tables", [](const SearchGame& g) { g.clear_board_tables(); });
 
     py::class_<SubgameSearch>(m, "SubgameSearch")
         .def(py::init([](std::shared_ptr<SearchGame> game, const std::vector<int>& stacks, int button,
