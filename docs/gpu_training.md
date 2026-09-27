@@ -14,17 +14,32 @@ Measured on an RTX 5070 against an i5-14400F on 16 threads.  Game: 3-max, 100bb,
 | GPU, batch 4096 | 442k (x6.8) | 29 min |
 | GPU, batch 16384 | 662k (x10.3) | ~20 min |
 
-Quality at equal numbers of iterations (duels of 1M deals, 3-max as above, ±1 bb/100):
+Quality per iteration: batched training is **delayed feedback**, because every iteration of a batch sees one
+strategy snapshot.  It costs some quality per iteration.
 
-| comparison | 79M iterations | 767M iterations |
-|---|---|---|
-| GPU vs CPU, batch 4096 | 0.0 | 0.0 |
-| GPU vs CPU, batch 16384 | 0.0 (two seeds) | 0.0 |
-| deep CPU vs shallow CPU (control) | | +4.3 |
+Exact exploitability on a preflop game (HU 20bb, raises of 0.5/1/3 pots, 11.5k infosets;
+`scripts/batch_epsilon.py`, 3 seeds; ratio = eps(batched) / eps(ordinary) at the same iteration count):
 
-In other words, the GPU learns exactly as well per iteration and is 7-10x faster.  At equal wall time the
-GPU blueprint beats the CPU one by about +4 bb/100 on this game.  The reports are in branches
-`opt/gpu-report5..7` and the summary is in `GPU_DESIGN.md` on the comms branch.
+| batch | batches per run: 16-64 | 256-1024 | 4096-16384 | one batched iteration is worth |
+|---|---|---|---|---|
+| 4096 | 1.06-1.09 | 1.07-1.11 | 1.20 | ~0.8-0.9 ordinary iterations |
+| 16384 | 1.29-1.36 | 1.20 | 1.21 | ~0.7-0.8 |
+| 65536 | 3.2-4.7 | 2.6-3.1 | 1.66 (at 1024) | 0.1-0.5: do not use |
+
+- In the tiny push/fold game there is no penalty.
+- Duels (3-max, ±1 bb/100) cannot see a 10-20 % eps difference: at equal iterations GPU and CPU drew.
+- Net, at equal wall time on 3-max wide: batch 4096 ~x5.5-6 and batch 16384 ~x7.5-8 against the CPU trainer.
+  At equal time the GPU blueprint beat the CPU one by about +4 bb/100 (round 6, control CPU/CPU = 0.0).
+
+**Rules.**
+- Batched mode is for **blueprint training only**.  Never use it in real-time search, which runs tens of
+  thousands of iterations per decision.
+- Batch ≤ 16384, and **at least ~1000 batches per run**: ≥ 16M iterations at 16384, ≥ 4M at 4096.
+- Prefer 16384 on long runs (it is 1.5x faster than 4096 on the GPU at a similar penalty) and 4096 on short
+  ones.
+
+The reports are in branches `opt/gpu-report5..8`, and the summaries on the comms branch are `GPU_DESIGN.md`
+and `2026-09-27_batch-epsilon.md`.
 
 ## Requirements and build
 
@@ -50,7 +65,7 @@ python scripts/train_blueprint.py <game flags> --backend cpp --gpu 0 --batch 163
 
 - **`--batch B`** (required).  The number of iterations that share one strategy snapshot.
   - Batches are aligned on absolute iteration numbers: 1..B, B+1..2B, and so on.
-  - 4096 and 16384 were measured equal in quality at 79M and 767M iterations; 16384 is 1.5x faster.
+  - See the rules above: B ≤ 16384 and at least ~1000 batches per run.
   - Larger batches gain little speed.  They also carry a quality risk on short runs: 65536 on HU at 20M
     iterations lost 11 bb/100.
 - **`--checkpoint-every N`**: a checkpoint and a blueprint (plus the `.it<N>` copy) every N iterations.
