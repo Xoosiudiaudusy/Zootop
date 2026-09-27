@@ -462,3 +462,63 @@ git commit -m "GPU run report 6 (3-max wide, equal-time duels with a control)"
 git push -u origin opt/gpu-report6
 ```
 Большие файлы (`data\eq3\*.bin`) **не коммить**.
+
+
+---
+
+# Раунд 7 (ночной, ~6 часов): GPU против CPU при РАВНОМ числе итераций
+
+Раунд 6 сравнивал равное **время**: GPU за 20 минут сделал в 7–10 раз больше итераций и выиграл. Но так он выиграл бы и у CPU, который просто учился дольше. Теперь сравниваем **равную глубину обучения**, то есть одинаковое число итераций. Вопрос: учит ли GPU (пачками) так же хорошо, как CPU, итерация к итерации.
+
+Всё делает один скрипт `scripts/gpu_round7.ps1`. Он сам по очереди обучает, играет дуэли и пишет сводку. Если прервался, повторный запуск пропускает уже сделанное.
+
+**Что он делает** (игра та же, что в раунде 6: 3-max, широкая сетка, potential-aware 64 с точными признаками):
+1. **Мелкая глубина, 79,2 млн итераций (как у cpu0 / cpu1 раунда 6):** GPU с пачкой 4096 (сид 0), 16384 (сид 0) и 16384 (сид 1). Каждое обучение ~3 минуты.
+2. **Глубокая, 767,3 млн итераций (как у gpu16k раунда 6):** GPU с пачкой 4096 (~30 мин) и **CPU до 767 млн (~3,2 часа)**.
+3. **Шесть дуэлей по 1 млн раздач**, по две одновременно:
+   - gpu4k_79M против cpu0 и gpu16k_79M против cpu0 — равные итерации, мелко;
+   - gpu16k_79M_s1 против cpu1 — то же с другим сидом;
+   - gpu16k (раунд 6) против cpu_767M и gpu4k_767M против cpu_767M — равные итерации, глубоко;
+   - cpu_767M против cpu0 — проверка чувствительности: глубокий CPU должен заметно обыграть мелкий.
+
+**Перед запуском:** в электропитании Windows выключи сон и гибернацию на время прогона, иначе ПК уснёт посреди обучения.
+
+### R7-1. Обновить, собрать, тесты
+```powershell
+cd ..\zootop-gpu
+git fetch origin opt/gpu
+git checkout --detach origin/opt/gpu
+git log --oneline -1
+python scripts/build_fast.py --clean *> build7.log
+Select-String -Path build7.log -Pattern "negpluribus:|error|built" | Select-Object -First 20
+python -m pytest -q tests/test_flatcfr.py tests/test_batched.py *> tests_gpu7.log
+Get-Content tests_gpu7.log -Tail 3
+```
+
+### R7-2. Короткая репетиция (~5–10 минут), чтобы ночью не упасть на пустяке
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\gpu_round7.ps1 -Tiny
+Get-Content r7tiny_summary.txt
+```
+Все обучения должны дойти до `saved`, у всех 6 дуэлей должны быть строки с `vs`. Цифры репетиции ничего не значат, там крошечные обучения. Файлы репетиции лежат отдельно (`data\eq3\tiny`, `r7tiny_*`) и основному прогону не мешают.
+
+### R7-3. Основной прогон (~6 часов, ПК не трогать)
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\gpu_round7.ps1 *> round7_console.log
+Get-Content round7_progress.log
+Get-Content r7_summary.txt
+```
+Ход работы с временем каждого шага — в `round7_progress.log`, итог — в `r7_summary.txt`. Если шаг упал, в `round7_progress.log` будет `FAILED` и имя лога. Остальные шаги скрипт продолжит.
+
+### R7-4. Отчёт
+`GPU_REPORT7.md`:
+- из `round7_progress.log`: время каждого шага;
+- из `r7_summary.txt`: итерации, it/s, инфосеты каждого обучения и все строки дуэлей с `vs` дословно;
+- замечания: сбои, `FAILED`, пики памяти, если замечены.
+```powershell
+git checkout -b opt/gpu-report7
+git add -f GPU_REPORT7.md build7.log tests_gpu7.log round7_progress.log r7_summary.txt r7_train_*.log r7_duel_*.log
+git commit -m "GPU run report 7 (equal iterations)"
+git push -u origin opt/gpu-report7
+```
+Большие файлы (`data\eq3\*.bin`) **не коммить**.

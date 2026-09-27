@@ -111,6 +111,8 @@ def main() -> None:
     ap.add_argument("--prune-after", type=int, default=0, help="iterations before pruning starts")
     ap.add_argument("--gpu", type=int, default=-1,
                     help="train on this CUDA device (flat GPU trainer, needs --backend cpp and --batch; bit-identical to --batch on the CPU)")
+    ap.add_argument("--gpu-emulate", action="store_true",
+                    help="test only: the GPU trainer's kernels emulated on the CPU (same numbers as --gpu, slow)")
     ap.add_argument("--seconds", type=float, default=0.0,
                     help="train for this wall time instead of --iters (whole batches with --batch); for equal-time comparisons")
     ap.add_argument("--data-dir", default=DATA, help="where buckets / checkpoints / blueprints go (default data/)")
@@ -212,6 +214,8 @@ def main() -> None:
             if snapshot:
                 s.save(it_path(bp_path))
 
+    if args.gpu_emulate and args.gpu < 0:
+        args.gpu = 0
     if args.gpu >= 0:
         if not cpp or args.batch <= 0:
             raise SystemExit("--gpu needs --backend cpp and --batch B")
@@ -221,7 +225,10 @@ def main() -> None:
     def train_for(train_step, iteration, what: str) -> None:
         """--seconds: steps of whole batches until the wall time is used; else --iters in one call"""
         if args.seconds <= 0:
+            start = time.perf_counter()
             train_step(args.iters)
+            el = max(time.perf_counter() - start, 1e-9)
+            print(f"{what}: {iteration():,} iterations in {el:.0f}s = {iteration() / el:,.0f} it/s", flush=True)
             return
         step = max(args.batch, 1) * max(1, 262144 // max(args.batch, 1)) if args.batch > 0 else 100_000
         start = time.perf_counter()
@@ -243,8 +250,11 @@ def main() -> None:
                                      not args.no_linear, trainer.threads)
         ft.batch_size = args.batch
         ft.linear_until = args.linear_until
-        ft.use_gpu(args.gpu)
-        print(f"GPU: {ft.gpu_device}; flat game {ft.game_stats()}", flush=True)
+        if args.gpu_emulate:
+            ft.emulate_gpu = True
+        else:
+            ft.use_gpu(args.gpu)
+        print(f"GPU: {'EMULATED on the CPU' if args.gpu_emulate else ft.gpu_device}; flat game {ft.game_stats()}", flush=True)
         train_for(ft.train, lambda: ft.iteration, "GPU")
         ft.copy_to(trainer._core)  # in C++: no Python dict of the whole table
         del ft  # frees the flat tables (host and device) before the checkpoint / blueprint are written
@@ -291,7 +301,10 @@ def main() -> None:
             print(f"  saved in {time.perf_counter() - t_save:.1f}s", flush=True)
         prev = None
     else:
+        t_it = time.perf_counter()
         trainer.train(args.iters, log_every=max(1, args.iters // 10))
+        el = max(time.perf_counter() - t_it, 1e-9)
+        print(f"{'CPU' if cpp else 'trainer'}: {trainer.iteration:,} iterations in {el:.0f}s = {args.iters / el:,.0f} it/s", flush=True)
     print(f"done in {time.perf_counter() - t0:.0f}s, {len(trainer.nodes):,} infosets")
     if cpp and args.prune_below > 0:
         touched = trainer.nodes_touched
