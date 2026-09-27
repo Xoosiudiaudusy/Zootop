@@ -9,7 +9,8 @@ scripts/search_timing.py, --hands random hands each (fixed --seed).  Per search:
 bucket tables), the solve seconds, iterations per second, and a fingerprint: every float of "final", "average"
 and the likelihood() of both seats, as hex.  With --threads 1 and a fixed seed the search is deterministic, so
 two builds with the same logic give the same fingerprints; --compare reports the first difference.
-A warm-up search per hand runs first (bucket caches), so the timed searches measure the solver.
+A warm-up search per hand runs first (bucket caches), so the timed searches measure the solver; --cold skips it, and
+"solve" then includes the bucket work of a new board (every hand has one), as in play.
 """
 from __future__ import annotations
 
@@ -62,6 +63,7 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--spots", default="", help="comma-separated prefixes of spot names")
     ap.add_argument("--depth", default="pluribus")
+    ap.add_argument("--cold", action="store_true", help="no warm-up search: the timed search pays the board's bucket work, as in play")
     ap.add_argument("--out", default=None, help="write the fingerprints (JSON)")
     ap.add_argument("--compare", default=None, help="fingerprints of another build to compare with")
     args = ap.parse_args()
@@ -103,7 +105,8 @@ def main() -> int:
                 r = s.solve()
                 return s, r, tb
 
-            run(12345)  # warm-up: bucket caches of this board
+            if not args.cold:
+                run(12345)  # warm-up: bucket caches of this board
             s, r, tb = run(7)
             key = f"{spot} #{h}"
             fp = {"final": hexes(r["final"]), "average": hexes(r["average"]), "iterations": r["iterations"],
