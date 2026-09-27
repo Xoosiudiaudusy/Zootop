@@ -210,10 +210,14 @@ class PotentialAwareBucketer:
 
     kind = "potential"
 
-    def __init__(self, n_buckets: int = 8, samples: int = 100, bins: int = 10):
+    def __init__(self, n_buckets: int = 8, samples: int = 100, bins: int = 10, exact: bool = False):
         self.n_buckets = n_buckets
         self.samples = samples  # Monte-Carlo runouts per next-street card (flop / turn features)
         self.bins = bins
+        # exact: flop / turn features by exact enumeration (every river card and opponent hole; C++
+        # core required) instead of `samples` Monte-Carlo runouts per next card; a different bucketer
+        # (its own fingerprint), `samples` unused.  False: nothing changes.
+        self.exact = bool(exact)
         self.centroids: Dict[int, List[List[float]]] = {}  # street -> n_buckets CDFs (ordered by strength)
         self.centroid_mean_equity: Dict[int, List[float]] = {}  # informational: mean E[HS] of each cluster
         self.centroid_share: Dict[int, List[float]] = {}  # informational: share of fit situations per cluster
@@ -228,10 +232,37 @@ class PotentialAwareBucketer:
         key = canonical_key(hole, board)
         f = self._features.get(key)
         if f is None:
-            counts, mean = next_street_histogram(key[:2], key[3:], self.samples, self.bins)
+            counts, mean = self._histogram(key[:2], key[3:])
             f = (histogram_cdf(counts), mean)
             self._features[key] = f
         return f
+
+    def _histogram(self, hole: Sequence[int], board: Sequence[int]) -> Tuple[List[int], float]:
+        if not self.exact:
+            return next_street_histogram(hole, board, self.samples, self.bins)
+        from .. import fast
+
+        c = fast.core()
+        if c is None or not hasattr(c, "exact_feature"):
+            raise RuntimeError("exact potential-aware features need the C++ core (python scripts/build_fast.py)")
+        counts, mean = c.exact_feature(list(hole), list(board), self.bins)
+        return list(counts), mean
+
+    def _precompute_exact(self, situations: List[List[int]]) -> None:
+        """Exact features of many fit situations at once (C++, all cores) into the feature cache."""
+        from .. import fast
+
+        c = fast.core()
+        if c is None or not hasattr(c, "exact_feature_many"):
+            raise RuntimeError("exact potential-aware features need the C++ core (python scripts/build_fast.py)")
+        keys = [canonical_key(cards[:2], cards[2:]) for cards in situations]
+        todo = sorted({k for k in keys if k not in self._features})
+        if not todo:
+            return
+        hands = [list(k[:2]) + list(k[3:]) for k in todo]
+        res = c.exact_feature_many(hands, len(todo[0]) - 3, self.bins, fast.default_threads())
+        for k, (counts, mean) in zip(todo, res):
+            self._features[k] = (histogram_cdf(counts), mean)
 
     def river_ehs(self, hole: Sequence[int], board: Sequence[int]) -> float:
         key = canonical_key(hole, board)
@@ -252,6 +283,8 @@ class PotentialAwareBucketer:
                     cuts = " ".join(f"{c:.2f}" for c in self.boundaries[int(street)])
                     print(f"  {street.name.lower():>5}: exact equity, cuts at {cuts}")
                 continue
+            if self.exact:
+                self._precompute_exact(situations)
             feats = [self.feature(cards[:2], cards[2:]) for cards in situations]
             cdfs = [f[0] for f in feats]
             means = [f[1] for f in feats]
@@ -304,7 +337,7 @@ class PotentialAwareBucketer:
         centroids = self.centroids.get(int(street))
         if centroids is None:
             raise RuntimeError("bucketer not fitted; call fit() or load()")
-        counts, _ = next_street_histogram(hole, board, self.samples, self.bins)
+        counts, _ = self._histogram(hole, board)
         return nearest_centroid(histogram_cdf(counts), centroids)
 
     def n_buckets_for(self, street: Street) -> int:
@@ -325,13 +358,14 @@ class PotentialAwareBucketer:
             "centroid_mean_equity": {str(k): v for k, v in self.centroid_mean_equity.items()},
             "centroid_share": {str(k): v for k, v in self.centroid_share.items()},
             "boundaries": {str(k): v for k, v in self.boundaries.items()},
+            **({"exact": True} if self.exact else {}),  # absent for Monte-Carlo features: old files unchanged
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "PotentialAwareBucketer":
         if d.get("kind") != cls.kind:
             raise ValueError(f"not a potential-aware bucketer file (kind={d.get('kind', 'ehs')!r}); use load_bucketer()")
-        b = cls(d["n_buckets"], d["samples"], d["bins"])
+        b = cls(d["n_buckets"], d["samples"], d["bins"], exact=bool(d.get("exact", False)))
         b.centroids = {int(k): [list(c) for c in v] for k, v in d["centroids"].items()}
         b.centroid_mean_equity = {int(k): list(v) for k, v in d.get("centroid_mean_equity", {}).items()}
         b.centroid_share = {int(k): list(v) for k, v in d.get("centroid_share", {}).items()}

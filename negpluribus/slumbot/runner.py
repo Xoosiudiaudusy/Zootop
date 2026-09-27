@@ -62,6 +62,9 @@ class Tally:
     n_decisions: int = 0
     n_blueprint_decisions: int = 0
     n_off_map: int = 0
+    n_searched: int = 0          # decisions of the search agent made by a search
+    search_seconds: float = 0.0
+    n_search_agent: int = 0      # decisions reported by the search agent (all of them say off_map)
     n_bot_bets: int = 0
     n_bot_bets_off_grid: int = 0
     wall: List[float] = field(default_factory=list)
@@ -90,7 +93,13 @@ class Tally:
             self.n_errors += 1
         for d in rec.get("decisions") or []:
             self.n_decisions += 1
-            if "off_map" in d:  # only blueprint decisions say whether they were on the map
+            if "played" in d:  # the search agent: every decision says how it was made
+                self.n_search_agent += 1
+                self.n_off_map += int(bool(d.get("off_map")))
+                if d["played"] == "search":
+                    self.n_searched += 1
+                    self.search_seconds += float(d.get("search_s") or 0.0)
+            elif "off_map" in d:  # only blueprint decisions say whether they were on the map
                 self.n_blueprint_decisions += 1
                 self.n_off_map += int(bool(d["off_map"]))
         # Slumbot's bets once per hand: our last decision lists all of them (every bet or raise
@@ -127,7 +136,11 @@ class Tally:
         if self.gap_hands:
             lines.append(f"hands Slumbot counted without a result on our side: {self.gap_hands}, "
                          f"{self.gap_chips:+d} chips for us (not in the bb/100 above)")
-        if self.n_blueprint_decisions:
+        if self.n_search_agent:
+            mean = self.search_seconds / self.n_searched if self.n_searched else 0.0
+            lines.append(f"our decisions: {self.n_decisions}, searched {self.n_searched} (mean {mean:.2f}s), off-map "
+                         f"{self.n_off_map} ({self.n_off_map / self.n_search_agent:.1%} of {self.n_search_agent} decisions)")
+        elif self.n_blueprint_decisions:
             lines.append(f"our decisions: {self.n_decisions}, off-map {self.n_off_map} "
                          f"({self.n_off_map / self.n_blueprint_decisions:.1%} of {self.n_blueprint_decisions} blueprint lookups)")
         elif self.n_decisions:

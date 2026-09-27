@@ -13,3 +13,9 @@ negpluribus/buckets_ehs10.json
 negpluribus/buckets_pot10.json
 *.pyd
 *.so
+tools/
+
+# web table (webapp/): runtime files and this machine's bots
+webapp/server.pid
+webapp/bots.local.json
+webapp/blueprints/

@@ -230,23 +230,36 @@ class DecisionExplainer:
     nothing in the agent changes), so the log shows the exact infoset key the agent looked up,
     its legal abstract actions and probabilities, whether it was off-map (key never seen in
     training -> the agent's check/call fallback), which abstract action the concrete move is,
-    and how every Slumbot bet was translated.  Other agents get only the concrete move."""
+    and how every Slumbot bet was translated.  An agent with a ``decision_info()`` method (the
+    search agent) reports its own decision (searched or not, its strategy, its effort, off-map), and
+    Slumbot's bets are listed with the grid's deterministic reading.  Other agents get only the
+    concrete move."""
 
     def __init__(self, agent: Agent):
         self.agent = agent
         self.proxy: Optional[_RecordingStrategy] = None
+        self.info: Optional[Callable[[], dict]] = None
         if isinstance(agent, BlueprintAgent):
             if isinstance(agent.strategy, _RecordingStrategy):
                 self.proxy = agent.strategy
             else:
                 self.proxy = _RecordingStrategy(agent.strategy)
                 agent.strategy = self.proxy
+        elif callable(getattr(agent, "decision_info", None)):
+            self.info = agent.decision_info  # type: ignore[attr-defined]
 
     def before_act(self) -> None:
         if self.proxy is not None:
             self.proxy.last = None
 
     def explain(self, obs: Observation, action: Action, hero: int) -> dict:
+        if self.info is not None:
+            out = dict(self.info())
+            grid: Optional[BetGrid] = getattr(self.agent, "grid", None)
+            if grid is not None:
+                names = [grid.from_concrete(ev, ev.all_in, None) for ev in obs.events]
+                out["translations"] = translations(obs.events, names, hero)
+            return out
         if self.proxy is None or self.proxy.last is None:
             return {}
         key, legal, probs = self.proxy.last

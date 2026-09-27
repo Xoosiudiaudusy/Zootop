@@ -6,6 +6,12 @@
     # dry run against the local mock server (nothing leaves the machine)
     python scripts/play_slumbot.py --blueprint ... --buckets ... --hands 200 --mock random
 
+    # the real-time search agent (the blueprint preflop, a C++ subgame search at every decision
+    # from the flop; docs/search_core.md part 3): its own log, the bucket cache, a budget
+    python scripts/play_slumbot.py --agent search --blueprint data/blueprint_hunl200w3_pot16_s0.bin \
+        --buckets data/buckets_hunl200w3_pot16_s0.json --cache data/bucketcache_hunl200w3_pot16_s0.bin \
+        --preflop-fracs 0.5,1.0,3.0 --search-budget 2 --hands 1000 --log data/slumbot/search_hunl200w3.jsonl
+
 Every hand is one JSON line in --log (format in docs/slumbot.md); a running bb/100 with its 95%
 confidence interval is printed after each hand.  Re-running with the same --log resumes: the old
 hands count, new ones are appended (--hands N plays N more; --until N stops once the log holds N
@@ -29,6 +35,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from negpluribus.abstraction import bucketer_kind, load_bucketer  # noqa: E402
 from negpluribus.agents import CallingAgent, GridRandomAgent, RandomAgent, make_agent  # noqa: E402
 from negpluribus.agents.blueprint import BlueprintAgent  # noqa: E402
+from negpluribus.agents.core_search import CoreSearchAgent, SearchResources, add_search_args, search_config_from_args  # noqa: E402
 from negpluribus.cfr import GameSpec  # noqa: E402
 from negpluribus.engine import Street  # noqa: E402
 from negpluribus.fast.blueprint import load_blueprint  # noqa: E402
@@ -43,7 +50,9 @@ def fracs(s: str):
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--agent", default="blueprint", help="blueprint (default), or caller / gridrandom / random for plumbing tests")
+    ap.add_argument("--agent", default="blueprint", choices=("blueprint", "search", "caller", "gridrandom", "random"),
+                    help="blueprint (default); search (the real-time search agent: --search-* flags); "
+                         "caller / gridrandom / random for plumbing tests")
     ap.add_argument("--blueprint", help="average strategy from scripts/train_blueprint.py (.bin or .json; looked up in C++ when the core is built)")
     ap.add_argument("--buckets", help="the bucketer JSON the blueprint was trained with")
     ap.add_argument("--preflop-fracs", default="1.0,3.0")
@@ -63,15 +72,16 @@ def main() -> int:
                          "(random, caller, gridrandom or an archetype: nit, tag, lag, station, maniac, ...)")
     ap.add_argument("--mock-seed", type=int, default=0)
     ap.add_argument("--trace", action="store_true", help="also log every raw server response of each hand (token removed)")
+    add_search_args(ap)
     args = ap.parse_args()
 
     spec = None
     meta = {"argv": sys.argv[1:]}
     grid = GameSpec(preflop_fracs=fracs(args.preflop_fracs), postflop_fracs=fracs(args.postflop_fracs),
                     max_raises_per_street=args.max_raises).grid
-    if args.agent == "blueprint":
+    if args.agent in ("blueprint", "search"):
         if not (args.blueprint and args.buckets):
-            ap.error("--agent blueprint needs --blueprint and --buckets")
+            ap.error(f"--agent {args.agent} needs --blueprint and --buckets")
         bk = load_bucketer(args.buckets)
         spec = GameSpec(
             n_players=2, stack_bb=STACK_SIZE // BIG_BLIND, sb=SMALL_BLIND, bb=BIG_BLIND, max_street=Street.RIVER,
@@ -79,9 +89,20 @@ def main() -> int:
             max_raises_per_street=args.max_raises, n_buckets=bk.n_buckets, bucket_kind=bucketer_kind(bk),
         )
         t = time.perf_counter()
-        bp = load_blueprint(args.blueprint)
         name = os.path.splitext(os.path.basename(args.blueprint))[0]
-        agent = BlueprintAgent(bp, bk, spec.grid, name=name, seed=args.seed)
+        if args.agent == "search":
+            res = SearchResources.load(spec, args.blueprint, bucketer=bk, cache_path=args.cache,
+                                       presample_seed=args.seed if args.presample else None)
+            bp = res.blueprint
+            cfg = search_config_from_args(args)
+            name = f"search_{name}"
+            agent = CoreSearchAgent(res, cfg, name=name, seed=args.seed)
+            print(f"search agent: {cfg}")
+            print(f"bucket cache: {res.cache_loaded if args.cache else 'none (the first searches on a board compute buckets)'}")
+            meta.update(search=vars(cfg), cache=args.cache)
+        else:
+            bp = load_blueprint(args.blueprint)
+            agent = BlueprintAgent(bp, bk, spec.grid, name=name, seed=args.seed)
         print(f"game: {spec.describe()}")
         print(f"blueprint: {len(bp):,} infosets from {args.blueprint} ({time.perf_counter() - t:.1f}s)")
         meta.update(blueprint=args.blueprint, buckets=args.buckets, game=spec.describe())
@@ -110,6 +131,8 @@ def main() -> int:
         return 130
     print()
     print(tally.summary())
+    if isinstance(agent, CoreSearchAgent):
+        print(f"search agent (this run): {agent.stats.summary()}")
     print(f"requests: {client.n_requests} ({client.n_retries} retries, {client.n_token_changes} token changes)")
     return 0
 

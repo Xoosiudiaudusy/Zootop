@@ -42,6 +42,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
@@ -98,6 +99,7 @@ struct Node {
     uint8_t acts[MAX_ACTIONS];
     SpinLock lock;
     uint8_t key_in_tree = 0;    // 1: `key` is a HistNode*, the string is spelled from it
+    uint8_t has_tw = 0;         // 1: data[2n] holds the traverser weight (relative pruning, mccfr.h)
     uint16_t key_bucket = 0;    // bucket of a tree-referenced key
     long long visits = 0;
     uint64_t k2 = 0;            // NodeKey::k2 of the node (set before it is published)
@@ -129,8 +131,11 @@ struct Node {
     const double* regret() const { return data; }
     double* strategy_sum() { return data + n; }
     const double* strategy_sum() const { return data + n; }
+    // sum of the iteration weights of the traverser's visits (only when has_tw: allocated with extra 1)
+    double* tw() { return data + 2 * n; }
 
     // bytes of a node with k actions (the struct up to data, then 2k doubles)
+    static size_t bytes_for(int k, int extra) { return bytes_for(k) + sizeof(double) * (size_t)extra; }
     static size_t bytes_for(int k) {
         static const size_t head = [] {
             Node probe;
@@ -317,8 +322,8 @@ public:
     static constexpr size_t CHARS_PER_CHUNK = 64 * 1024;
 
     // a node with room for exactly `k` actions (not initialised beyond the header defaults)
-    Node* new_node(int k) {
-        const size_t need = (Node::bytes_for(k) + 7) & ~(size_t)7;
+    Node* new_node(int k, int extra = 0) {
+        const size_t need = (Node::bytes_for(k, extra) + 7) & ~(size_t)7;
         if (need > node_left_) {
             node_chunks_.emplace_back(new uint64_t[BYTES_PER_CHUNK / 8]);
             node_next_ = reinterpret_cast<char*>(node_chunks_.back().get());
@@ -455,6 +460,11 @@ public:
     // starts over; nothing is claimed while it waits.
     template <class Init>
     Found get_or_create(const NodeKey& k, int arena, int n_actions, Init&& init) {
+        return get_or_create(k, arena, n_actions, 0, std::forward<Init>(init));
+    }
+    // the same, with room for `extra` doubles after the node's 2 * n_actions (Node::tw)
+    template <class Init>
+    Found get_or_create(const NodeKey& k, int arena, int n_actions, int extra, Init&& init) {
         Node* prepared = nullptr;
         const char* prepared_key = nullptr;
         for (;;) {
@@ -469,7 +479,7 @@ public:
                 if (p == nullptr) {
                     if (!prepared) {
                         NodeArena& a = *arenas_[arena];
-                        prepared = a.new_node(n_actions);
+                        prepared = a.new_node(n_actions, extra);
                         prepared_key = init(*prepared, a);
                         if (prepared->n != n_actions) throw std::logic_error("node initialised with another action count");
                         prepared->k2 = k.k2;

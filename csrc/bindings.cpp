@@ -2,12 +2,14 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <exception>
 #include <memory>
-#include <thread>
 #include <string>
+#include <thread>
+#include <tuple>
 #include <vector>
 
 #include "abstraction.h"
@@ -15,6 +17,7 @@
 #include "engine.h"
 #include "equity.h"
 #include "evaluator.h"
+#include "exactfeat.h"
 #include "handindex.h"
 #include "mccfr.h"
 #include "persist.h"
@@ -585,6 +588,8 @@ struct Hand {
     }
 };
 
+#include "aivat_bindings.h"  // AIVAT evaluator (csrc/aivat.h); registered at the end of the module
+
 // ------------------------------------------------------------------ module
 PYBIND11_MODULE(_fastcore, m) {
     m.doc() = "NegativePluribus C++ core: evaluator, equity, engine, abstraction, MCCFR";
@@ -616,6 +621,67 @@ PYBIND11_MODULE(_fastcore, m) {
         }
         return py::make_tuple(eq, state_to_py(rng));
     }, "equity_vs_random driven by a random.Random state; returns (equity, new_state)");
+
+    m.def("equity_vs_hand", [](const py::sequence& hole, const py::sequence& opp, const py::sequence& board, int threads) {
+        std::vector<int> h = to_cards(hole), o = to_cards(opp), b = to_cards(board);
+        if (h.size() != 2 || o.size() != 2 || b.size() > 5 || b.size() == 1 || b.size() == 2)
+            throw std::invalid_argument("equity_vs_hand: two holes of 2 cards and a board of 0, 3, 4 or 5 cards");
+        uint64_t used = 0;
+        for (const std::vector<int>* v : {&h, &o, &b})
+            for (int c : *v) {
+                if (c < 0 || c > 51 || (used >> c & 1)) throw std::invalid_argument("equity_vs_hand: distinct cards 0..51");
+                used |= 1ULL << c;
+            }
+        py::gil_scoped_release nogil;
+        // every completion of the board, exactly: wins + ties / 2 over the runouts; the runouts are
+        // split by their first card among the threads, each thread's count exact (integers in
+        // halves), so the result does not depend on the thread count
+        std::vector<int> rest;
+        for (int c = 0; c < 52; c++) if (!(used >> c & 1)) rest.push_back(c);
+        const int need = 5 - (int)b.size(), n = (int)rest.size();
+        if (need == 0) {
+            int ch[7] = {h[0], h[1], b[0], b[1], b[2], b[3], b[4]}, co[7] = {o[0], o[1], b[0], b[1], b[2], b[3], b[4]};
+            const int64_t a = evaluate(ch, 7), c2 = evaluate(co, 7);
+            return a > c2 ? 1.0 : a == c2 ? 0.5 : 0.0;
+        }
+        std::vector<long long> twice_won((size_t)n, 0), runs((size_t)n, 0);  // per first card
+        auto work = [&](int first) {
+            int ch[7], co[7];
+            for (int i = 0; i < (int)b.size(); i++) ch[2 + i] = co[2 + i] = b[(size_t)i];
+            ch[0] = h[0]; ch[1] = h[1]; co[0] = o[0]; co[1] = o[1];
+            int idx[5] = {first, first + 1, first + 2, first + 3, first + 4};
+            if (first > n - need) return;
+            long long w2 = 0, r = 0;
+            for (;;) {
+                for (int k = 0; k < need; k++) ch[7 - need + k] = co[7 - need + k] = rest[(size_t)idx[k]];
+                const int64_t a = evaluate(ch, 7), c2 = evaluate(co, 7);
+                w2 += a > c2 ? 2 : a == c2 ? 1 : 0;
+                r++;
+                int k = need - 1;  // next combination of `need` cards among `rest`, first card fixed
+                while (k >= 1 && idx[k] == n - need + k) k--;
+                if (k < 1) break;
+                idx[k]++;
+                for (int j = k + 1; j < need; j++) idx[j] = idx[j - 1] + 1;
+            }
+            twice_won[(size_t)first] = w2;
+            runs[(size_t)first] = r;
+        };
+        const int T = std::max(1, std::min(threads, n));
+        if (T == 1 || need == 1) {
+            for (int f = 0; f < n; f++) work(f);
+        } else {
+            std::atomic<int> next{0};
+            std::vector<std::thread> pool;
+            for (int t = 0; t < T; t++)
+                pool.emplace_back([&]() { for (int f = next.fetch_add(1); f < n; f = next.fetch_add(1)) work(f); });
+            for (auto& th : pool) th.join();
+        }
+        long long w2 = 0, r = 0;
+        for (int f = 0; f < n; f++) { w2 += twice_won[(size_t)f]; r += runs[(size_t)f]; }
+        return 0.5 * (double)w2 / (double)r;
+    }, py::arg("hole"), py::arg("opp"), py::arg("board"), py::arg("threads") = 1,
+       "exact equity of `hole` against the known `opp` over every completion of the board (0, 3, 4 or 5 cards); "
+       "`threads` for the preflop enumeration (the result does not depend on it)");
 
     m.def("equity_vs_random_seeded", [](const py::sequence& hole, const py::sequence& board, int n_opp, int samples, uint64_t seed) {
         std::vector<int> h = to_cards(hole), b = to_cards(board);
@@ -724,6 +790,128 @@ PYBIND11_MODULE(_fastcore, m) {
         return py::make_tuple(std::vector<int>(counts, counts + bins), mean);
     }, "next-street E[HS] histogram (counts over `bins`, mean equity) as abstraction/potential.py computes it");
 
+    // ---- exact potential-aware features (exactfeat.h)
+    m.def("exact_feature", [](const py::sequence& hole, const py::sequence& board, int bins) {
+        std::vector<int> h = to_cards(hole), bd = to_cards(board);
+        if (h.size() != 2 || bd.size() < 3 || bd.size() > 4) throw std::invalid_argument("2 hole cards and a 3..4 card board");
+        if (bins < 1 || bins > 64) throw std::invalid_argument("bins 1..64");
+        int counts[64];
+        double mean;
+        {
+            py::gil_scoped_release nogil;
+            exact_feature(h.data(), bd.data(), (int)bd.size(), bins, counts, mean);
+        }
+        return py::make_tuple(std::vector<int>(counts, counts + bins), mean);
+    }, "exact next-street equity histogram (counts, mean) of one hand, by the definition");
+    m.def("exact_feature_many", [](const std::vector<std::vector<int>>& hands, int n_board, int bins, int threads) {
+        // hands: [h0, h1, board...]; returns [(counts, mean)] in the same order
+        std::vector<std::vector<int>> counts(hands.size(), std::vector<int>(bins));
+        std::vector<double> means(hands.size());
+        {
+            py::gil_scoped_release nogil;
+            std::atomic<size_t> next{0};
+            auto work = [&]() {
+                for (size_t i = next.fetch_add(1); i < hands.size(); i = next.fetch_add(1))
+                    exact_feature(hands[i].data(), hands[i].data() + 2, n_board, bins, counts[i].data(), means[i]);
+            };
+            std::vector<std::thread> pool;
+            for (int t = 1; t < std::max(1, threads); t++) pool.emplace_back(work);
+            work();
+            for (auto& th : pool) th.join();
+        }
+        py::list out;
+        for (size_t i = 0; i < hands.size(); i++) out.append(py::make_tuple(counts[i], means[i]));
+        return out;
+    }, py::arg("hands"), py::arg("n_board"), py::arg("bins"), py::arg("threads") = 1,
+       "exact features of many hands ([h0, h1, board...] each, one board size), multithreaded");
+    m.def("exact_feature_batch", [](const py::sequence& board, int bins) {
+        std::vector<int> bd = to_cards(board);
+        if (bd.size() < 3 || bd.size() > 4) throw std::invalid_argument("a 3..4 card board");
+        py::dict out;
+        std::vector<std::tuple<int, int, std::vector<int>, double>> rows;
+        {
+            py::gil_scoped_release nogil;
+            ExactFeatureBatch batch(bins);
+            batch.compute(bd.data(), (int)bd.size());
+            bool on[52] = {false};
+            for (int c : bd) on[c] = true;
+            int counts[64];
+            for (int a = 0; a < 52; a++)
+                for (int b = a + 1; b < 52; b++) {
+                    if (on[a] || on[b]) continue;
+                    double m;
+                    batch.feature(a, b, counts, m);
+                    rows.emplace_back(a, b, std::vector<int>(counts, counts + bins), m);
+                }
+        }
+        for (auto& r : rows) out[py::make_tuple(std::get<0>(r), std::get<1>(r))] = py::make_tuple(std::get<2>(r), std::get<3>(r));
+        return out;
+    }, "exact features of every hole of one board: {(a, b): (counts, mean)}");
+    m.def("build_exact_features", [](int n_board, int bins, int threads, const std::string& path) {
+        ExactFeatureTable t;
+        {
+            py::gil_scoped_release nogil;
+            build_exact_features(n_board, bins, threads, t);
+            if (!path.empty()) {
+                FILE* f = open_file(path, "wb");
+                if (!f) throw std::runtime_error("cannot write " + path);
+                const uint64_t n = t.mean.size();
+                std::fwrite("NPXF", 1, 4, f);
+                const int32_t hdr[2] = {t.n_board, t.bins};
+                std::fwrite(hdr, sizeof hdr, 1, f);
+                std::fwrite(&n, 8, 1, f);
+                std::fwrite(t.counts.data(), 1, t.counts.size(), f);
+                std::fwrite(t.mean.data(), 8, t.mean.size(), f);
+                std::fclose(f);
+            }
+        }
+        py::dict d;
+        d["classes"] = (unsigned long long)t.mean.size();
+        return d;
+    }, py::arg("n_board"), py::arg("bins"), py::arg("threads"), py::arg("path") = "",
+       "exact features of every flop / turn class; optionally saved: NPXF, n_board, bins, n, counts[n][bins] u8, mean[n] f64");
+
+    m.def("count_betting_tree", [](const py::dict& spec_d, long long limit) {
+        // size of the abstract betting tree (button 0): decision histories and actions per street,
+        // terminals; stops after `limit` decision histories (then "complete" is False)
+        Spec spec = spec_from_dict(spec_d);
+        BetGrid grid = spec.grid();
+        int deck[52];
+        for (int i = 0; i < 52; i++) deck[i] = i;
+        long long dec[4] = {0, 0, 0, 0}, acts[4] = {0, 0, 0, 0}, term = 0, total = 0;
+        bool complete = true;
+        {
+            py::gil_scoped_release nogil;
+            std::vector<HandState> stack;
+            stack.emplace_back(spec.stacks(), 0, spec.sb, spec.bb, spec.ante, deck, spec.max_street);
+            while (!stack.empty()) {
+                HandState st = stack.back();
+                stack.pop_back();
+                if (st.terminal) { term++; continue; }
+                if (total >= limit) { complete = false; break; }
+                Obs obs = observe(st, st.to_act);
+                ActionList al;
+                grid.abstract_actions(obs, al);
+                dec[obs.street]++;
+                acts[obs.street] += al.n;
+                total++;
+                for (int i = 0; i < al.n; i++) {
+                    HandState c(st);
+                    int type, amount;
+                    grid.to_concrete(obs, al.a[i], type, amount);
+                    c.apply(type, amount);
+                    stack.push_back(c);
+                }
+            }
+        }
+        py::dict d;
+        d["decisions"] = std::vector<long long>(dec, dec + 4);
+        d["actions"] = std::vector<long long>(acts, acts + 4);
+        d["terminals"] = term;
+        d["complete"] = complete;
+        return d;
+    }, py::arg("spec"), py::arg("limit") = 200000000LL);
+
     m.def("river_equity_exact", [](const py::sequence& hole, const py::sequence& board) {
         std::vector<int> h = to_cards(hole), bd = to_cards(board);
         if (h.size() != 2 || bd.size() != 5) throw std::invalid_argument("river_equity_exact expects 2 hole cards and a 5-card board");
@@ -779,8 +967,10 @@ PYBIND11_MODULE(_fastcore, m) {
         }, "kind, n_buckets, samples, bins and the fingerprint of the fitted parameters");
 
     py::class_<PotentialBucketer, Bucketer, std::shared_ptr<PotentialBucketer>>(m, "PotentialBucketer")
-        .def(py::init([](int n_buckets, int samples, int bins, const py::dict& centroids, const py::dict& boundaries, const py::object& cache_caps) {
+        .def(py::init([](int n_buckets, int samples, int bins, const py::dict& centroids, const py::dict& boundaries, const py::object& cache_caps,
+                         bool exact) {
             auto b = std::make_shared<PotentialBucketer>(n_buckets, samples, bins);
+            b->exact = exact;
             b->set_cache_caps(caps_from_py(cache_caps));
             for (auto kv : centroids) {
                 int street = kv.first.cast<int>();
@@ -795,7 +985,9 @@ PYBIND11_MODULE(_fastcore, m) {
                 b->boundaries[street] = kv.second.cast<std::vector<double>>();
             }
             return b;
-        }), py::arg("n_buckets"), py::arg("samples"), py::arg("bins"), py::arg("centroids"), py::arg("boundaries"), py::arg("cache_caps") = py::none())
+        }), py::arg("n_buckets"), py::arg("samples"), py::arg("bins"), py::arg("centroids"), py::arg("boundaries"), py::arg("cache_caps") = py::none(),
+            py::arg("exact") = false)
+        .def_property_readonly("exact", [](const PotentialBucketer& b) { return b.exact; })
         .def("feature", [](const PotentialBucketer& b, const py::sequence& hole, const py::sequence& board) {
             std::vector<int> h = to_cards(hole), bd = to_cards(board);
             if (h.size() != 2 || bd.size() < 3 || bd.size() > 4) throw std::invalid_argument("feature expects 2 hole cards and a 3..4 card board");
@@ -883,6 +1075,11 @@ PYBIND11_MODULE(_fastcore, m) {
             if (err) std::rethrow_exception(err);
         }, py::arg("bucketer"), py::arg("street"), py::arg("threads") = 1, py::arg("progress") = py::none(), py::arg("every") = 10.0,
            "tabulate one street (1 flop, 2 turn, 3 river) of a fitted core bucketer")
+        .def("build_from_features", [](BucketTables& t, const Bucketer& bk, int street, const std::string& path, int threads) {
+            py::gil_scoped_release nogil;
+            t.build_from_features(bk, street, path, threads);
+        }, py::arg("bucketer"), py::arg("street"), py::arg("path"), py::arg("threads") = 1,
+           "flop / turn of an exact potential-aware bucketer from a feature file (core.build_exact_features)")
         .def("has", &BucketTables::has)
         .def("size", &BucketTables::size)
         .def("lookup", [](const BucketTables& t, const py::sequence& hole, const py::sequence& board) {
@@ -1016,6 +1213,30 @@ PYBIND11_MODULE(_fastcore, m) {
         .def_property_readonly("action_names", [](const Trainer& t) { return t.grid.names; })
         .def_property_readonly("cache_size", [](const Trainer& t) { return t.bucketer->cache_size(); })
         .def("cache_stats", [](const Trainer& t) { return cache_stats_dict(*t.bucketer); })
+        .def("set_pruning", [](Trainer& t, double below, double prob, long long after, bool last_street, bool relative, bool scale_t,
+                               double floor) {
+            ApiLock lk(t.api_mu);
+            if (relative && scale_t) throw std::invalid_argument("pruning: relative and scale_t exclude each other");
+            if (floor != 0.0 && floor < 1.0) throw std::invalid_argument("pruning: the floor factor is >= 1 (x the threshold) or 0");
+            t.prune_scale_t = scale_t;
+            t.regret_floor = floor;
+            if (below < 0 || prob < 0 || prob > 1 || after < 0) throw std::invalid_argument("pruning: below >= 0, 0 <= prob <= 1, after >= 0");
+            t.prune_below = below;
+            t.prune_relative = relative;
+            t.prune_prob = prob;
+            t.prune_after = after;
+            t.prune_last_street = last_street;
+        }, py::arg("below"), py::arg("prob") = 0.95, py::arg("after") = 0, py::arg("last_street") = false, py::arg("relative") = false,
+           py::arg("scale_t") = false, py::arg("floor") = 0.0,
+           "regret-based pruning (Pluribus): skip actions with regret < -below (stored units), or with relative=True below "
+           "-below bb per unit of the node's own traverser weight; below = 0 turns it off")
+        .def_property_readonly("pruned_actions", &Trainer::pruned_actions)
+        .def_property("linear_until", [](const Trainer& t) { return t.linear_until; },
+                      [](Trainer& t, long long v) {
+                          ApiLock lk(t.api_mu);
+                          if (v < 0) throw std::invalid_argument("linear_until >= 0");
+                          t.linear_until = v;
+                      }, "> 0: Linear CFR weights stop growing after this iteration (Pluribus-style schedule); 0: always linear")
         .def("table_stats", [](Trainer& t) {
             ApiLock lk(t.api_mu);
             py::dict d = table_stats_dict(t.nodes);
@@ -1406,7 +1627,7 @@ PYBIND11_MODULE(_fastcore, m) {
         }, py::arg("combo"), "the combo's lossless class on the root's round (its infoset there); -1 if it meets the board")
         .def("set_reach", &SubgameSearch::set_reach, py::arg("seat"), py::arg("weights"),
              "replace a live seat's range (1326 weights)")
-        .def("likelihood", [](const SubgameSearch& s, int seat, const py::object& actions) {
+        .def("likelihood", [](const SubgameSearch& s, int seat, const py::object& actions, double floor) {
             std::vector<std::pair<int, int>> acts;
             if (actions.is_none()) {
                 for (const PathStep& p : s.path()) acts.emplace_back(p.type, p.amount);
@@ -1414,10 +1635,11 @@ PYBIND11_MODULE(_fastcore, m) {
                 acts = actions.cast<std::vector<std::pair<int, int>>>();
             }
             long long missing = 0;
-            std::vector<double> w = s.likelihood(seat, acts, missing);
+            std::vector<double> w = s.likelihood(seat, acts, missing, floor);
             return py::make_tuple(w, missing);
-        }, py::arg("seat"), py::arg("actions") = py::none(),
-           "(1326 likelihoods of `seat`'s round actions under the average strategy, missing lookups)")
+        }, py::arg("seat"), py::arg("actions") = py::none(), py::arg("floor") = 0.0,
+           "(1326 likelihoods of `seat`'s round actions under the average strategy, missing lookups); each factor at "
+           "least `floor`")
         .def("_probe_path", [](const SubgameSearch& s, int k, int h0, int h1) -> py::object {
             std::vector<double> v = s.probe_path(k, h0, h1);
             if (v.empty()) return py::none();
@@ -1523,4 +1745,6 @@ PYBIND11_MODULE(_fastcore, m) {
             return s.sample_deals(n, focused, seed);
         }, py::arg("n"), py::arg("focused") = false, py::arg("seed") = 1,
            "tests: deals as the solver draws them: 2 cards per seat (in seat order), then the rest of the board");
+
+    register_aivat(m);
 }

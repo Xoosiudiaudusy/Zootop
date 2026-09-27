@@ -36,6 +36,7 @@ class GameSpec:
     n_buckets: int = 8
     forbid_open_limp: bool = False  # True + preflop_fracs=() = pure push/fold (the HRC game)
     bucket_kind: str = "ehs"  # "ehs" (EquityBucketer) or "potential" (PotentialAwareBucketer)
+    exact_features: bool = False  # potential only: exact flop / turn features instead of Monte-Carlo
 
     def __post_init__(self) -> None:
         if self.bucket_kind not in BUCKET_KINDS:
@@ -67,6 +68,10 @@ class GameSpec:
     def make_bucketer(self, samples: Optional[int] = None) -> EquityBucketer:
         """An unfitted bucketer of ``bucket_kind`` (``samples``: 150 for E[HS], 100 runouts per
         next-street card for potential-aware, when not given)."""
+        if self.exact_features:
+            if self.bucket_kind != "potential":
+                raise ValueError("exact_features needs bucket_kind='potential'")
+            return make_bucketer(self.bucket_kind, self.n_buckets, samples, exact=True)
         return make_bucketer(self.bucket_kind, self.n_buckets, samples)
 
     def describe(self) -> str:

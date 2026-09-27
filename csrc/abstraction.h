@@ -689,6 +689,53 @@ inline double river_equity_exact(const int* hole, const int* board, int n_board)
     return won / (double)n;
 }
 
+// ---- exact potential-aware feature of one hand (exactfeat.h has the per-board batch)
+inline int exact_bin(double e, int bins) {
+    int b = (int)(e * (double)bins);
+    return b >= bins ? bins - 1 : b;
+}
+
+// the feature of one hand by the definition: counts[bins] and the mean (reference implementation)
+inline void exact_feature(const int* hole, const int* board, int n_board, int bins, int* counts, double& mean) {
+    bool used[52] = {false};
+    used[hole[0]] = used[hole[1]] = true;
+    for (int i = 0; i < n_board; i++) used[board[i]] = true;
+    for (int i = 0; i < bins; i++) counts[i] = 0;
+    int b5[5];
+    for (int i = 0; i < n_board; i++) b5[i] = board[i];
+    double total = 0.0;
+    int n = 0;
+    if (n_board == 4) {
+        for (int c = 0; c < 52; c++) {
+            if (used[c]) continue;
+            b5[4] = c;
+            const double e = river_equity_exact(hole, b5, 5);
+            counts[exact_bin(e, bins)]++;
+            total += e;
+            n++;
+        }
+    } else {  // flop
+        for (int t = 0; t < 52; t++) {
+            if (used[t]) continue;
+            b5[3] = t;
+            double s = 0.0;
+            int m = 0;
+            for (int r = 0; r < 52; r++) {
+                if (used[r] || r == t) continue;
+                b5[4] = r;
+                s += river_equity_exact(hole, b5, 5);
+                m++;
+            }
+            const double e = s / (double)m;
+            counts[exact_bin(e, bins)]++;
+            total += e;
+            n++;
+        }
+    }
+    mean = total / (double)n;
+}
+
+
 // next_street_histogram(): E[HS] after each possible next card (card order), Monte-Carlo with
 // `samples` runouts from ONE generator seeded with hash(canonical_key(hole, board)) & 0xFFFFFFFF
 // and consumed sequentially; counts over `bins` equal bins of [0, 1] and the mean equity.
@@ -729,6 +776,7 @@ public:
     int bins = 10;
     std::vector<std::vector<double>> centroids[4];  // by street (FLOP, TURN): n_buckets CDFs of `bins` values
     std::vector<double> boundaries[4];              // RIVER: n_buckets - 1 cut points
+    bool exact = false;  // flop / turn features by exact enumeration (exact_feature) instead of Monte-Carlo
 
     PotentialBucketer() = default;
     PotentialBucketer(int n_buckets_, int samples_, int bins_) : n_buckets(n_buckets_), samples(samples_), bins(bins_) {
@@ -750,8 +798,35 @@ public:
             for (const auto& c : centroids[s]) h.doubles(c);
         }
         h.doubles(boundaries[RIVER]);
+        if (exact) h.u64(0x4558414354ULL);  // "EXACT": another bucketer; absent, the fingerprint is unchanged
         id.fingerprint = h.value();
         return id;
+    }
+
+    // the histogram counts of a flop / turn canonical form (Monte-Carlo or exact)
+    void histogram(const CanonicalForm& cf, int* counts, double& mean) const {
+        if (exact) exact_feature(cf.hole, cf.board, cf.n_board, bins, counts, mean);
+        else potential_histogram(cf.hole, cf.board, cf.n_board, samples, bins, counts, mean);
+    }
+
+    // the bucket of a flop / turn feature: CDF, then the nearest centroid (EMD = L1 on CDFs, first minimum)
+    int assign_counts(int street, const int* counts) const {
+        const std::vector<std::vector<double>>& cens = centroids[street];
+        if (cens.empty()) throw std::runtime_error("bucketer not fitted");
+        double cdf[MAX_BINS];
+        int n = 0;
+        for (int i = 0; i < bins; i++) n += counts[i];
+        int cum = 0;
+        for (int i = 0; i < bins; i++) { cum += counts[i]; cdf[i] = (double)cum / (double)n; }
+        int best = 0;
+        double best_d = 0.0;
+        for (size_t j = 0; j < cens.size(); j++) {
+            const std::vector<double>& cen = cens[j];
+            double d = 0.0;
+            for (int i = 0; i < bins; i++) d += std::fabs(cdf[i] - cen[i]);
+            if (j == 0 || d < best_d) { best = (int)j; best_d = d; }
+        }
+        return best;
     }
 
     // (CDF, mean equity) on the canonical representative: PotentialAwareBucketer.feature()
@@ -759,7 +834,7 @@ public:
         CanonicalForm cf;
         canonical_form(hole, board, n_board, cf);
         int counts[MAX_BINS];
-        potential_histogram(cf.hole, cf.board, cf.n_board, samples, bins, counts, mean);
+        histogram(cf, counts, mean);
         cdf.resize(bins);
         int n = 0;
         for (int i = 0; i < bins; i++) n += counts[i];
@@ -856,25 +931,11 @@ private:
             double e = river_equity_exact(cf.hole, cf.board, cf.n_board);
             return (int)(std::upper_bound(cuts.begin(), cuts.end(), e) - cuts.begin());
         }
-        const std::vector<std::vector<double>>& cens = centroids[street];
-        if (cens.empty()) throw std::runtime_error("bucketer not fitted");
+        if (centroids[street].empty()) throw std::runtime_error("bucketer not fitted");
         int counts[MAX_BINS];
         double mean;
-        potential_histogram(cf.hole, cf.board, cf.n_board, samples, bins, counts, mean);
-        double cdf[MAX_BINS];
-        int n = 0;
-        for (int i = 0; i < bins; i++) n += counts[i];
-        int cum = 0;
-        for (int i = 0; i < bins; i++) { cum += counts[i]; cdf[i] = (double)cum / (double)n; }
-        int best = 0;
-        double best_d = 0.0;
-        for (size_t j = 0; j < cens.size(); j++) {
-            const std::vector<double>& cen = cens[j];
-            double d = 0.0;
-            for (int i = 0; i < bins; i++) d += std::fabs(cdf[i] - cen[i]);
-            if (j == 0 || d < best_d) { best = (int)j; best_d = d; }
-        }
-        return best;
+        histogram(cf, counts, mean);
+        return assign_counts(street, counts);
     }
 };
 

@@ -1,0 +1,14 @@
+{
+  "_comment": "Copy to webapp/bots.local.json (git-ignored) and describe this machine's extra bots: absolute paths, or paths relative to the project root. Big files can go to webapp/blueprints/ (git-ignored) or anywhere else, e.g. a flash drive. An entry with the same id as in bots.json replaces it; \"default\" here overrides the shared default. Restart the server after editing.",
+  "bots": [
+    {
+      "id": "mybot",
+      "label": "Мой бот 200bb",
+      "note": "перенесён с десктопа",
+      "stack_bb": 200, "preflop": [0.5, 1.0, 3.0], "postflop": [0.5, 1.0, 2.0, 4.0], "max_raises": 3,
+      "blueprint": "webapp/blueprints/blueprint_mybot.bin",
+      "bucketer": "webapp/blueprints/buckets_mybot.json",
+      "tables_dir": "webapp/blueprints"
+    }
+  ]
+}

@@ -443,3 +443,407 @@ where there are rollouts.
    the search could go (updates without locks give statistically equivalent results, to be shown
    with the exact evaluator's curves); rollouts could stop at the river with a precomputed river
    value table instead of playing it out.
+
+# Part 3: the search agent at the table (2026-09-25)
+
+## Using it
+
+```python
+from negpluribus.agents.core_search import CoreSearchAgent, SearchConfig, SearchResources
+res = SearchResources.load(spec, "data/blueprint_hunl200w3_pot16_s0.bin", "data/buckets_hunl200w3_pot16_s0.json",
+                           cache_path="data/bucketcache_hunl200w3_pot16_s0.bin")   # once per process, 0.4-0.5 s
+agent = CoreSearchAgent(res, SearchConfig(time_budget=0.5, threads=14), seed=1)   # a drop-in Agent
+```
+
+```
+# Slumbot (its own log; the grid must be the blueprint's)
+python scripts/play_slumbot.py --agent search --blueprint data/blueprint_hunl200w3_pot16_s0.bin \
+    --buckets data/buckets_hunl200w3_pot16_s0.json --cache data/bucketcache_hunl200w3_pot16_s0.bin \
+    --preflop-fracs 0.5,1.0,3.0 --search-budget 2 --hands 1000 --log data/slumbot/search_hunl200w3.jsonl
+# duels and archetypes: the search hero against the blueprint, the overbettor, random, the archetypes
+python scripts/eval_archetypes.py --spec 2p_200bb_river --preflop-fracs 0.5,1.0,3.0 --postflop-fracs 0.5,1.0,2.0,4.0 \
+    --blueprint data/blueprint_hunl200w3_pot16_s0.bin --buckets data/buckets_hunl200w3_pot16_s0.json \
+    --cache data/bucketcache_hunl200w3_pot16_s0.bin --agent search --search-budget 0.5 \
+    --opponents blueprint,overbettor,random --deals 1000 --progress 50 --log data/duel_search05.jsonl
+python scripts/duel_log.py data/duel_search05.jsonl [--paired data/duel_blueprint.jsonl]   # also while it runs
+# where a hero wins or loses: add --log-hands data/hands.jsonl to the duel, then
+python scripts/hand_log_report.py data/hands.jsonl [--paired data/hands_blueprint.jsonl]
+```
+
+**The data files** (in `data/`, not in git), made once per blueprint and per bucketer:
+
+```
+python scripts/export_json.py data/blueprint_hunl200w3_pot16_s0.json data/blueprint_hunl200w3_pot16_s0.bin
+    # 3.2 s; 233,759,108 bytes; the binary loads in 0.1 s instead of the JSON's minutes
+python scripts/precompute_buckets.py --buckets data/buckets_hunl200w3_pot16_s0.json \
+    --out data/bucketcache_hunl200w3_pot16_s0.bin --threads 14
+    # about 11 minutes; 121,974,381 bytes; every flop and turn bucket (part 2)
+```
+
+Flags of `--agent search` (both scripts): `--cache`, `--search-budget` (seconds per decision,
+default 2), `--search-street-budgets "preflop=8,flop=3,turn=2,river=1"`, `--search-iterations` (a
+fixed count instead of the clock), `--search-threads` (default 14), `--search-play average|final`
+(default average), `--search-depth` (default pluribus), `--preflop-offgrid` (default 0.3),
+`--no-preflop-search` (the blueprint translates every preflop size), `--presample` (off by default).
+
+## How it plays
+
+* **Preflop: the blueprint**, through an inner `BlueprintAgent` (randomized translation, as on
+  Slumbot).  A search instead when (1) an opponent's raise of this preflop is far off the grid: the
+  relative distance between its raise increment and the nearest abstract size at its node (the grid's
+  sizes as the engine clamps them there, all-in included) is above `preflop_offgrid` = 0.3; (2) the
+  blueprint has no strategy at our key (it would check/call blind: "off the map"); (3) an earlier
+  preflop decision of this hand was searched.  A preflop search has its root at the start of the hand
+  and leaves at the start of the flop (continuation leaves, 3 rollouts).
+* **From the flop: a search at every decision**, root at the start of the round, the round's real
+  actions as the path (our own fixed for our hand, off-grid sizes inserted), `depth="pluribus"`
+  (heads-up: to the end of the hand; 3 or more players at the flop: leaves at the turn or after the
+  second raise).
+* **Ranges across rounds**: Bayes over the blueprint for rounds played without a search; for a
+  searched round, the last search's `likelihood(seat, round actions, floor=1e-3)` of every live seat,
+  passed as `overrides` to the later rounds' searches (tested: the turn search gets exactly the flop
+  search's likelihoods).
+* **Play**: the average strategy of our hand (default; `solve()["average"]`, accumulated every
+  iteration), or the final iteration.  The chosen action is sampled from it.
+* **Never stalls**: a search error falls back to the blueprint and is counted (none in any run below).
+* **What it reports**: `stats` (decisions by street; preflop decisions of the blueprint; searches,
+  seconds and iterations by street; why preflop decisions were searched; searches with an inserted
+  size; off-map decisions), `fallback_rate` like `BlueprintAgent`, and `decision_info()` per
+  decision, which the Slumbot log records (searched or not, actions, final and average strategy,
+  iterations, seconds, inserted sizes).
+
+The duel tool (`negpluribus/eval/duel.py`) deals and seeds exactly as `duplicate_match` (tested:
+the same raw numbers) and adds per hand the heads-up **card-luck correction**: at every card deal
+(the hole cards, then each street reached), (equity after − equity before) × the pot at the deal,
+with exact equities (`equity_vs_hand` enumerates every board completion; the preflop 1.7M boards on
+8 threads in 21 ms).  Equity is a martingale over the cards to come (tested exactly), so the
+correction has mean zero whatever the players do and removing it keeps the estimate unbiased.
+
+## Checks (measured 2026-09-25, HU 200bb blueprint, 14 threads, the live Slumbot match the only other load)
+
+Game: `blueprint_hunl200w3_pot16_s0` (binary, 3.04M infosets; preflop 0.5/1/3, postflop
+0.5/1/2/4 pot + all-in, 3 raises, 16 potential-aware buckets), the bucket cache loaded.  Duels:
+`scripts/eval_archetypes.py --agent search ... --seed 0`, duplicate deals (each deck twice, seats
+swapped), 95% CI with one deal as one sample; "corrected" = minus the card luck.
+
+**a. Decisions off the map, against the random agent** (it raises to any chip amount):
+
+| hero | hands | off-map decisions | bb/100 raw | luck-corrected |
+|---|---:|---:|---:|---:|
+| blueprint agent | 100,000 | 6.8% | +147.3 ± 21.8 | |
+| search agent, 0.5 s | 300 | **0 of 453 (0.0%)** | +1531 ± 873 | +1485 ± 526 |
+
+The blueprint's 6.8% (10-11% in the HU 100bb game of docs/scale_4street.md) are the check/call
+fallbacks of unknown keys.  The search agent has none: 101 of its 453 decisions were preflop
+searches (89 for a size farther than 0.3 from the grid, 12 after a preflop search), 166 searches
+held an inserted size.  Its preflop searches are slow: 4,200 iterations in 0.5 s (a preflop root's
+leaves are at the flop, and every leaf value plays 3 rollouts through the flop, turn and river).
+
+**c. The duel: search agent against the blueprint agent** (the blueprint on both sides):
+
+| budget | deals / hands | bb/100 raw | luck-corrected | hero s / hand | searches / hand | iterations: flop / turn / river |
+|---|---:|---:|---:|---:|---:|---:|
+| 0.5 s | 2,000 / 4,000 | +16.6 ± 61.0 | **−1.7 ± 49.2** | 0.81 | 1.56 | 74k / 228k / 802k |
+| 2 s | 150 / 300 | +94.8 ± 112.2 | +84.8 ± 92.9 | 3.22 | 1.60 | 339k / 985k / 3.44M |
+
+At 0.5 s per decision the search agent is **not measurably better than the blueprint**: the
+luck-corrected estimate is −1.7 with a 95% interval of ±49 bb/100 over 4,000 hands (the correction
+cut the interval from ±61).  Expected before the run: the search agent wins, size unknown; at this
+budget it does not show.  At 2 s the 300 hands (run for the timing of d) give +85 ± 93: too few
+hands to tell.  A reading, measured in part 2 at turn roots: the exact exploitability of the search's
+play falls below the blueprint's (6.2 bb per deal) only after about 200-300k iterations (100k:
+9.6-10; 300k: 4.9-5.1; 1M: 2.4-3.4), and at 0.5 s the flop search runs 74k and the turn 228k, at 2 s
+339k and 985k.
+
+**b. The value overbettor** (`negpluribus/agents/overbettor.py`, the test of docs/scale_4street.md
+rebuilt: the blueprint agent, but when it raises with a strong hand, preflop a hole in the top 15%
+of `hole_percentile`, later an equity of at least 0.8 against one random hand, it raises 2.5 x the
+grid's largest size instead, 7.5 pots preflop and 10 pots later, at most 80% of the way to its
+all-in; pure value, off the grid):
+
+| hero | deals | hands | bb/100 raw | luck-corrected | overbets |
+|---|---|---:|---:|---:|---:|
+| blueprint agent (pseudo-harmonic translation) | 0..49,999 | 100,000 | +24.0 ± 9.8 | | |
+| blueprint agent, logged | 0..2,499 | 5,000 | +35.6 ± 44.0 | +39.2 ± 34.6 | 821 |
+| search agent, 0.5 s | 0..1,499 | 3,000 | −288.3 ± 141.6 | −222.5 ± 92.6 | 510 |
+| search agent, 0.5 s, logged | 1,500..2,499 | 2,000 | −307.6 ± 188.9 | −311.0 ± 122.0 | 354 |
+| search agent, 2 s on every street, logged (R5) | 0..1,499 | 3,000 | −161.5 ± 121.1 | −114.5 ± 78.4 | 498 |
+
+The old clamping translation lost 54 bb/100 to this opponent on the narrow HU 100bb grid; with the
+paper's translation the blueprint agent beats it.  **The search agent at 0.5 s loses to it**: −258 ±
+74 bb/100 luck-corrected over the 5,000 hands of both runs, −249 ± 106 and −369 ± 123 per deal against
+the blueprint agent on the same decks and seeds.  The check fails.
+
+**Where, and the mechanism** (`--log-hands`, `scripts/hand_log_report.py`, deals 1,500..2,499, per
+100 hands of each kind, without the card luck; "paired": the search agent minus the blueprint agent
+in the same hand, same deal and seat, raw):
+
+| hands | number | search agent | paired with the blueprint agent | share of the −308 bb/100 |
+|---|---:|---:|---:|---:|
+| the overbettor overbet preflop, the hero searched preflop | 187 | −2,663 ± 956 | −2,978 ± 1,721 | −288 |
+| no overbet | 1,685 | +52 ± 57 | −49 ± 77 | +72 |
+| overbet on the flop | 44 | −3,096 ± 1,952 | −1,923 ± 2,477 | −49 |
+| overbet on the turn | 42 | −1,562 ± 1,723 | −213 ± 2,433 | −32 |
+| overbet on the river | 42 | −226 ± 1,324 | +2 ± 1,308 | −10 |
+
+The loss is in the hands where the overbettor raised preflop off the grid (7.5 pots: an open to
+16 bb, a 3-bet to 32 or 48 bb) and the hero answered with a preflop search: 187 hands of 2,000,
+27-31 bb lost in each.  What the hero did at its first preflop search, by the strength of its hand:
+raised with 73 of 110 hands in the bottom half of `hole_percentile` (called 8, folded 29), with 60
+of 61 between 50% and 85%, with all 16 in the top 15%; the opponent holds the top 15% only.  Typical
+hands: 3♦8♠ and T♠4♣ re-raised a 16 bb open and then shoved into AA and AK; 6♠J♣ shoved over a
+32 bb 3-bet into AK; 7♣6♦ 4-bet a 32 bb 3-bet and called KK's shove.  The blueprint agent folded all
+four at its first decision.  The preflop searches ran 3,649 iterations on average
+in 0.5 s (a preflop root has leaves at the flop, each leaf value 3 rollouts through the flop, turn
+and river).
+
+**Under-convergence, measured on the spot itself** (`SubgameSearch` with the BB holding 3♦8♠ after
+the overbettor's 16 bb open; our average strategy, fold / call / 3-bet to 32 bb; two seeds each;
+the 0.5 s rows ran while another 14-thread search was running, so they got 1,400-1,800 iterations
+instead of the 3,600 of the duel):
+
+| solve | iterations | fold | call | 3-bet to 32 bb |
+|---|---:|---:|---:|---:|
+| 14 threads, 0.5 s | 1,365-1,763 | 0.32-0.77 | 0.14-0.32 | 0.00-0.46 |
+| 14 threads, fixed | 3,600 | 0.59 / 0.91 | 0.23 / 0.05 | 0.08 / 0.01 |
+| 1 thread, fixed | 3,600 | 0.96 / 0.90 | 0.01 / 0.08 | 0.00 / 0.01 |
+| 14 threads, fixed (7 s) | 30,000 | **1.00** | 0.00 | 0.00 |
+
+At the duel's budget the average strategy of a trash hand still calls or re-raises a 7.5-pot open
+much of the time; at 30,000 iterations it folds.  At the same number of iterations one thread
+converged further than fourteen here (a hypothesis: the fourteen threads' first iterations all read
+the same near-uniform regrets).  What the
+search believes about the open (the SB's range times its probability of the open, from the
+search's average; one thread): at 3,600 iterations 16.1% of the SB's hands open 16 bb, half of them
+in the bottom half of `hole_percentile`; at 30,000, 9.7%, 29% in the bottom half and 24.5% in the
+top 15%.  The overbettor opens this way with the top 15% only: even converged, the subgame's
+equilibrium assumes bluffs that this opponent does not have.
+
+**Without the preflop searches** (`--no-preflop-search`: the blueprint translates every preflop
+size, the searches from the flop unchanged), on the same deals 1,500..2,499 and seeds:
+
+| hero | bb/100 raw | luck-corrected | paired with the blueprint agent, luck-corrected |
+|---|---:|---:|---:|
+| blueprint agent | +58.5 ± 66.3 | +58.1 ± 49.1 | |
+| search agent, 0.5 s | −307.6 ± 188.9 | −311.0 ± 122.0 | −369.2 ± 123.2 |
+| search agent, 0.5 s, no preflop search | +33.9 ± 102.4 | −11.4 ± 79.2 | −69.5 ± 86.1 |
+
+Dropping the preflop searches gains +299.6 ± 104.0 bb/100 (luck-corrected, paired per deal), and
+the hands with a preflop overbet go from −2,663 ± 956 to +42 ± 334 per 100 of them.  Without them
+the search agent neither loses significantly to the overbettor (−11 ± 79) nor differs significantly
+from the blueprint agent on these deals (−70 ± 86).  A second, smaller loss is in the answers to
+postflop overbets (below).
+
+So the mechanism is measured three ways: the loss sits in the hands with a preflop search (per-hand
+attribution); on the spot itself the preflop search at the duel's budget has not converged (trash
+calls or re-raises a 7.5-pot open, folds at 30,000 iterations); and without the preflop searches
+the loss is gone.
+
+**With 8 s for the preflop searches** (`--search-street-budgets preflop=8`, 0.5 s from the flop;
+67,409 iterations per preflop search; the same deals 1,500..2,499; hero 1.52 s per hand):
+
+| comparison, luck-corrected bb/100 | 8 s preflop |
+|---|---:|
+| against the overbettor | −80.2 ± 93.4 (raw −45.2 ± 137.8) |
+| minus the 0.5 s search agent (paired) | +230.8 ± 99.9 |
+| minus the search agent without preflop searches (paired) | −68.8 ± 76.9 |
+| minus the blueprint agent (paired) | −138.4 ± 97.8 |
+
+Converged preflop searches fold the trash (first preflop search: bottom half of `hole_percentile`
+folded 97 of 110, re-raised 8; 50-85%: folded 29 of 61, re-raised 23, called 9), and the hands with
+a preflop overbet cost −594 ± 631 per 100 of them instead of −2,663.  The agent no longer loses
+significantly to the overbettor, but it stays behind the blueprint agent on these deals (−138 ± 98)
+and is not better than translating preflop (−69 ± 77, not significant).  What is left, as far as
+these samples show: the 50-85% hands that still re-raise a premium-only overbet (the subgame's
+equilibrium expects bluffs in it), and the flop overbets (−2,692 ± 1,835 per 100 of those 43 hands).
+
+**Where the rest of the gap sits** (`hand_log_report.py --paired ... --breakdown`, deals
+1,500..2,499, paired hand by hand with the blueprint agent, luck-corrected; "per 100" = per 100
+hands of the part, "share" = its part of the total per 100 hands of the run, the shares adding up
+to the total).  A pair of hands is identical up to the search agent's first search (same seeds:
+tested, and the 724-888 hands without a search differ by exactly 0), so the hands split by that
+first search:
+
+| first search of the search agent | R1: 0.5 s | R3: no preflop search | R4: 8 s preflop |
+|---|---:|---:|---:|
+| none (hands identical to the blueprint's) | 724 hands, 0 | 888, 0 | 724, 0 |
+| preflop | 187: −2,556 ± 914 per 100, share −239.0 ± 91.3 | | 187: −487 ± 647, share −45.5 ± 60.7 |
+| from the flop, the opponent overbet on a later street | 128: −1,243 ± 980, share −79.5 ± 63.9 | 132: −1,082 ± 873, share −71.4 ± 58.6 | 129: −841 ± 921, share −54.2 ± 59.9 |
+| from the flop, no overbet at all | 961: −106 ± 113, share −50.7 ± 54.2 | 957: −25 ± 120, share −12.0 ± 57.3 | 960: −81 ± 109, share −38.6 ± 52.5 |
+| from the flop, after a translated preflop overbet | | 23: +1,211 ± 1,897, share +13.9 ± 22.1 | |
+| total | −369.2 ± 123.4 | −69.5 ± 84.9 | −138.4 ± 100.0 |
+
+Besides the preflop searches, the gap sits in the answers to postflop overbets, not in ordinary
+postflop play (no significant gap in the 957-961 hands without an overbet).  The answers to the
+opponent's first postflop overbet in the same hands (`scripts/overbet_answers.py`; "behind" = below
+1/2 equity against the opponent's actual hand at that street; the blueprint agent's reading of the
+overbet replayed from its seeds):
+
+| hands of the search agent's first postflop overbet | search agent | blueprint agent, same hands |
+|---|---|---|
+| R3 (0.5 s, no preflop search), 132 hands | fold 106 (all behind), call 2 (behind), raise 24 (19 behind) | fold 91 (90 behind), call 5 (3 behind), raise 0; 36 hands went another way before the overbet |
+| R4 (8 s preflop), 129 hands | fold 101, call 2, raise 26 (20 behind) | fold 89, call 5, raise 0; 35 another way |
+| R1 (0.5 s), 128 hands | fold 100, call 3, raise 25 (21 behind) | fold 88, call 5, raise 0; 35 another way |
+
+Against this opponent a raise is behind even when it is right (it overbets strong hands only); the
+signal is the paired result in these hands, luck-corrected: R3 −1,082 ± 873 per 100 of them (share
+−71.4), R4 −841 ± 921 (−54.2), R1 −1,243 ± 980 (−79.5).  The blueprint agent read the overbet as its
+all-in in 65 of the 96 hands where it faced it (R3's hands), as 4 pots in 31, and never raised: an
+all-in leaves only fold or call, and against the all-in it calls narrowly.  On all of its own 339
+hands with a postflop overbet it answered fold 311, call 23, raise 5 (all 5 from the 4-pot reading).
+For example A♠8♦ with middle pair re-raised a 60 bb flop overbet into two pair and called the
+shove; the blueprint agent folded.  By the street where the hand was
+decided (R4): preflop showdowns, the all-ins after preflop searches, 19 hands, −5,838 ± 2,612 per
+100, share −55.5 ± 34.6; river showdowns 290 hands, −395 ± 371, share −57.3 ± 54.0; the other
+streets not significant.  Whether the re-raises behind are the 0.5 s budget (the inserted
+overbet's range not converged) or the subgame's equilibrium assumption (a balanced overbet range;
+this opponent has no bluffs) is what the 2 s run (R5) separates.
+
+**At 2 s on every street (R5, the user's test budget; deals 0..1,499, the decks of the first 0.5 s
+run; 15,774 iterations per preflop search, 426k per flop search, 1.12M turn, 3.34M river; the
+hero 3.18 s per hand):**
+
+| comparison on deals 0..1,499 | raw | luck-corrected |
+|---|---:|---:|
+| the 2 s search agent against the overbettor | −161.5 ± 121.1 | −114.5 ± 78.4 |
+| the blueprint agent against it, same deals | +20.4 ± 58.4 | +26.6 ± 47.4 |
+| 2 s minus the blueprint agent (paired per deal) | −181.9 ± 129.0 | −141.1 ± 86.8 |
+| 2 s minus 0.5 s (paired per deal) | +126.7 ± 111.1 | +108.0 ± 84.7 |
+
+The same breakdown, paired hand by hand with the blueprint agent, luck-corrected:
+
+| first search of the search agent | hands | per 100 of them | share of the −141.1 |
+|---|---:|---:|---:|
+| none (identical) | 1,083 | 0 | 0 |
+| preflop | 262 | −1,731 ± 745 | −151.2 ± 67.3 |
+| from the flop, the opponent overbet on a later street | 206 | −112 ± 557 | −7.7 ± 38.2 |
+| from the flop, no overbet at all | 1,449 | +37 ± 93 | +17.8 ± 45.1 |
+
+By the street where the hand was decided: preflop showdowns (the all-ins after preflop searches), 33
+hands, −8,463 ± 2,053 per 100, share −93.1 ± 38.6; flop showdowns 17 hands, share −45.0 ± 30.0;
+hands folded on the turn 407, +269 ± 165 per 100, share +36.4 ± 22.6 (the only significant gain);
+the rest not significant.  The answers to the first postflop overbet (206 hands): fold 176, call 6,
+raise 24 (17 behind); the blueprint agent in the same hands fold 144, call 13, raise 5, 44 another
+way.  The first preflop search, by the hero's hand: bottom half folded 97 of 146 (raised 37, called
+12), 50-85% raised 71 of 83, top 15% raised all 33.
+
+What this says, with the 0.5 s runs (R1, R3, R4 are on deals 1,500..2,499, so the comparison is
+between parts, each paired with the blueprint agent on its own deals):
+
+* The postflop-overbet hands no longer lose significantly at 2 s (−112 ± 557 per 100, against −841 to
+  −1,243 at 0.5 s), and re-raises became rarer (24 of 206 against 24-26 of 128-132): consistent with
+  under-convergence at 0.5 s; the balanced-range reading is not needed for these numbers, but with an
+  interval of ±557 per 100 hands a loss there is not excluded either.
+* The preflop searches still lose at 15.8k iterations (−1,731 ± 745 per 100 of those hands), as at
+  3.6k (−2,556 ± 914) and more than at 67k (−487 ± 647): the preflop searches need their own, larger
+  budget; the 50-85% hands still re-raise the premium-only overbet at 15.8k.
+* Ordinary postflop play shows no significant difference from the blueprint agent at either budget
+  (2 s: +37 ± 93 per 100 of those hands; 0.5 s: −25 to −106 ± 110-120).
+
+So check b fails at 0.5 s and at 2 s (against the overbettor −258 ± 74 and −115 ± 78), and the whole
+significant loss at 2 s is in the preflop searches.
+
+**d. Seconds per hand** (the search agent's time in its decisions; the rest of a hand, the opponent
+and the engine, takes about 0.01 s):
+
+| budget | opponent | hands | hero s / hand | decisions / hand | searches / hand |
+|---|---|---:|---:|---:|---:|
+| 0.5 s | blueprint | 4,000 | 0.81 | 2.62 | 1.56 |
+| 0.5 s | overbettor | 3,000 | 0.82 | 2.53 | 1.58 |
+| 0.5 s | random | 300 | 0.38 | 1.51 | 0.74 |
+| 2 s | blueprint | 300 | 3.22 | 2.63 | 1.60 |
+
+A searched decision costs its budget plus 30-38 ms at flop roots (the river table) and 3-10 ms
+later; with 8 s for preflop searches the agent took 1.52 s per hand against the overbettor (197
+preflop searches in 2,000 hands).  Against Slumbot the blueprint agent made 1.08 preflop, 0.83 flop, 0.54 turn and 0.40 river
+decisions per hand (46,128 hands of `data/slumbot/hunl200w3_pot16_s0.jsonl`): 1.77 postflop
+decisions per hand, so the search agent needs about 1.77 x (budget + 0.03) s per hand, 0.94 s at 0.5 s
+and 3.6 s at 2 s, plus Slumbot's own time (1.06 s per hand in the blueprint's match).
+
+## For the Slumbot evaluation (a proposal; the plan is the user's)
+
+* **Not with the 0.5 s defaults**: at 0.5 s the agent shows no edge over the blueprint (−1.7 ± 49.2)
+  and its preflop searches are exploitable (−258 ± 74 against the overbettor).
+* **Preflop**: Pluribus's rule stays (a search only for a size farther than 0.3 from the grid).
+  Slumbot bets off our grid preflop rarely (120 of 17,223 of its preflop bets in the blueprint's
+  match), but each such search needs a budget that converges: at 0.5 s (3.6k iterations) they lost
+  −2,556 ± 914 per 100 of those hands against the overbettor, with 8 s (67k iterations) −487 ± 647,
+  and the spot measured converges by 30k iterations.  Source: Modicum re-solves the preflop with the
+  new size for 30 s of MCCFR and caches the solution for the next time that size comes (Depth-Limited
+  Solving 2018, pp. 12-13).  The budget of preflop searches (`--search-street-budgets preflop=...`)
+  and a cache are for the user to decide.
+* **Budget from the flop**: 2 s (the user's test budget).  Against the overbettor it removed the
+  significant loss in the postflop-overbet hands that 0.5 s had, and 2 s beat 0.5 s by +108 ± 85
+  on the same deals; an edge over the blueprint agent in ordinary postflop play is not shown yet.
+* **Time**: the agent needs about 1.77 x (budget + 0.03) s per hand against Slumbot's lines, plus
+  Slumbot's 1.06 s: at 2 s about 4.7 s per hand, so 10,000 hands in 13 h (a 95% interval of about
+  ±27 bb/100 luck-corrected, from the spread of the blueprint's match: ±13.3 at 40,000) and 40,000
+  hands in 52 h (±13); at 1 s about 2.9 s per hand, 40,000 hands in 32 h.
+* **Before it**: a 2 s duel against the blueprint agent long enough to see an edge (2,000 deals =
+  4,000 hands, 3.6 h, about ±50 bb/100), since 300 hands at 2 s (+85 ± 93) do not show one.
+
+## State of part 3 and how to continue (written 2026-09-25 about 20:45; R5 finished at 20:53 and is analysed above)
+
+Done and committed on the branch `worktree-agent-ae78f3fcf39ad9442` (on top of master bcb1b68):
+the agent (`negpluribus/agents/core_search.py`), the value overbettor, the duel with the card-luck
+correction (`negpluribus/eval/duel.py`), `--agent search` in `scripts/play_slumbot.py` and
+`scripts/eval_archetypes.py`, `scripts/duel_log.py`, `scripts/hand_log_report.py` (with
+`--breakdown`), `scripts/overbet_answers.py`, the tests (`tests/test_core_search_agent.py`, 9; every
+solve in `tests/test_search_core.py` runs a fixed number of iterations except the time-budget test
+itself, `test_solve_respects_budgets_and_returns_distributions`), and checks a-d above.  The two
+tests the coordinator named are done: `test_our_taken_actions_are_fixed_for_our_actual_hole_only`
+runs 20,000 iterations (commit d328d7f, its logic unchanged); `test_our_average_is_accumulated_every_iteration`
+already ran a fixed 40,000 iterations and was flaky for another reason (the fixture's blueprint is
+trained on 4 threads, so it differs from process to process, and the test compared two averages
+that agree only as the strategy settles); it now checks an exact one-thread identity (commit
+9a2c76c).
+
+The runs, all in the session's scratchpad
+`C:\Users\AB73~1\AppData\Local\Temp\claude\C--Project-Manchatten-NegativePluriibus\9700a191-7573-420d-8867-e6a768035c26\scratchpad\p3\`
+(`check_<name>.txt` the console output, `log_<name>.jsonl` one line per deal, `hands_<name>.jsonl`
+one line per hand where present; all `--seed 0`):
+
+| name | hero, opponent, budget | deals |
+|---|---|---|
+| a_random05 | search 0.5 s, random | 0..149 |
+| c_duel05 | search 0.5 s, blueprint | 0..1,999 |
+| b_overbet05 | search 0.5 s, overbettor | 0..1,499 |
+| d_duel2 | search 2 s, blueprint | 0..149 |
+| r2_bp (hands) | blueprint agent, overbettor | 0..2,499 |
+| r1_search05 (hands) | search 0.5 s, overbettor | 1,500..2,499 |
+| r3_nopre05 (hands) | search 0.5 s without preflop searches, overbettor | 1,500..2,499 |
+| r4_pre8 (hands) | search 0.5 s, preflop 8 s, overbettor | 1,500..2,499 |
+| r5_search2 (hands) | search 2 s everywhere, overbettor | 0..1,499 |
+
+The R5 analysis above was made with these commands (to redo it, or to analyse another run):
+
+```
+set P=<the scratchpad p3 path above>
+python scripts/duel_log.py %P%\log_r5_search2.jsonl --paired %P%\log_r2_bp.jsonl
+python scripts/duel_log.py %P%\log_r5_search2.jsonl --paired %P%\log_b_overbet05.jsonl
+python scripts/hand_log_report.py %P%\hands_r5_search2.jsonl --paired %P%\hands_r2_bp.jsonl --breakdown
+python scripts/overbet_answers.py %P%\hands_r5_search2.jsonl --paired %P%\hands_r2_bp.jsonl
+```
+
+(`check_r5_search2.txt` ends with the iterations of the preflop searches; the data files the runs
+use are in the worktree's `data/`: the binary blueprint, the buckets JSON, the bucket cache.)  No
+new search runs with a time budget while other jobs load the machine: they would get less CPU.
+
+## What comes next (proposals)
+
+1. The budget of preflop searches (and Modicum's cache), measured with the duel and the archetypes.
+2. The search on master's bucket tables (one mechanism instead of the bucket cache; river tables
+   also make the rollouts of preflop searches cheaper).
+3. The remaining gap: with 8 s preflop searches (and 0.5 s later) the agent still trailed the
+   blueprint agent against the overbettor (−138 ± 98), in the answers to postflop overbets
+   (re-raises, where the blueprint agent, reading most overbets as its all-in, only folds or calls)
+   and in the 50-85% hands that re-raise a premium-only preflop overbet.  At 2 s the postflop part is
+   no longer significant (above).  Two readings of what is left, not measured apart: under-convergence,
+   or the search answering an overbet as the balanced size it solves it as, which is right against a
+   balanced overbettor and wrong against this value-only one, while the blueprint agent's narrow
+   answer to an all-in happens to be right against it.  A **balanced overbettor** would separate them:
+   the blueprint whose largest raise or all-in becomes the same off-grid overbet, with the
+   blueprint's own range for it (bluffs included).  There is no such archetype yet; it is a small
+   variant of `ValueOverbettor` (about 20 lines and a test, half an hour), and the runs cost about 4 min
+   for the blueprint agent (2,500 deals), 28 min for the search agent at 0.5 s (1,000 deals) and
+   1.8-2.7 h at 2 s (1,000-1,500 deals).

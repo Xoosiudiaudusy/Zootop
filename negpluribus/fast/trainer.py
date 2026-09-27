@@ -70,7 +70,8 @@ def core_bucketer(bucketer, cache_caps=None):
         if not hasattr(c, "PotentialBucketer"):
             raise RuntimeError("the built C++ core predates potential-aware buckets; run `python scripts/build_fast.py`")
         centroids = {int(k): [list(cdf) for cdf in v] for k, v in bucketer.centroids.items()}
-        return tabulated(c.PotentialBucketer(bucketer.n_buckets, bucketer.samples, bucketer.bins, centroids, boundaries, caps))
+        return tabulated(c.PotentialBucketer(bucketer.n_buckets, bucketer.samples, bucketer.bins, centroids, boundaries, caps,
+                                             exact=bool(getattr(bucketer, "exact", False))))
     return tabulated(c.Bucketer(bucketer.n_buckets, bucketer.samples, boundaries, caps))
 
 
@@ -146,6 +147,33 @@ class CppMCCFRTrainer(MCCFRTrainer):
         self._core = core().Trainer(spec_to_dict(spec), self._core_bucketer, int(seed) & 0xFFFFFFFFFFFFFFFF, bool(linear), self.threads,
                                     verify_keys=verify_keys_enabled())
         self._view = NodeView(lambda: self._core.n_nodes, self._core.get_node, self._core.keys, self._core.export_nodes)
+
+    def set_pruning(self, below: float, prob: float = 0.95, after: int = 0, last_street: bool = False,
+                    relative: bool = False, scale_t: bool = False, floor: float = 0.0) -> "CppMCCFRTrainer":
+        """Regret-based pruning as in Pluribus (off by default, ``below=0``): in a share ``prob`` of the
+        iterations after ``after``, the traverser skips actions whose accumulated regret is below
+        ``-below`` (stored units: bb x iteration weight; Pluribus used 300,000,000 in its units), except
+        on the last betting street (``last_street=True`` allows it there, for measurements on one-street
+        games) and except actions that end the hand.  ``relative=True``: ``below`` is in bb of regret per
+        unit of the node's own traverser weight (the weight-averaged regret per visit), a threshold that
+        does not drift with the iteration count or the number of buckets; nodes created before it was
+        turned on are never pruned, and the weight is not saved in checkpoints (it restarts on resume).
+        ``scale_t=True``: the threshold is ``below x t`` (Pluribus kept a fixed threshold on regrets growing
+        like t; ours grow like t^2).  ``floor`` (e.g. 1.033, Pluribus -310M against -300M): regrets are
+        clamped at floor x the threshold after every update once t > ``after``, so pruned actions that
+        improve come back.  Changes the algorithm: judge it by the result (exploitability, duels)."""
+        self._core.set_pruning(float(below), float(prob), int(after), bool(last_street), bool(relative), bool(scale_t), float(floor))
+        return self
+
+    def set_linear_until(self, iterations: int) -> "CppMCCFRTrainer":
+        """Linear CFR weights stop growing after ``iterations`` (Pluribus stopped its linear discounting
+        after 400 minutes); 0 (the default) keeps Linear CFR for the whole run.  Changes the algorithm."""
+        self._core.linear_until = int(iterations)
+        return self
+
+    @property
+    def pruned_actions(self) -> int:
+        return self._core.pruned_actions
 
     # ------------------------------------------------------------ state mirrors
     def _ready(self) -> bool:

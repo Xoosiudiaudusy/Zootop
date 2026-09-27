@@ -280,7 +280,7 @@ def test_an_off_grid_action_is_inserted_where_it_was_taken(trained):
     off = raise_to(int(0.7 * pot))  # 0.7 pot: between the grid's 0.5 and 1
     assert off.amount not in {spec.grid.to_concrete(obs, n).amount for n in spec.grid.abstract_actions(obs)}
     _act(st, acts, off)
-    s = make_search(game, st, acts, time_budget=0.5)
+    s = make_search(game, st, acts, iterations=20_000, time_budget=0.0)  # a fixed amount of work, whatever the load
     path = s.path()
     assert len(path) == 1 and path[0]["inserted"] and path[0]["actor"] == 1
     node = path[0]
@@ -303,7 +303,7 @@ def test_an_off_grid_action_is_inserted_where_it_was_taken(trained):
     obs2 = st.observe(st.current_player)
     off2 = raise_to(min(obs2.max_raise_to - 1, obs2.min_raise_to + 37))
     _act(st, acts, off2)
-    s2 = make_search(game, st, acts, time_budget=0.5)
+    s2 = make_search(game, st, acts, iterations=20_000, time_budget=0.0)
     ins = [p["inserted"] for p in s2.path()]
     assert ins == [True, False, True]
     assert s2.root_info()["pot"] == s.root_info()["pot"] and s2.root_info()["n_events"] == 2  # same root
@@ -322,7 +322,7 @@ def test_our_taken_actions_are_fixed_for_our_actual_hole_only(trained):
     _act(st, acts, spec.grid.to_concrete(st.observe(st.current_player), "r1"))     # BB raises
     obs = st.observe(st.current_player)
     assert obs.seat == 0
-    s = make_search(game, st, acts, time_budget=0.6)
+    s = make_search(game, st, acts, iterations=20_000, time_budget=0.0)  # a fixed amount of work, whatever the load
     r = s.solve()
     assert r["forced"] > 0 and r["visited"]
     h = list(obs.hole)
@@ -453,6 +453,9 @@ def test_solve_respects_budgets_and_returns_distributions(trained):
     assert 0.4 <= r["seconds"] < 0.6 and r["iterations"] > 100
     lik, missing = s.likelihood(1 - st.current_player)
     assert len(lik) == 1326 and all(0.0 <= x <= 1.0 for x in lik)
+    floored, _ = s.likelihood(1 - st.current_player, floor=0.25)  # each factor at least 0.25
+    theirs = sum(1 for p in s.path() if p["actor"] == 1 - st.current_player)
+    assert all(b >= a for a, b in zip(lik, floored)) and min(x for x in floored if x > 0) >= 0.25 ** theirs
     with pytest.raises(RuntimeError):  # not our turn: nothing to solve
         core.SubgameSearch(game, list(st.starting_stacks), st.button, acts, list(st.board), 1 - st.current_player,
                            list(st.players[1 - st.current_player].hole), iterations=10).solve()
@@ -526,7 +529,7 @@ def test_raise_limit_spares_the_real_path_up_to_our_decision(trained):
     spec, _, game, _ = trained[3]
     st, acts = line_hand(spec, ["r1", "c", "c", "r0.5", "r1"])  # flop: SB bets, BB raises: two raises, BTN to act
     assert st.street == Street.FLOP and st.raises_this_street == 2 and st.current_player == 0
-    s = make_search(game, st, acts, depth="pluribus")
+    s = make_search(game, st, acts, depth="pluribus", iterations=2_000, time_budget=0.0)
     leaves, terminals, decisions = s._leaves(100_000)
     path = [(p["type"], p["amount"]) for p in s.path()]
     assert len(path) == 2
@@ -682,26 +685,36 @@ def test_search_tables_and_presampled_actions(trained, bucketer):
 
 
 def test_our_average_is_accumulated_every_iteration(trained):
-    """solve()["average"] adds up our decision's strategy once per iteration (our hole's own reach
-    there is fixed), so it exists even when our hole is too unlikely in our range for the opponents'
-    traversals to deal it (the node's accumulated average, "average_table", then stays uniform);
-    where they do deal it, the two agree."""
+    """solve()["average"] adds up our decision's current strategy after every iteration with weight
+    t (Linear MCCFR's weights): checked exactly on one thread, where a run of n iterations repeats the
+    first n - 1 of a run of n - 1 (sigma_t = the final strategy of a t-iteration run).  So it exists
+    even when our hole is too unlikely in our range for the opponents' traversals to deal it: the
+    node's accumulated average ("average_table", what the profile and likelihood() use) then stays
+    uniform.  (The two averages weight the same strategies differently, so they agree only as the
+    strategy settles; an earlier version compared them and was flaky.)"""
     spec, _, game, _ = trained[2]
     st, acts = line_hand(spec, ["r1", "c", "c", "c", "c", "c", "c", "r1"])  # river: BB checks, SB bets pot
     assert st.street == Street.RIVER and st.current_player == 1
     seat = st.current_player
-    s = make_search(game, st, acts, iterations=40_000, time_budget=0.0, threads=2)
+    probe = make_search(game, st, acts, iterations=1, time_budget=0.0, threads=1)
+    ours = probe.class_of(core.combo_index(*st.players[seat].hole))
+    w = probe.ranges()[seat]
+    for rare in (False, True):
+        finals = []
+        for n in range(1, 7):
+            s = make_search(game, st, acts, iterations=n, time_budget=0.0, threads=1)
+            if rare:
+                s.set_reach(seat, [x * 1e-12 if s.class_of(c) == ours else x for c, x in enumerate(w)])
+            r = s.solve()
+            finals.append(r["final"])
+            want = [sum((t + 1) * finals[t][a] for t in range(n)) / (n * (n + 1) / 2) for a in range(len(r["final"]))]
+            assert r["average"] == pytest.approx(want, abs=1e-12), (rare, n)
+    s = make_search(game, st, acts, iterations=40_000, time_budget=0.0, threads=1)
+    s.set_reach(seat, [x * 1e-12 if s.class_of(c) == ours else x for c, x in enumerate(w)])
     r = s.solve()
-    tv = 0.5 * sum(abs(a - b) for a, b in zip(r["average"], r["average_table"]))
-    assert abs(sum(r["average"]) - 1) < 1e-9 and tv < 0.15, (r["average"], r["average_table"])
-    ours = s.class_of(core.combo_index(*st.players[seat].hole))
-    w = s.ranges()[seat]
-    s2 = make_search(game, st, acts, iterations=40_000, time_budget=0.0, threads=2)
-    s2.set_reach(seat, [x * 1e-12 if s2.class_of(c) == ours else x for c, x in enumerate(w)])
-    r2 = s2.solve()
-    n = len(r2["average"])
-    assert r2["average_table"] == pytest.approx([1.0 / n] * n)  # never dealt to the opponents' traversals
-    assert abs(sum(r2["average"]) - 1) < 1e-9 and max(r2["average"]) > 1.0 / n + 0.2, r2["average"]
+    k = len(r["average"])
+    assert r["average_table"] == pytest.approx([1.0 / k] * k)  # never dealt to the opponents' traversals
+    assert abs(sum(r["average"]) - 1) < 1e-9 and 0.5 * sum(abs(p - 1.0 / k) for p in r["average"]) > 0.05, r["average"]
 
 
 def test_a_search_with_leaves_converges_in_its_own_model(trained):

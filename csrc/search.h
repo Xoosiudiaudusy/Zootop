@@ -567,8 +567,10 @@ public:
     // Per combo of `seat`: the probability, under this search's average strategy, of `seat`'s
     // actions among `actions` (the real actions of the round from its start: the solved path,
     // possibly continued).  Combos never reached, or actions the subgame did not contain, count 1
-    // (no information); `missing` counts those (step, combo) lookups.
-    std::vector<double> likelihood(int seat, const std::vector<std::pair<int, int>>& actions, long long& missing) const {
+    // (no information); `missing` counts those (step, combo) lookups.  Each factor is at least
+    // `floor` (as the blueprint's Bayes floors sigma at min_prob), so no combo drops out entirely.
+    std::vector<double> likelihood(int seat, const std::vector<std::pair<int, int>>& actions, long long& missing,
+                                   double floor = 0.0) const {
         if (!table_) throw std::runtime_error("solve first");
         std::vector<double> w((size_t)N_COMBOS, 0.0);
         for (int c = 0; c < N_COMBOS; c++) if (class_of_[c] >= 0) w[(size_t)c] = 1.0;
@@ -591,7 +593,7 @@ public:
                     if (!f.node || f.node->n != na.n) { missing++; continue; }
                     double avg[MAX_ACTIONS];
                     f.node->average_strategy(avg);
-                    w[(size_t)c] *= avg[a];
+                    w[(size_t)c] *= std::max(avg[a], floor);
                 }
             }
             if (a < 0) break;  // not in this subgame: nothing further is known about the path

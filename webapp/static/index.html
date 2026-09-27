@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NegativePluribus · стол</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>♠</text></svg>">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">Negative<span>Pluribus</span><em>web table</em></div>
+  <div class="session" id="session">
+    <div class="s-item"><label>раздач</label><b id="s-hands">0</b></div>
+    <div class="s-item"><label>итог</label><b id="s-net">0 bb</b></div>
+    <div class="s-item"><label>bb/100</label><b id="s-bb100">0.0</b></div>
+    <button class="s-reset" id="btn-reset" title="сбросить счётчик сессии">⟲ сброс</button>
+  </div>
+</header>
+
+<main>
+  <section class="stage">
+    <div class="table" id="table">
+      <!-- villain: plaque above his cards (he sits on the far side), bet toward the center -->
+      <div class="seat seat-villain" id="seat-1">
+        <div class="plaque" id="villain-plaque">
+          <div class="avatar">🤖</div>
+          <div class="meta">
+            <div class="name" id="villain-name">Бот</div>
+            <div class="stack" id="villain-stack">—</div>
+          </div>
+          <div class="act empty" id="villain-act">·</div>
+          <div class="pos-badge" id="villain-pos">BB</div>
+          <div class="dealer" id="villain-dealer" hidden>D</div>
+        </div>
+        <div class="cards" id="villain-cards"></div>
+        <div class="bet-slot"><div class="street-bet empty" id="villain-bet"></div></div>
+      </div>
+
+      <!-- center: pot + board -->
+      <div class="center">
+        <div class="pot" id="pot" hidden>Банк <b id="pot-chips">0</b><span id="pot-bb"></span></div>
+        <div class="board" id="board">
+          <div class="slot" data-i="0"></div><div class="slot" data-i="1"></div>
+          <div class="slot" data-i="2"></div><div class="slot" data-i="3"></div>
+          <div class="slot" data-i="4"></div>
+        </div>
+        <div class="banner-slot"><div class="banner" id="banner" hidden></div></div>
+      </div>
+
+      <!-- hero: bet toward the center, cards, plaque below -->
+      <div class="seat seat-hero" id="seat-0">
+        <div class="bet-slot"><div class="street-bet empty" id="hero-bet"></div></div>
+        <div class="cards" id="hero-cards"></div>
+        <div class="plaque" id="hero-plaque">
+          <div class="avatar">🧑</div>
+          <div class="meta">
+            <div class="name">Вы</div>
+            <div class="stack" id="hero-stack">—</div>
+          </div>
+          <div class="act empty" id="hero-act">·</div>
+          <div class="pos-badge" id="hero-pos">BTN/SB</div>
+          <div class="dealer" id="hero-dealer" hidden>D</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- action bar: one stable row -->
+    <div class="actionbar" id="actionbar">
+      <div class="actions" id="actions"></div>
+    </div>
+  </section>
+
+  <aside class="panel">
+    <section class="card-block">
+      <h3>Бот</h3>
+      <div class="bot-list" id="bot-list"><div class="muted">загрузка…</div></div>
+    </section>
+
+    <section class="card-block">
+      <h3>Решение бота</h3>
+      <div id="bot-decision"><div class="muted">ещё не действовал</div></div>
+    </section>
+
+    <section class="card-block grow">
+      <h3>Рука</h3>
+      <div class="handlog" id="handlog"><div class="muted">—</div></div>
+    </section>
+
+    <section class="card-block grow2">
+      <h3>Руки сессии</h3>
+      <div class="history" id="history"><div class="muted">пока пусто</div></div>
+    </section>
+
+    <section class="card-block">
+      <h3>Настройки</h3>
+      <label class="toggle">
+        <input type="checkbox" id="opt-auto" checked>
+        <span>новая раздача автоматически</span>
+      </label>
+      <label class="toggle">
+        <input type="checkbox" id="opt-reveal">
+        <span>показывать карты бота после раздачи</span>
+      </label>
+      <div class="muted small" id="bot-spec"></div>
+    </section>
+  </aside>
+</main>
+
+<div class="overlay" id="overlay" hidden>
+  <div class="dialog">
+    <div class="spinner"></div>
+    <div id="overlay-text">загрузка бота…</div>
+  </div>
+</div>
+<div class="toast" id="toast" hidden></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,51 @@
+{
+  "_comment": "Bots of the web table. Paths are relative to the project root (data/ may be a junction to another drive) or absolute. Game parameters must match the training. This machine's extra bots go to webapp/bots.local.json (git-ignored), see bots.local.example.json.",
+  "default": "pot64x_s1",
+  "bots": [
+    {
+      "id": "pot64x_s1",
+      "label": "HUNL 200bb · pot64x · s1",
+      "note": "potential-aware 64 корзины, точные признаки, сид 1, 400 млн итераций",
+      "stack_bb": 200, "preflop": [0.5, 1.0, 3.0], "postflop": [0.5, 1.0, 2.0, 4.0], "max_raises": 3,
+      "blueprint": "data/blueprint_hunl200w3_pot64x_s1.bin",
+      "bucketer": "data/buckets_hunl200w3_pot64x_s1.json",
+      "tables_dir": "data/bucket_tables"
+    },
+    {
+      "id": "pot64x_s0",
+      "label": "HUNL 200bb · pot64x · s0",
+      "note": "то же, сид 0, 400 млн итераций",
+      "stack_bb": 200, "preflop": [0.5, 1.0, 3.0], "postflop": [0.5, 1.0, 2.0, 4.0], "max_raises": 3,
+      "blueprint": "data/blueprint_hunl200w3_pot64x_s0.bin",
+      "bucketer": "data/buckets_hunl200w3_pot64x_s0.json",
+      "tables_dir": "data/bucket_tables"
+    },
+    {
+      "id": "pot64_s1",
+      "label": "HUNL 200bb · pot64 · s1",
+      "note": "potential-aware 64 корзины, признаки Монте-Карло, сид 1, 400 млн итераций",
+      "stack_bb": 200, "preflop": [0.5, 1.0, 3.0], "postflop": [0.5, 1.0, 2.0, 4.0], "max_raises": 3,
+      "blueprint": "data/blueprint_hunl200w3_pot64_s1.bin",
+      "bucketer": "data/buckets_hunl200w3_pot64_s1.json",
+      "tables_dir": "data/bucket_tables"
+    },
+    {
+      "id": "pot64_s0",
+      "label": "HUNL 200bb · pot64 · s0",
+      "note": "то же, сид 0, 400 млн итераций",
+      "stack_bb": 200, "preflop": [0.5, 1.0, 3.0], "postflop": [0.5, 1.0, 2.0, 4.0], "max_raises": 3,
+      "blueprint": "data/blueprint_hunl200w3_pot64_s0.bin",
+      "bucketer": "data/buckets_hunl200w3_pot64_s0.json",
+      "tables_dir": "data/bucket_tables"
+    },
+    {
+      "id": "pot16_s0",
+      "label": "HUNL 200bb · pot16 · s0",
+      "note": "боевой blueprint матча со Slumbot: 16 корзин, 40 млн итераций",
+      "stack_bb": 200, "preflop": [0.5, 1.0, 3.0], "postflop": [0.5, 1.0, 2.0, 4.0], "max_raises": 3,
+      "blueprint": "data/blueprint_hunl200w3_pot16_s0.json",
+      "bucketer": "data/buckets_hunl200w3_pot16_s0.json",
+      "tables_dir": "data/bucket_tables"
+    }
+  ]
+}

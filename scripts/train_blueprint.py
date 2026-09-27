@@ -75,6 +75,8 @@ def main() -> None:
     ap.add_argument("--buckets", type=int, default=8)
     ap.add_argument("--buckets-kind", choices=list(BUCKET_KINDS), default="ehs",
                     help="postflop card abstraction: E[HS] cut points or potential-aware EMD clusters (docs/buckets.md)")
+    ap.add_argument("--exact-features", action="store_true",
+                    help="potential-aware buckets with exact flop / turn features (enumeration) instead of Monte-Carlo runouts")
     ap.add_argument("--fit-situations", type=int, default=1200, help="random situations per street for the bucketer fit")
     ap.add_argument("--iters", type=int, default=30000)
     ap.add_argument("--no-linear", action="store_true", help="plain CFR weighting instead of Linear CFR")
@@ -92,6 +94,18 @@ def main() -> None:
     ap.add_argument("--json", action="store_true", help="C++ backend: also write the JSON files next to the binary ones")
     ap.add_argument("--no-l1", action="store_true",
                     help="skip the L1-change diagnostic at checkpoints (C++ backend: frees the ~60 bytes per infoset it keeps between checkpoints)")
+    ap.add_argument("--prune-below", type=float, default=0.0,
+                    help="C++ backend: regret-based pruning (Pluribus) of actions whose accumulated regret is below -X "
+                         "(stored units: bb x iteration weight; Pluribus 3e8; 0 = off, the default); changes the algorithm, judge by the result")
+    ap.add_argument("--prune-prob", type=float, default=0.95, help="share of iterations that prune (Pluribus: 0.95)")
+    ap.add_argument("--prune-relative", action="store_true",
+                    help="--prune-below in bb of regret per unit of the node's own traverser weight (independent of t and bucket count)")
+    ap.add_argument("--prune-scale-t", action="store_true", help="the pruning threshold is --prune-below x t")
+    ap.add_argument("--regret-floor", type=float, default=0.0,
+                    help="clamp regrets at this factor x the pruning threshold (Pluribus: 310/300 = 1.033; 0 = off)")
+    ap.add_argument("--linear-until", type=int, default=0,
+                    help="C++ backend: Linear CFR weights stop growing after this iteration (Pluribus-style schedule; 0 = always linear)")
+    ap.add_argument("--prune-after", type=int, default=0, help="iterations before pruning starts")
     ap.add_argument("--data-dir", default=DATA, help="where buckets / checkpoints / blueprints go (default data/)")
     args = ap.parse_args()
     no_throttle = disable_power_throttling()  # scheduling only, results unchanged
@@ -105,8 +119,10 @@ def main() -> None:
         max_raises_per_street=args.max_raises,
         n_buckets=args.buckets,
         bucket_kind=args.buckets_kind,
+        exact_features=args.exact_features,
     )
-    tag = args.tag or f"{spec.n_players}p_{spec.stack_bb}bb_{args.street}" + ("_pot" if args.buckets_kind == "potential" else "")
+    tag = args.tag or (f"{spec.n_players}p_{spec.stack_bb}bb_{args.street}" + ("_pot" if args.buckets_kind == "potential" else "")
+                       + ("x" if args.exact_features else ""))
     data = args.data_dir
     os.makedirs(data, exist_ok=True)
     bk_path = os.path.join(data, f"buckets_{tag}.json")
@@ -118,6 +134,9 @@ def main() -> None:
             bucketer = load_bucketer(bk_path)
             if bucketer_kind(bucketer) != spec.bucket_kind:
                 raise SystemExit(f"{bk_path} holds {bucketer_kind(bucketer)!r} buckets, the spec wants {spec.bucket_kind!r}; use --tag")
+            if bool(getattr(bucketer, "exact", False)) != args.exact_features:
+                raise SystemExit(f"{bk_path} was fitted {'with' if getattr(bucketer, 'exact', False) else 'without'} exact features; "
+                                 "match --exact-features or use another --tag")
             print("buckets: loaded", bk_path)
         else:
             print(f"buckets: fitting {spec.bucket_kind} ({args.fit_situations} situations per street)…", flush=True)
@@ -129,6 +148,19 @@ def main() -> None:
     trainer = MCCFRTrainer(spec, bucketer, seed=args.seed, linear=not args.no_linear, backend=args.backend, threads=args.threads,
                            cache_caps=args.bucket_cache)
     cpp = trainer.backend == "cpp"
+    if args.linear_until > 0:
+        if not cpp:
+            raise SystemExit("--linear-until needs --backend cpp")
+        trainer.set_linear_until(args.linear_until)
+        print(f"Linear CFR weights stop growing after iteration {args.linear_until:,}")
+    if args.prune_below > 0:
+        if not cpp:
+            raise SystemExit("--prune-below needs --backend cpp")
+        trainer.set_pruning(args.prune_below, args.prune_prob, args.prune_after, relative=args.prune_relative,
+                            scale_t=args.prune_scale_t, floor=args.regret_floor)
+        print(f"pruning: regret below -{args.prune_below:g}{' bb per unit of node weight' if args.prune_relative else ''}, "
+              f"{' x t' if args.prune_scale_t else ''}{f', floor x{args.regret_floor:g}' if args.regret_floor else ''}, "
+              f"{args.prune_prob:.0%} of iterations after {args.prune_after:,}")
     ext = ".bin" if cpp and args.format == "bin" else ".json"
     bp_path = os.path.join(data, f"blueprint_{tag}{ext}")
     ck_path = os.path.join(data, f"checkpoint_{tag}{ext}")
@@ -208,6 +240,10 @@ def main() -> None:
     else:
         trainer.train(args.iters, log_every=max(1, args.iters // 10))
     print(f"done in {time.perf_counter() - t0:.0f}s, {len(trainer.nodes):,} infosets")
+    if cpp and args.prune_below > 0:
+        touched = trainer.nodes_touched
+        print(f"pruned actions {trainer.pruned_actions:,} ({trainer.pruned_actions / max(1, touched + trainer.pruned_actions):.1%} of "
+              f"nodes touched + pruned), nodes touched {touched:,} ({touched / max(1, trainer.iteration):.1f} per iteration)")
     # the agent's strategy: the average strategy at full precision, as trainer.strategy() had it
     # (C++ backend: the same floats from a C++ lookup, no dict)
     if cpp:

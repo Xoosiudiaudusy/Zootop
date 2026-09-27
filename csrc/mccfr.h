@@ -80,6 +80,10 @@ struct alignas(64) ThreadCtx {  // one cache line boundary per thread: no false 
     int bucket_memo[MAX_PLAYERS][6];  // [seat][n_board], -1 = not computed in this iteration
     // history-tree traversal: the deal of the iteration and the showdown strengths by relative seat
     int button = 0;
+    bool prune = false;        // this iteration prunes (Trainer::prune_below)
+    double prune_limit = 0.0;  // regrets below this are pruned
+    double floor_base = 0.0;   // < 0: regrets are clamped at this (relative pruning: x the node's weight)
+    long long pruned = 0;      // actions skipped
     bool strength_done = false;
     int64_t strength[MAX_PLAYERS];
 
@@ -162,6 +166,28 @@ public:
     int threads = 1;
     uint64_t seed = 0;
     bool verify_keys = false;  // test mode, see KeyChecker
+    // Regret-based pruning (Pluribus, Brown & Sandholm 2019, supplement): in a share `prune_prob` of the
+    // iterations after `prune_after`, the traverser does not explore an action whose accumulated
+    // regret is below -prune_below (the stored units: bb x iteration weight; Pluribus: -300,000,000
+    // in its own units); never on the last betting street (unless prune_last_street, for
+    // measurements on one-street games), never an action that ends the hand, and never every action
+    // of a node.  prune_below <= 0: off (the default; then nothing changes, not even the draws).
+    long long linear_until = 0;  // > 0: Linear CFR weights stop growing after this iteration (off: 0)
+    // relative pruning: prune_below is in bb of regret per unit of the node's own traverser weight
+    // (the weight-averaged regret per visit), which does not grow with t or with the bucket count;
+    // nodes created while it is on carry that weight (Node::tw, 8 bytes), older nodes are never pruned
+    bool prune_relative = false;
+    // Pluribus-like scale: the threshold grows with the iteration, -prune_below x t (Pluribus kept its
+    // threshold fixed on regrets that, once the discounting stopped, grow like t; ours grow like t^2)
+    bool prune_scale_t = false;
+    // regret floor (Pluribus: -310M against a -300M threshold, "for every action", so a pruned action
+    // that improves comes back): regrets are clamped at regret_floor x the pruning threshold after
+    // every update (e.g. 1.033); 0: no floor.  Applied in every iteration once t > prune_after.
+    double regret_floor = 0.0;
+    double prune_below = 0.0;
+    double prune_prob = 0.95;
+    long long prune_after = 0;
+    bool prune_last_street = false;
     std::mutex api_mu;         // held by train() and by the Python-facing table accessors (bindings)
 
     Trainer(const Spec& spec_, std::shared_ptr<Bucketer> bk, uint64_t seed_, bool linear_, int threads_, bool verify_keys_ = false)
@@ -229,10 +255,11 @@ public:
         group_.end();
         iteration_ = target;
         long long touched = 0;
-        for (auto& c : ctxs_) { touched += c.nodes_touched; c.nodes_touched = 0; }
+        for (auto& c : ctxs_) { touched += c.nodes_touched; c.nodes_touched = 0; pruned_ += c.pruned; c.pruned = 0; }
         nodes_touched_ += touched;
         checker_.rethrow();
     }
+    long long pruned_actions() const { return pruned_; }
 
     // RNG state of thread 0 (interop with random.Random.getstate()/setstate())
     PyRandom& rng0() { return ctxs_[0].rng; }
@@ -250,15 +277,29 @@ private:
     long long nodes_touched_ = 0;
     HistTree tree_;
     HistNode* root_ = nullptr;
+    long long pruned_ = 0;
 
     void run_iteration(long long t, ThreadCtx& ctx) {
-        double weight = linear ? (double)t : 1.0;
+        // Linear CFR: weight t; with linear_until > 0 the weight stops growing at that iteration (Pluribus
+        // stopped its linear discounting after 400 minutes), i.e. plain CFR from there on
+        double weight = linear ? (double)(linear_until > 0 && t > linear_until ? linear_until : t) : 1.0;
         ctx.order.resize(52);
         for (int i = 0; i < 52; i++) ctx.order[i] = i;
         ctx.rng.shuffle(ctx.order);
         ctx.reset_bucket_memo();  // a new deal
         int button = (int)(t % spec.n_players);
         ctx.button = button;
+        ctx.prune_limit = 0.0;
+        ctx.prune = false;
+        ctx.floor_base = 0.0;
+        if (prune_below > 0.0 && t > prune_after) {
+            const double base = prune_scale_t ? -prune_below * (double)t : -prune_below;
+            if (regret_floor > 0.0) ctx.floor_base = regret_floor * base;
+            if (ctx.rng.random() < prune_prob) {
+                ctx.prune = true;
+                ctx.prune_limit = base;
+            }
+        }
         for (int traverser = 0; traverser < spec.n_players; traverser++) traverse_tree(root_, traverser, weight, ctx);
     }
 
@@ -271,9 +312,11 @@ private:
             if (p) { cached = true; return p; }
         }
         const int n = spec.n_players;
-        FlatNodeTable::Found f = nodes.get_or_create(node_key(h->street, h->rel, h->n_active, b, h->hh), ctx.tid, h->na,
+        const int extra = prune_relative ? 1 : 0;
+        FlatNodeTable::Found f = nodes.get_or_create(node_key(h->street, h->rel, h->n_active, b, h->hh), ctx.tid, h->na, extra,
                                                      [&](Node& nd, NodeArena&) {
             nd.init(h->ids, h->na);
+            if (extra) { nd.has_tw = 1; *nd.tw() = 0.0; }
             return nd.refer_to_tree(h, b);  // key string spelled on demand from the tree (no copy)
         });
         if (verify_keys) {
@@ -304,18 +347,41 @@ private:
         ctx.nodes_touched++;
         const int na = h->na;
         double sigma[MAX_ACTIONS];
+        double reg[MAX_ACTIONS];
+        const bool prune_here = ctx.prune && seat == traverser && (prune_last_street || h->street < spec.max_street);
         node->lock.lock();
         node->current_strategy(sigma);
+        double limit = ctx.prune_limit;
+        if (prune_here) {
+            for (int i = 0; i < na; i++) reg[i] = node->regret()[i];
+            if (prune_relative) limit = node->has_tw ? ctx.prune_limit * *node->tw() : -1e300;
+        }
         node->lock.unlock();
 
         if (seat == traverser) {
             double utils[MAX_ACTIONS];
-            for (int i = 0; i < na; i++) utils[i] = traverse_tree(tree_.child(h, i), traverser, weight, ctx);
+            bool explore[MAX_ACTIONS];
+            int n_explore = 0;
+            for (int i = 0; i < na; i++) {
+                explore[i] = true;
+                if (prune_here && reg[i] < limit && !tree_.child(h, i)->terminal) explore[i] = false;
+                n_explore += explore[i];
+            }
+            if (n_explore == 0) for (int i = 0; i < na; i++) explore[i] = true;
+            for (int i = 0; i < na; i++) {
+                if (explore[i]) utils[i] = traverse_tree(tree_.child(h, i), traverser, weight, ctx);
+                else { utils[i] = 0.0; ctx.pruned++; }
+            }
             double prods[MAX_ACTIONS];
-            for (int i = 0; i < na; i++) prods[i] = sigma[i] * utils[i];
+            for (int i = 0; i < na; i++) prods[i] = explore[i] ? sigma[i] * utils[i] : 0.0;
             double u = py_sum(prods, na);
             node->lock.lock();
-            for (int i = 0; i < na; i++) node->regret()[i] += weight * (utils[i] - u);
+            for (int i = 0; i < na; i++) if (explore[i]) node->regret()[i] += weight * (utils[i] - u);
+            if (ctx.floor_base < 0.0) {
+                const double fl = prune_relative ? (node->has_tw ? ctx.floor_base * *node->tw() : -1e300) : ctx.floor_base;
+                for (int i = 0; i < na; i++) if (node->regret()[i] < fl) node->regret()[i] = fl;
+            }
+            if (node->has_tw) *node->tw() += weight;
             node->lock.unlock();
             return u;
         }

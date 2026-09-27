@@ -169,6 +169,21 @@ python scripts/run_eval.py --hero tag --villains nit,station,maniac,lag,passive 
 python scripts/run_eval.py --hero lag --baseline tag --villains nit,station,maniac,lag,passive --deals 300
 ```
 
+## Веб-стол: сыграть против бота
+
+`webapp\start.bat` (или `python webapp\server.py`) поднимает локальный сервер `http://127.0.0.1:8777`: хедз-ап
+против любого blueprint'а проекта в браузере. Список ботов — в `webapp/bots.json`, свои боты этой машины — в
+`webapp/bots.local.json`. Подробно: `webapp/README.md`.
+
+## Где лежат данные
+
+Всё тяжёлое — blueprint'ы, чекпоинты, таблицы корзин, логи матчей и дуэлей — в папке `data/`, git её не
+отслеживает. По решению пользователя (27.09.2026) `data/` переезжает на диск D: `D:\NegativePluribus\data`, а
+`data/` в проекте становится ссылкой на неё (junction). Все скрипты по-прежнему пишут и читают `data/...`, поэтому
+новые blueprint'ы и чекпоинты сами попадают на D. Перенос делает `scripts/move_data_to_d.ps1`: проверки, сверка
+каждого файла, старая копия удаляется только с `-DeleteOld`. Проверить, где данные: `dir` в корне проекта
+показывает `data` как `<JUNCTION>` с путём на D. Перенос назначен на утро 28.09, когда закончатся ночные опыты.
+
 ## Как это использовать из кода
 
 ```python
