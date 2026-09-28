@@ -2500,8 +2500,7 @@ private:
         std::vector<std::vector<double>> buf;
         size_t top = 0;
         std::vector<std::vector<double>> rows;   // per depth: sigma / regret / sum rows of the card parts
-        std::vector<std::vector<int>> ints;      // per depth: touched card parts
-        std::vector<std::vector<uint8_t>> seen;
+        std::vector<std::vector<int>> ints;      // per depth: counts of the card parts' combos
         int depth = 0;
         double* get() {
             if (top == buf.size()) buf.emplace_back((size_t)N_COMBOS, 0.0);
@@ -2518,6 +2517,83 @@ private:
             return;
         }
         for (int a = 0; a < na; a++) out[a] = reg[a] > 0.0 ? reg[a] / sum : 0.0;
+    }
+
+    // the average strategy of p below t where o's reach is zero: no values, no regrets (both would be
+    // zero), but p's strategy sums still add p's own reach x sigma, as at every node p reaches
+    void v_avg(TNode* t, int p, const double* rp, int r, double weight, VCtx& vc) {
+        if (t->terminal || t->leaf) return;
+        {
+            bool any = false;
+            for (int d = 0; d < N_COMBOS && !any; d++) any = rp[d] != 0.0;
+            if (!any) return;
+        }
+        const int q = t->seat;
+        const int na = t->na.n;
+        const int nc = t->n_cache;
+        std::call_once(t->vonce, [&]() {
+            t->vreg.assign((size_t)nc * na, 0.0);
+            t->vss.assign((size_t)nc * na, 0.0);
+            t->vvis.assign((size_t)nc, 0);
+        });
+        auto child = [&](int a, const double* rpa) {
+            TNode* c = tchild(t, a);
+            if (r >= 0 && t->n_board == 4 && c->n_board == 5) {
+                const ComboTable& ct = combo_table();
+                double* rp2 = vc.get();
+                for (int d = 0; d < N_COMBOS; d++) rp2[d] = (ct.c0[d] == r || ct.c1[d] == r) ? 0.0 : rpa[d];
+                v_avg(c, p, rp2, r, weight, vc);
+                vc.release(1);
+                return;
+            }
+            v_avg(c, p, rpa, r, weight, vc);
+        };
+        if (q != p) {
+            for (int a = 0; a < na; a++) child(a, rp);
+            return;
+        }
+        const bool river_part = t->street != root_street_;
+        const int* cpv = river_part ? vboards_[(size_t)(root_.n_board == 5 ? 52 : r)].bucket.data() : class_of_.data();
+        const int forced = t->path_node && q == hand_.our_seat ? our_combo_ : -1;
+        const int dep = vc.depth++;
+        if ((int)vc.rows.size() <= dep) {
+            vc.rows.resize((size_t)dep + 1);
+            vc.ints.resize((size_t)dep + 1);
+        }
+        std::vector<double>& rows = vc.rows[(size_t)dep];
+        if (rows.size() < (size_t)nc * na * 3) rows.resize((size_t)nc * na * 3);
+        double* sg = rows.data();
+        double* ss = sg + (size_t)nc * na;
+        t->vlock.lock();
+        for (int cp = 0; cp < nc; cp++) v_regret_matching(&t->vreg[(size_t)cp * na], na, &sg[(size_t)cp * na]);
+        t->vlock.unlock();
+        std::fill(ss, ss + (size_t)nc * na, 0.0);
+        std::vector<int>& cnt = vc.ints[(size_t)dep];
+        cnt.assign((size_t)nc, 0);
+        for (int c = 0; c < N_COMBOS; c++) {
+            const int cp = cpv[c];
+            if (cp < 0 || cp >= nc || c == forced || rp[c] == 0.0) continue;
+            cnt[(size_t)cp]++;
+            for (int a = 0; a < na; a++) ss[(size_t)cp * na + a] += rp[c] * sg[(size_t)cp * na + a];
+        }
+        t->vlock.lock();
+        for (int cp = 0; cp < nc; cp++) {
+            if (!cnt[(size_t)cp]) continue;
+            for (int a = 0; a < na; a++) t->vss[(size_t)cp * na + a] += weight * ss[(size_t)cp * na + a];
+            t->vvis[(size_t)cp] += 1;
+        }
+        t->vlock.unlock();
+        double* rp2 = vc.get();
+        for (int a = 0; a < na; a++) {
+            for (int c = 0; c < N_COMBOS; c++) {
+                const int cp = cpv[c];
+                const double sgm = c == forced ? (a == t->path_index ? 1.0 : 0.0) : (cp < 0 || cp >= nc) ? 0.0 : sg[(size_t)cp * na + a];
+                rp2[c] = rp[c] * sgm;
+            }
+            child(a, rp2);
+        }
+        vc.release(1);
+        vc.depth--;
     }
 
     // the child of t through action a, crossing to the river card r when the action ends the turn
@@ -2553,6 +2629,7 @@ private:
             for (int d = 0; d < N_COMBOS && !any; d++) any = ro[d] != 0.0;
             if (!any) {
                 std::fill(v, v + N_COMBOS, 0.0);
+                v_avg(t, p, rp, r, weight, vc);
                 return;
             }
         }
@@ -2572,7 +2649,6 @@ private:
         if ((int)vc.rows.size() <= dep) {
             vc.rows.resize((size_t)dep + 1);
             vc.ints.resize((size_t)dep + 1);
-            vc.seen.resize((size_t)dep + 1);
         }
         // sigma of every card part (a snapshot of the node's regrets), then per combo and action
         std::vector<double>& rows = vc.rows[(size_t)dep];
@@ -2606,7 +2682,19 @@ private:
                     ro2[d] = ro[d] * Sa[d];
                     mass += ro2[d];
                 }
-                if (!(mass > 0.0)) continue;
+                if (!(mass > 0.0)) {
+                    TNode* c = tchild(t, a);
+                    if (r >= 0 && t->n_board == 4 && c->n_board == 5) {
+                        const ComboTable& ct = combo_table();
+                        double* rp2 = vc.get();
+                        for (int d = 0; d < N_COMBOS; d++) rp2[d] = (ct.c0[d] == r || ct.c1[d] == r) ? 0.0 : rp[d];
+                        v_avg(c, p, rp2, r, weight, vc);
+                        vc.release(1);
+                    } else {
+                        v_avg(c, p, rp, r, weight, vc);
+                    }
+                    continue;
+                }
                 v_child(t, a, p, o, rp, ro2, r, weight, ctx, vc, va);
                 for (int c = 0; c < N_COMBOS; c++) v[c] += va[c];
             }
@@ -2685,6 +2773,9 @@ private:
 
     void vector_loop(Ctx& ctx, std::atomic<long long>& next_t, std::atomic<bool>& stop,
                      std::chrono::steady_clock::time_point deadline, const NodeKey& our_key, int our_n) {
+        // a river root has no chance to sample: concurrent full-width iterations would only read each other's
+        // stale regrets (measured: 4 threads converge 5x slower per second), so it runs on one thread
+        if (vriver_.empty() && ctx.tid > 0) return;
         VCtx vc;
         std::vector<double> v((size_t)N_COMBOS);
         while (!stop.load(std::memory_order_relaxed)) {
