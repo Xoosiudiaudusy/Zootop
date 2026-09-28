@@ -5,10 +5,11 @@ of an observed raise must be one of them: otherwise every later key of the hand 
 plays check/call ("off the map").  Checked on the production grid (HU 200bb: preflop 0.5/1/3 pot, postflop
 0.5/1/2/4 pot, 3 raises per street) and a 3-max game, with and without the per-event coins.
 
-QA-1 (found while writing these tests, production code unchanged): at a raise-capped node (``raises_this_street >=
-max_raises_per_street``) the abstract actions are f / c / a, but a non-all-in raise is still translated between the
+QA-1 (found while writing these tests; fixed 2026-09-29): at a raise-capped node (``raises_this_street >=
+max_raises_per_street``) the abstract actions are f / c / a, but a non-all-in raise was translated between the
 grid's pot fractions ("r1", "r3"), which do not exist there.  At 200bb a preflop 5-bet short of all-in (open, 3-bet,
-4-bet, 5-bet) reaches it; the blueprint agent then misses every key of the hand and calls.
+4-bet, 5-bet) reaches it; the blueprint agent then missed every key of the hand and called.  Now such a raise is "a"
+(Python BetGrid.from_concrete, C++ BetGrid::from_concrete, and the AIVAT's translation outcomes in both).
 """
 from __future__ import annotations
 
@@ -108,8 +109,6 @@ def _five_bet_short_of_all_in():
     return h, obs, ev
 
 
-@pytest.mark.xfail(strict=True, reason="QA-1: BetGrid.from_concrete (abstraction/actions.py) ignores the raise cap: a "
-                                        "non-all-in raise at a capped node becomes 'r1'/'r3', which that node does not have")
 def test_a_raise_at_a_raise_capped_node_translates_to_the_all_in():
     _, obs, ev = _five_bet_short_of_all_in()
     assert GRID_HU200.from_concrete(ev, ev.all_in) == "a"
@@ -123,8 +122,6 @@ class _Buckets:
         return 0
 
 
-@pytest.mark.xfail(strict=True, reason="QA-1: after a capped-node raise the blueprint agent looks up a history the "
-                                        "abstract game never has, falls back to check/call and counts it off the map")
 def test_the_blueprint_agent_finds_its_key_after_a_raise_at_a_capped_node():
     h, capped_obs, ev = _five_bet_short_of_all_in()
     obs = h.observe()  # the SB answers the 5-bet

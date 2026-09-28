@@ -26,7 +26,6 @@ After training the script prints:
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import shutil
 import sys
@@ -42,7 +41,7 @@ from negpluribus.cfr.mccfr import MCCFRTrainer  # noqa: E402
 from negpluribus.abstraction import BUCKET_KINDS, bucketer_kind, load_bucketer  # noqa: E402
 from negpluribus.engine import Street  # noqa: E402
 from negpluribus.eval import duplicate_match  # noqa: E402
-from negpluribus.fast.blueprint import tagged_path  # noqa: E402
+from negpluribus.fast.runinfo import ResumeError, code_version, new_passport, now_text, read_passport, resume_checkpoint, train_diff, write_passport  # noqa: E402
 from negpluribus.fast.power import CoreMeter, disable_power_throttling  # noqa: E402
 
 DATA = os.path.join(os.path.dirname(__file__), "..", "data")
@@ -82,7 +81,12 @@ def main() -> None:
     ap.add_argument("--iters", type=int, default=30000)
     ap.add_argument("--no-linear", action="store_true", help="plain CFR weighting instead of Linear CFR")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--resume", action="store_true",
+                    help="continue checkpoint_<tag>.bin/.json (the one of the larger iteration); an error if there is none, or if "
+                         "its passport (<file>.run.json) says it was trained with other --seed/--batch/--no-linear/--linear-until/"
+                         "--prune-* settings")
+    ap.add_argument("--resume-override", action="store_true",
+                    help="with --resume: continue even if these settings differ from the checkpoint's (the passport keeps the history)")
     ap.add_argument("--eval-deals", type=int, default=300)
     ap.add_argument("--tag", default=None)
     ap.add_argument("--backend", choices=["python", "cpp"], default=None, help="traversal backend (default: NEGPLURIBUS_BACKEND or python)")
@@ -182,15 +186,47 @@ def main() -> None:
     also_json = cpp and args.json and ext == ".bin"  # JSON copies next to the binary files
     print(f"backend: {trainer.backend}" + (f" x{trainer.threads} threads, bucket cache {trainer.cache_caps}" if cpp else "")
           + f", files {ext[1:]}{' + json' if also_json else ''}, Windows power throttling {'off' if no_throttle else 'not changed'}")
+    # the run passport (negpluribus/fast/runinfo.py): the settings that change what training computes, how it runs,
+    # the game; written next to every checkpoint and blueprint as <file>.run.json
+    train_settings = {"seed": int(args.seed), "batch": int(args.batch), "linear": not args.no_linear, "linear_until": int(args.linear_until),
+                      "prune_below": float(args.prune_below), "prune_prob": float(args.prune_prob), "prune_after": int(args.prune_after),
+                      "prune_relative": bool(args.prune_relative), "prune_scale_t": bool(args.prune_scale_t),
+                      "regret_floor": float(args.regret_floor)}
+    game_info = {"players": args.players, "stack_bb": args.stack, "street": args.street, "preflop_fracs": args.preflop_fracs,
+                 "postflop_fracs": args.postflop_fracs, "max_raises": args.max_raises, "buckets": args.buckets,
+                 "buckets_kind": args.buckets_kind, "exact_features": bool(args.exact_features), "tag": tag}
+    history: list = []
     if args.resume:
-        # C++ backend: checkpoint_<tag>.bin or .json, whichever was written last (the C++ trainer
-        # reads both; a Python-backend run on the same tag writes JSON); Python backend: the JSON
-        resume_from = tagged_path(data, "checkpoint", tag) if cpp else ck_path
-        if os.path.exists(resume_from):
-            t = time.perf_counter()
-            trainer.load_checkpoint(resume_from)
-            print(f"resumed from iteration {trainer.iteration:,} ({len(trainer.nodes):,} infosets, {resume_from}, "
-                  f"{time.perf_counter() - t:.1f}s)")
+        # C++ backend: checkpoint_<tag>.bin or .json, the one of the larger iteration (never the newer file: an old
+        # JSON next to a later binary is not continued); Python backend: the JSON.  None: an error, not a new run
+        try:
+            resume_from = resume_checkpoint(data, tag, binary=cpp)
+        except ResumeError as err:
+            raise SystemExit(str(err))
+        saved = read_passport(resume_from)
+        t = time.perf_counter()
+        trainer.load_checkpoint(resume_from)
+        diff = train_diff(saved, train_settings) if saved else {}
+        if bool(trainer.linear) != train_settings["linear"]:  # the checkpoint's own flag (it used to override --no-linear silently)
+            diff["linear"] = (bool(trainer.linear), train_settings["linear"])
+        if diff:
+            text = ", ".join(f"{k}: {a!r} (checkpoint) vs {b!r} (now)" for k, (a, b) in diff.items())
+            if not args.resume_override:
+                raise SystemExit(f"--resume: {resume_from} was trained with other settings: {text}; use the same flags, "
+                                 "another --tag, or --resume-override to continue anyway")
+            print(f"--resume-override: continuing with other settings than the checkpoint's: {text}")
+            trainer.linear = train_settings["linear"]
+        if saved is None:
+            print(f"note: {resume_from} has no passport (written before passports): its settings cannot be checked")
+        history = list(saved.get("history", [])) if saved else []
+        print(f"resumed from iteration {trainer.iteration:,} ({len(trainer.nodes):,} infosets, {resume_from}, "
+              f"{time.perf_counter() - t:.1f}s)")
+    segment = {"from_iteration": int(trainer.iteration), "started": now_text(), "code": code_version(), "backend": trainer.backend,
+               "threads": int(getattr(trainer, "threads", 1) or 1), "device": "cpu", "train": dict(train_settings)}
+
+    def passport(iteration: int) -> dict:
+        seg = dict(segment, to_iteration=int(iteration))
+        return new_passport(train_settings, {k: seg[k] for k in ("backend", "threads", "device")}, game_info, iteration, history + [seg])
 
     def it_path(path: str) -> str:  # blueprint_<tag>.it<N>.<ext>
         root, e = os.path.splitext(path)
@@ -203,17 +239,25 @@ def main() -> None:
             # JSON copies first, so that the binary files are the newest of each pair
             # (fast.blueprint.tagged_path, --resume)
             pairs = ([(ck_path[: -len(ext)] + ".json", bp_path[: -len(ext)] + ".json")] if also_json else []) + [(ck_path, bp_path)]
+            pp = passport(trainer.iteration)
             for ck, bp in pairs:
                 trainer.save_checkpoint(ck)
                 trainer.save_blueprint(bp)
+                write_passport(ck, pp)
+                write_passport(bp, pp)
                 if snapshot:
                     shutil.copyfile(bp, it_path(bp))  # the same bytes
+                    write_passport(it_path(bp), pp)
         else:
+            pp = passport(trainer.iteration)
             trainer.save_checkpoint(ck_path)
             s = strat if strat is not None else trainer.strategy()
             s.save(bp_path)
+            write_passport(ck_path, pp)
+            write_passport(bp_path, pp)
             if snapshot:
                 s.save(it_path(bp_path))
+                write_passport(it_path(bp_path), pp)
 
     if args.gpu_emulate and args.gpu < 0:
         args.gpu = 0
@@ -243,13 +287,6 @@ def main() -> None:
     t0 = time.perf_counter()
     gpu_started = False  # the flat trainer holds this run's tables (set just before its training loop)
 
-    def write_gpu_info(path: str, info: dict) -> None:
-        # (the text first, then a temporary file renamed over the old one: a failure leaves the old file whole)
-        text = json.dumps(info)
-        with open(path + ".tmp", "w", encoding="utf-8") as f:
-            f.write(text)
-        os.replace(path + ".tmp", path)
-
     try:
         if args.gpu >= 0:
             # the flat trainer on the device (gpucfr.h); its tables are then handed to the ordinary trainer,
@@ -266,18 +303,8 @@ def main() -> None:
             else:
                 ft.use_gpu(args.gpu)
             print(f"GPU: {'EMULATED on the CPU' if args.gpu_emulate else ft.gpu_device}; flat game {ft.game_stats()}", flush=True)
-            run_info = {"seed": int(args.seed), "batch": int(args.batch), "linear": not args.no_linear, "linear_until": int(args.linear_until)}
-            info_path = ck_path + ".gpu.json"  # what a GPU checkpoint was trained with (checked on --resume)
-            if trainer.iteration > 0:  # --resume loaded a checkpoint: its tables go to the device
-                if os.path.exists(info_path):
-                    with open(info_path, encoding="utf-8") as f:
-                        saved = json.load(f)
-                    diff = {k: (saved.get(k), v) for k, v in run_info.items() if saved.get(k) != v}
-                    if diff:
-                        raise SystemExit(f"--resume --gpu: the checkpoint was trained with other settings {diff} (saved, now); "
-                                         "use the same --seed / --batch / --linear-until, or another --tag")
-                else:
-                    print("GPU: resuming from a checkpoint without GPU run info (a CPU checkpoint?): continuing from its tables")
+            segment["device"] = "GPU emulated on the CPU" if args.gpu_emulate else f"GPU {args.gpu}: {ft.gpu_device}"
+            if trainer.iteration > 0:  # --resume loaded a checkpoint (its settings checked above): its tables go to the device
                 t_load = time.perf_counter()
                 n_rows = ft.copy_from(trainer._core)
                 trainer._core.import_nodes({}, True)  # the table lives in the flat trainer now
@@ -294,7 +321,6 @@ def main() -> None:
                 t_save = time.perf_counter()
                 ft.copy_to(trainer._core)
                 save_outputs(snapshot=True)
-                write_gpu_info(info_path, dict(run_info, iteration=int(ft.iteration)))
                 n_inf = trainer.n_nodes
                 trainer._core.import_nodes({}, True)  # free the copy until the next checkpoint
                 print(f"  checkpoint {ft.iteration:,}: {n_inf:,} infosets, {time.perf_counter() - t0:.0f}s, "
@@ -330,8 +356,6 @@ def main() -> None:
             import gc
 
             gc.collect()
-            with open(info_path, "w", encoding="utf-8") as f:
-                json.dump(dict(run_info, iteration=int(trainer.iteration)), f)
         elif args.seconds > 0:
             train_for(lambda n: trainer.train(n), lambda: trainer.iteration, "CPU")
         cores = CoreMeter()  # busy cores per checkpoint interval: ~4 instead of ~15 means the run is throttled
@@ -390,16 +414,18 @@ def main() -> None:
             if flat is not None and flat.tables_consistent:
                 flat.copy_to(trainer._core)
                 trainer.save_checkpoint(ck_path)
-                write_gpu_info(ck_path + ".gpu.json", dict(run_info, iteration=int(flat.iteration)))
+                write_passport(ck_path, passport(flat.iteration))
                 saved = flat.iteration
-            elif flat is None and cpp and args.batch > 0 and trainer._core.tables_consistent:
+            elif flat is None and cpp and trainer._core.tables_consistent:  # (batched: the failed batch was not applied;
+                # plain: a table growth that failed after the last iteration of the call -- the tables are whole)
                 trainer.save_checkpoint(ck_path)
+                write_passport(ck_path, passport(trainer.iteration))
                 saved = trainer.iteration
         except Exception as e2:  # (writing needs memory too; a failed write leaves the old file: .tmp + rename)
             text += f"; writing the checkpoint failed too ({type(e2).__name__}: {e2}): the last checkpoint on disk is untouched"
         else:
             text += (f"; checkpoint of iteration {saved:,} written to {ck_path}: continue with --resume" if saved is not None
-                     else "; no checkpoint written (the tables hold part of an iteration): the last checkpoint on disk is untouched")
+                     else "; no checkpoint written (the tables may hold part of the failed call's iterations): the last checkpoint on disk is untouched")
         raise SystemExit(f"training stopped: {text}")
     print(f"done in {time.perf_counter() - t0:.0f}s, {len(trainer.nodes):,} infosets")
     if cpp and args.prune_below > 0:
@@ -408,13 +434,15 @@ def main() -> None:
               f"nodes touched + pruned), nodes touched {touched:,} ({touched / max(1, trainer.iteration):.1f} per iteration)")
     # the agent's strategy: the average strategy at full precision, as trainer.strategy() had it
     # (C++ backend: the same floats from a C++ lookup, no dict)
+    # the final state also as the .it<N> snapshot of its iteration (M1: a later --resume writes over the plain files;
+    # GPU runs end on whole batches, so their snapshot names are multiples of the batch like their checkpoints)
     if cpp:
-        save_outputs(snapshot=False)
+        save_outputs(snapshot=True)
         # the in-memory blueprint only for the evaluation below (a large game's copy may not fit in RAM)
         strat = trainer.blueprint(rounded=False) if args.eval_deals > 0 else None
     else:
         strat = trainer.strategy()
-        save_outputs(snapshot=False, strat=strat)
+        save_outputs(snapshot=True, strat=strat)
     print("saved", bp_path)
 
     # ------------------------------------------------------------ sanity rows

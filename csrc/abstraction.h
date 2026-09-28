@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -24,6 +25,7 @@
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <unordered_map>
 #include <vector>
 
@@ -64,6 +66,15 @@ inline std::string raise_name(double frac) {
     char buf[32];
     std::snprintf(buf, sizeof buf, "r%g", frac);
     return std::string(buf);
+}
+
+// the other way: the pot fraction of a raise size's name ("r0.5" -> 0.5); false for "f", "c", "a" and any
+// other name (negpluribus/cfr/strategy.py size_fraction: the same syntax, read correctly rounded on both sides)
+inline bool size_fraction(const std::string& s, double& frac) {
+    if (s.size() < 2 || s[0] != 'r') return false;
+    const char* last = s.data() + s.size();
+    const std::from_chars_result r = std::from_chars(s.data() + 1, last, frac);
+    return r.ec == std::errc() && r.ptr == last && std::isfinite(frac);
 }
 
 // ------------------------------------------------------------------ bet grid
@@ -216,7 +227,8 @@ struct BetGrid {
 
     // deterministic translation (event_rng=None in the reference).  Ganzfried & Sandholm (IJCAI
     // 2013): translate between the two neighbouring ABSTRACT actions, the all-in being one of
-    // them; grid sizes at or above the actor's all-in are the all-in in that spot.  Mirrors
+    // them; grid sizes at or above the actor's all-in are the all-in in that spot.  A raise at a
+    // raise-capped node, where abstract_actions() has only f / c / a, is the all-in (QA-1).  Mirrors
     // BetGrid.from_concrete in negpluribus/abstraction/actions.py operation for operation.
     // (Since 2026-09-24 the sorted grid lives on the stack instead of two vector copies per raise:
     // the same sorted values, the same comparisons, so the same token.)
@@ -225,6 +237,7 @@ struct BetGrid {
         if (ev.type == CALL) { out += 'c'; return; }
         const std::vector<double>& fracs = fracs_for(ev.street);
         if (ev.all_in && allow_all_in) { out += 'a'; return; }
+        if (ev.raises_this_street >= max_raises_per_street) { out += allow_all_in ? 'a' : 'c'; return; }
         if (fracs.empty()) { out += 'a'; return; }
         double x = observed_frac(ev);
         int pot_after_call = ev.pot_before + ev.to_call;

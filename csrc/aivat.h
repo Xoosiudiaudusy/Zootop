@@ -162,7 +162,9 @@ inline void translation_outcomes(const BetGrid& g, const Event& ev, TransOut& ou
         return out.one(t);
     }
     const std::vector<double>& fracs = g.fracs_for(ev.street);
-    if ((ev.all_in && g.allow_all_in) || fracs.empty()) return out.one("a");
+    if (ev.all_in && g.allow_all_in) return out.one("a");
+    if (ev.raises_this_street >= g.max_raises_per_street) return out.one(g.allow_all_in ? "a" : "c");  // capped node (QA-1)
+    if (fracs.empty()) return out.one("a");
     const double x = BetGrid::observed_frac(ev);
     const int pac = ev.pot_before + ev.to_call;
     if (g.allow_all_in && ev.stack_after >= 0 && pac > 0) {

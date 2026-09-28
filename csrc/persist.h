@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -632,10 +633,12 @@ inline CheckpointScalars read_checkpoint_json(const std::string& path, BetGrid& 
 // 9 x (actions) bytes per infoset, plus the key strings only when asked for (exports, `items`).
 //
 // policy(key, legal) is BlueprintStrategy.policy: the entry of `key` (None if absent), the
-// probability of each legal name (the last one if a name appears twice, 0.0 if absent), their sum
-// with CPython's sum() (py_sum), None if it is <= 0, else each value divided by the sum.  Keys are
-// found by numeric key: equal strings, equal keys; a different string with the same 128-bit key
-// is the (never observed) collision case, refused at load when the key strings are there.
+// probability of each legal name (the last one if a name appears twice, 0.0 if absent), plus for
+// the all-in the probability of the record's raise sizes that are the all-in at this node (H4, see
+// Collapse), their sum with CPython's sum() (py_sum), None if it is <= 0, else each value divided by
+// the sum.  Keys are found by numeric key: equal strings, equal keys; a different string with the
+// same 128-bit key is the (never observed) collision case, refused at load when the key strings are
+// there.
 class BlueprintTable {
 public:
     GameIdentity identity;  // has_game false when unknown (a table loaded from JSON)
@@ -694,8 +697,10 @@ public:
     }
 
     // BlueprintStrategy.policy for record i and the legal names given by their index in `names`
-    // (-1: not a name of this table); false = None
-    bool policy_at(long long i, const int* legal, int n_legal, double* out) const {
+    // (-1: not a name of this table); false = None.  `moved` (optional): the probability the record's
+    // collapsed raise sizes gave to the all-in (0 when none).  The same floats in the same order as
+    // policy_of_row in negpluribus/cfr/strategy.py.
+    bool policy_at(long long i, const int* legal, int n_legal, double* out, double* moved = nullptr) const {
         const uint32_t a = off[(size_t)i], b = off[(size_t)i + 1];
         for (int l = 0; l < n_legal; l++) {
             double v = 0.0;
@@ -703,10 +708,28 @@ public:
                 for (uint32_t t = a; t < b; t++) if (ids[t] == legal[l]) v = prob(t);
             out[l] = v;
         }
+        double m = 0.0;
+        const Collapse c = collapse_of(i, legal, n_legal);
+        if (c.all_in >= 0)
+            for (uint32_t t = a; t < b; t++)
+                if (collapses(c, t, legal, n_legal)) {
+                    const double p = prob(t);
+                    out[c.all_in] += p;
+                    m += p;
+                }
+        if (moved) *moved = m;
         const double s = py_sum(out, n_legal);
         if (s <= 0) return false;
         for (int l = 0; l < n_legal; l++) out[l] = out[l] / s;
         return true;
+    }
+
+    // the index in `legal` that record entry t (off[i] <= t < off[i + 1]) is played at: its own name's
+    // (the first), the all-in's when it is a raise size that collapsed into it (Collapse), else -1
+    int legal_index_at(long long i, uint32_t t, const int* legal, int n_legal) const {
+        for (int l = 0; l < n_legal; l++) if (legal[l] == ids[t]) return l;
+        const Collapse c = collapse_of(i, legal, n_legal);
+        return collapses(c, t, legal, n_legal) ? c.all_in : -1;
     }
 
     size_t prob_bytes() const { return probs.capacity() * 8 + kprobs.capacity() * 4; }
@@ -730,6 +753,14 @@ public:
             dir_[j] = (uint32_t)i;
         }
         dir_.shrink_to_fit();
+        // the names are final here (every loader calls this last): their raise-size fractions, the all-in
+        size_frac_.assign(names.size(), std::numeric_limits<double>::quiet_NaN());
+        all_in_name_ = -1;
+        for (size_t k = 0; k < names.size(); k++) {
+            double f;
+            if (size_fraction(names[k], f)) size_frac_[k] = f;
+            else if (names[k] == "a" && all_in_name_ < 0) all_in_name_ = (int)k;
+        }
     }
     // names deduplicated (a grid has "r1" preflop and postflop), ids rewritten to the first index
     void dedupe_names() {
@@ -755,6 +786,50 @@ public:
 private:
     std::vector<uint32_t> dir_;
     int shift_ = 63;
+    std::vector<double> size_frac_;  // per name: its pot fraction if it is a raise size ("r0.5"), else NaN
+    int all_in_name_ = -1;           // the index of "a" in names (-1: none)
+
+    // H4.  A raise size of a record that `legal` lacks and that is larger than every raise size `legal`
+    // shares with the record reaches the stack at this node: chips grow with the pot fraction, and
+    // BetGrid::abstract_actions lists the all-in in place of every size that hits the stack.  That
+    // happens to a record played at a shallower stack than it was trained for (the 200bb blueprint at
+    // a 50bb table, a depth-grid point above the table's stack) or after an off-grid bet.  Its
+    // probability goes to the all-in, the nearest legal action by amount, when that is legal, instead
+    // of being renormalised away; other missing names (a size clamped onto a smaller one, anything
+    // when the all-in is not legal) are renormalised away as before.  A table without the name "a"
+    // cannot recognise a legal all-in and moves nothing.
+    struct Collapse {
+        int all_in = -1;  // the all-in's index in legal; -1: nothing moves
+        double top = -std::numeric_limits<double>::infinity();  // the largest raise size legal shares with the record
+    };
+    double frac_of(int id) const {  // NaN: not a raise size (or not a name of the table)
+        return id >= 0 && (size_t)id < size_frac_.size() ? size_frac_[(size_t)id] : std::numeric_limits<double>::quiet_NaN();
+    }
+    static bool listed(int id, const int* legal, int n_legal) {
+        for (int l = 0; l < n_legal; l++) if (legal[l] == id) return true;
+        return false;
+    }
+    Collapse collapse_of(long long i, const int* legal, int n_legal) const {
+        Collapse c;
+        const uint32_t a = off[(size_t)i], b = off[(size_t)i + 1];
+        bool missing = false;  // a name of the record that legal lacks (never at the record's own node)
+        for (uint32_t t = a; t < b && !missing; t++) missing = !listed(ids[t], legal, n_legal);
+        if (!missing || all_in_name_ < 0) return c;
+        for (int l = 0; l < n_legal && c.all_in < 0; l++) if (legal[l] == all_in_name_) c.all_in = l;
+        if (c.all_in < 0) return c;
+        for (int l = 0; l < n_legal; l++) {
+            const double f = frac_of(legal[l]);
+            if (!(f > c.top)) continue;  // not a size (NaN), or not larger
+            bool in_record = false;
+            for (uint32_t t = a; t < b && !in_record; t++) in_record = ids[t] == legal[l];
+            if (in_record) c.top = f;
+        }
+        return c;
+    }
+    // record entry t is a raise size that collapsed into the all-in
+    bool collapses(const Collapse& c, uint32_t t, const int* legal, int n_legal) const {
+        return c.all_in >= 0 && frac_of(ids[t]) > c.top && !listed(ids[t], legal, n_legal);
+    }
 };
 
 // Layout (little-endian):

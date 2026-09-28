@@ -328,7 +328,11 @@ def translation_outcomes(grid: BetGrid, ev: Event) -> List[Tuple[str, float]]:
     if ev.action.type != ActionType.RAISE:
         return [(grid.from_concrete(ev, ev.all_in, None), 1.0)]
     fracs = grid.fracs_for(ev.street)
-    if (ev.all_in and grid.allow_all_in) or not fracs:
+    if ev.all_in and grid.allow_all_in:
+        return [("a", 1.0)]
+    if ev.raises_this_street >= grid.max_raises_per_street:  # a raise-capped node: f / c / a only (QA-1)
+        return [("a" if grid.allow_all_in else "c", 1.0)]
+    if not fracs:
         return [("a", 1.0)]
     x = grid.observed_frac(ev)
     x_allin = grid.all_in_frac(ev)

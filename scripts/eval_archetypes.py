@@ -39,6 +39,9 @@ picked per hand by the effective stack; --blueprint / --buckets are then only th
 overbettor).  --log-hands writes the point and its blueprint with every hero decision, and with the first
 one the effective stack and the review's alternatives (docs/stack_grid_design.md 6.4); every hand line has
 the starting stacks ("stacks", chips).
+The "blueprint" opponents count their decisions whose lookup gave the probability of raise sizes that are the
+all-in at this stack to the all-in (a blueprint deeper than the table, H4 in docs/stack_grid_design.md 8): per
+hand "opp_all_in" in --log-hands (only when non-zero), in total a line after the result.
 The Python evaluation is the reference; the blueprint answers through its own abstraction,
 exactly as at the table.  --blueprint takes either format (binary .bin or JSON); with the C++
 core built the strategy is looked up in C++ (the same probabilities, a tenth of the memory;
@@ -205,8 +208,8 @@ def main() -> None:
             hero = BlueprintAgent(bp, bk_play, spec.grid, seed=1, name="hero")
         if opp == "gridrandom":
             vils = [GridRandomAgent(spec.grid, name=f"{opp}{i}", seed=10 + i) for i in range(n - 1)]
-        elif opp == "blueprint":
-            vils = [BlueprintAgent(obp, obk, spec.grid, name=f"{opp}{i}", seed=10 + i) for i in range(n - 1)]
+        elif opp == "blueprint":  # counting the lookups that give collapsed raise sizes to the all-in (report, hand log)
+            vils = [BlueprintAgent(obp, obk, spec.grid, name=f"{opp}{i}", seed=10 + i, count_all_in=True) for i in range(n - 1)]
         elif opp == "overbettor":
             vils = [ValueOverbettor(bp, bk_play, spec.grid, mult=args.overbet_mult, name=f"{opp}{i}", seed=10 + i) for i in range(n - 1)]
         else:
@@ -219,6 +222,7 @@ def main() -> None:
                   f"off-map {hero.fallback_rate:.1%}, {time.perf_counter() - t:.0f}s)", flush=True)
             if opp == "overbettor":
                 print(f"             overbets made: {sum(v.n_overbets for v in vils):,}", flush=True)
+            print_all_in(vils)
             continue
         log = open(args.log, "a", encoding="utf-8") if args.log else None
 
@@ -237,13 +241,18 @@ def main() -> None:
                 print(f"    {opp} deal {r.n_deals}: {r.line()}, {time.perf_counter() - t0:.0f}s{extra}", flush=True)
 
         hand_log = open(args.log_hands, "a", encoding="utf-8") if args.log_hands else None
+        all_in_seen = [0]  # the opponents' decisions so far whose lookup moved collapsed sizes to the all-in
 
-        def on_hand(d, seat, rec, luck_bb, infos, opp=opp):
+        def on_hand(d, seat, rec, luck_bb, infos, opp=opp, vils=vils, all_in_seen=all_in_seen):
             row = {"opponent": opp, "agent": args.agent, "deal": d, "hero_seat": seat, "button": rec.button,
                    "stacks": list(rec.starting_stacks), "holes": rec.hole_cards, "board": rec.board,
                    "events": [[int(e.street), e.seat, int(e.action.type), int(e.action.amount)] for e in rec.events],
                    "net_bb": rec.net[seat] / spec.bb, "luck_bb": None if luck_bb is None else round(luck_bb, 4),
                    "hero": [{k: v for k, v in i.items() if k in HERO_KEYS} for i in infos]}
+            moved = sum(getattr(v, "n_all_in", 0) for v in vils)
+            if moved > all_in_seen[0]:  # only then: at the blueprints' own depth the logs keep their old bytes
+                row["opp_all_in"] = moved - all_in_seen[0]
+            all_in_seen[0] = moved
             hand_log.write(json.dumps(row) + "\n")
             hand_log.flush()
 
@@ -261,6 +270,15 @@ def main() -> None:
             print(f"             {hero.summary()}; {memory_line()}", flush=True)
         if opp == "overbettor":
             print(f"             overbets made: {sum(v.n_overbets for v in vils):,}", flush=True)
+        print_all_in(vils)
+
+
+def print_all_in(vils) -> None:
+    """The line of the opponents' decisions whose lookup moved collapsed raise sizes to the all-in (if any)."""
+    n_all_in = sum(getattr(v, "n_all_in", 0) for v in vils)
+    if n_all_in:
+        print(f"             opponent decisions with raise sizes played as the all-in (collapsed at this stack): "
+              f"{n_all_in:,} of {sum(getattr(v, 'n_decisions', 0) for v in vils):,}", flush=True)
 
 
 if __name__ == "__main__":

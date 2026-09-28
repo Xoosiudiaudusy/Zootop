@@ -1612,12 +1612,13 @@ private:
                 int legal[MAX_ACTIONS];
                 for (int a = 0; a < na.n; a++) legal[a] = grid_to_bp_[na.id[a]];
                 if (!game_->presampled.empty()) {  // the action drawn in advance for this infoset and continuation
-                    const int name = bp.ids[bp.off[(size_t)i] + game_->presampled[(size_t)i * N_CONTINUATIONS + (size_t)choice]];
-                    for (int a = 0; a < na.n; a++) {
-                        if (legal[a] == name) {
-                            for (int b = 0; b < na.n; b++) p[b] = b == a ? 1.0 : 0.0;
-                            return;
-                        }
+                    // (a raise size that is the all-in here plays the all-in, as in policy_at; a name that is
+                    // not legal for another reason: the renormalised row)
+                    const uint32_t t = bp.off[(size_t)i] + game_->presampled[(size_t)i * N_CONTINUATIONS + (size_t)choice];
+                    const int a = bp.legal_index_at(i, t, legal, na.n);
+                    if (a >= 0) {
+                        for (int b = 0; b < na.n; b++) p[b] = b == a ? 1.0 : 0.0;
+                        return;
                     }
                 }
                 have = bp.policy_at(i, legal, na.n, p);

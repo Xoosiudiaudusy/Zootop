@@ -598,6 +598,47 @@ def test_continuations_multiply_fold_call_or_raises_by_five_and_renormalise(trai
     assert checked > 400 and unknown < checked / 4
 
 
+def test_a_deeper_blueprint_gives_its_collapsed_sizes_to_the_all_in_in_the_search(trained):
+    """H4 in the search: the 30bb blueprint in the SearchGame of a 12bb table (a deeper blueprint on a shallower
+    table, like the single 200bb blueprint at 50bb).  Many of its sizes are the all-in there; the rollout policy and
+    the ranges are BlueprintStrategy.policy at the real legal names (collapsed sizes -> "a"): the ranges bit for bit,
+    the rollout policy to 1e-15, on states where probability moved to the all-in."""
+    from negpluribus.cfr.strategy import policy_of_row
+    from negpluribus.fast.trainer import spec_to_dict
+
+    spec, t, _, cbk = trained[2]
+    shallow = GameSpec(n_players=2, stack_bb=12, max_street=Street.RIVER, n_buckets=8, max_raises_per_street=2,
+                       preflop_fracs=(1.0,), postflop_fracs=(0.5, 1.0))
+    game = core.SearchGame(spec_to_dict(shallow), cbk, t.blueprint().lookup)
+    strategy = t.strategy()
+    grid = shallow.grid
+    rng = random.Random(21)
+    moved = checked = 0
+    for trial in range(40):
+        st, acts = random_hand(shallow, rng, rng.choice([Street.FLOP, Street.TURN, Street.RIVER]), off_grid=0.0)
+        root = int(st.street)
+        s = make_search(game, st, acts, depth="next_street" if root < 3 else "end")
+        assert [g for g in s.ranges()] == brute_ranges(shallow, strategy, cbk, st, acts, st.street)
+        k0 = s.root_info()["n_events"]
+        obs = st.observe(st.current_player)
+        hole = list(obs.hole)
+        b = cbk.bucket(hole, list(obs.board))
+        key = infoset_key_for_bucket(obs, b, grid)
+        legal = grid.abstract_actions(obs)
+        base = strategy.policy(key, legal)
+        row = strategy.table.get(key)
+        if base is None:
+            base = [1.0 if n == "c" else 0.0 for n in legal]
+        kinds_here = [0 if n == "f" else 1 if n == "c" else 2 for n in legal]
+        for choice in range(4):
+            names, got = s._rollout_policy(acts[k0:], hole[0], hole[1], choice)
+            assert names == legal
+            assert got == pytest.approx(core.apply_continuation(kinds_here, base, choice), abs=1e-15), (trial, choice)
+        checked += 1
+        moved += row is not None and policy_of_row(row[0], row[1], legal)[1] > 0
+    assert checked == 40 and moved >= 5, (checked, moved)
+
+
 def test_leaf_choices_are_shared_by_a_players_indistinguishable_leaves(trained):
     spec, _, game, _ = trained[2]
     st, acts = _flop_hand(spec, flop_board=[0, 20, 44])  # a one-suit flop: the other three suits are interchangeable

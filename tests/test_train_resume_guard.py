@@ -1,30 +1,37 @@
 """scripts/train_blueprint.py --resume, checkpoints and snapshots, end to end on the push/fold game, one thread; the GPU
 path runs on the CPU with --gpu-emulate (the GPU kernels' code on the host: the same numbers, no device used).
 
-docs/gpu_training.md: a GPU checkpoint writes checkpoint_<tag>.bin.gpu.json (seed, batch, linear, linear_until) and a
-resume with other values is refused; a resume with the same values continues bit for bit.  Checked:
+docs/gpu_training.md: every checkpoint has a passport checkpoint_<tag>.bin.run.json (seed, batch, linear, linear_until,
+pruning; since 29.09.2026 it replaces the GPU checkpoint's checkpoint_<tag>.bin.gpu.json) and a resume with other values
+is refused; a resume with the same values continues bit for bit.  Checked:
 
-  * a refused resume exits non-zero, names the settings and leaves the checkpoint, its run info and the blueprint
+  * a refused resume exits non-zero, names the settings and leaves the checkpoint, its passport and the blueprint
     untouched;
   * 1024 + --resume 512 iterations write the same blueprint and checkpoint bytes as 1536 in one run;
   * the GPU path's blueprint is the CPU batched mode's (the same average strategy).
 
-Regression tests of defects, xfail(strict) while the defect is in master:
+Regression tests of defects fixed by the resume-safety change (optimizer, opt/resume-safety aef7d62), ordinary tests
+since:
 
-  * H1 (= QA-3): --resume without a checkpoint of the tag trains from iteration 0 without a word
-    (train_blueprint.py:185-193 prints only when the file exists) and overwrites blueprint_<tag>.bin, the tag's
-    "latest" blueprint; and the file resumed from is the NEWER of checkpoint_<tag>.bin / .json by mtime
-    (fast/blueprint.py tagged_path), not the one further on.
-  * M1 (= QA-2): with --gpu the checkpoint that ends the run gets no .it<N> snapshot (the loop skips its gpu_checkpoint()
-    since "the final save below covers the last one", and that final save_outputs(snapshot=False) writes only
-    blueprint_<tag>.bin); the CPU path writes it.  The final version of every GPU run (the 600M depth-grid points,
-    pot64x at 1.6B) exists only under the name the next continuation of the tag overwrites.
-  * M3: a CPU --resume keeps nothing it does not store: --batch, --linear-until and a --no-linear against a linear
-    checkpoint go through silently (the GPU path refuses the same mismatches); at the trainer, linear_until and
-    batch_size of a checkpoint are not restored.  (The checkpoint's linear flag winning over the constructor's is
-    deliberate and tested in tests/test_persist.py:222; a fix that refuses instead must update that test.)
+  * H1 (= QA-3): --resume without a checkpoint of the tag trained from iteration 0 without a word and overwrote
+    blueprint_<tag>.bin, the tag's "latest" blueprint; and the file resumed from was the NEWER of
+    checkpoint_<tag>.bin / .json by mtime (fast/blueprint.py tagged_path), not the one further on.
+  * M1 (= QA-2): with --gpu the checkpoint that ends the run got no .it<N> snapshot (the final
+    save_outputs(snapshot=False) wrote only blueprint_<tag>.bin), so the final version of a GPU run existed only under
+    the name the next continuation of the tag overwrites.
+  * M3, the script's part: a CPU --resume let --batch, --linear-until and a --no-linear against a linear checkpoint go
+    through silently (the GPU path refused the same mismatches).
+
+Still open, xfail(strict) while the defect is in master:
+
+  * M3, the trainer's part: at the trainer, linear_until and batch_size of a checkpoint are not restored (the passport
+    is a file next to the checkpoint, checked by train_blueprint.py only).  (The checkpoint's linear flag winning over
+    the constructor's is deliberate and tested in tests/test_persist.py:222; a fix that refuses instead must update
+    that test.)
   * L1: CPU --batch with --checkpoint-every not a multiple of the batch splits batches at the checkpoints (a
     checkpointed run is another algorithm than the same run without checkpoints); the GPU path rounds it up.
+  * L6: on the CPU, --seconds trains in one timed loop and ignores --checkpoint-every (the .it<N> snapshot of the
+    final write, M1, is not a checkpoint of the run).
 """
 from __future__ import annotations
 
@@ -59,7 +66,7 @@ def _sha(path) -> str:
 
 
 def _files(d):
-    return {name: _sha(d / name) for name in ("checkpoint_g.bin", "checkpoint_g.bin.gpu.json", "blueprint_g.bin")}
+    return {name: _sha(d / name) for name in ("checkpoint_g.bin", "checkpoint_g.bin.run.json", "blueprint_g.bin")}
 
 
 @pytest.fixture(scope="module")
@@ -68,9 +75,12 @@ def first_run(tmp_path_factory):
     out = _run(d, "--iters", "1024", "--checkpoint-every", "512")
     assert out.returncode == 0, out.stderr[-2000:]
     assert "EMULATED on the CPU" in out.stdout
-    with open(d / "checkpoint_g.bin.gpu.json", encoding="utf-8") as f:
+    with open(d / "checkpoint_g.bin.run.json", encoding="utf-8") as f:
         info = json.load(f)
-    assert info == {"seed": 0, "batch": 256, "linear": True, "linear_until": 0, "iteration": 1024}
+    assert info["iteration"] == 1024
+    assert {k: info["train"][k] for k in ("seed", "batch", "linear", "linear_until")} == {"seed": 0, "batch": 256, "linear": True,
+                                                                                          "linear_until": 0}
+    assert not (d / "checkpoint_g.bin.gpu.json").exists()  # the passport replaced it
     return d
 
 
@@ -103,7 +113,7 @@ def test_a_resume_with_the_same_settings_continues_bit_for_bit(first_run, tmp_pa
     a, b = _files(resumed), _files(straight)
     assert a["blueprint_g.bin"] == b["blueprint_g.bin"]
     assert a["checkpoint_g.bin"] == b["checkpoint_g.bin"]
-    with open(resumed / "checkpoint_g.bin.gpu.json", encoding="utf-8") as f:
+    with open(resumed / "checkpoint_g.bin.run.json", encoding="utf-8") as f:
         assert json.load(f)["iteration"] == 1536
 
 
@@ -119,8 +129,6 @@ def test_the_gpu_path_writes_the_blueprint_of_the_cpu_batched_mode(first_run, tm
     assert len(a) > 100 and a == b
 
 
-@pytest.mark.xfail(strict=True, reason="M1 (= QA-2): train_blueprint.py GPU path skips the .it<N> snapshot of the last "
-                                        "checkpoint (its final save_outputs(snapshot=False) 'covers' it); the CPU path writes it")
 def test_the_gpu_path_keeps_a_snapshot_of_every_checkpoint_including_the_last(first_run):
     """The naming rule of the handoff (28.09 15:00): blueprint_<tag>.bin is the latest version and is overwritten when the
     tag trains on; fixed versions are the .it<N> snapshots.  The CPU path writes .it512 and .it1024 here
@@ -144,8 +152,6 @@ def _ck_iteration(path) -> int:
     return MCCFRTrainer(spec, seed=0, backend="cpp", threads=1).load_checkpoint(str(path)).iteration
 
 
-@pytest.mark.xfail(strict=True, reason="H1 (= QA-3): train_blueprint.py --resume without a checkpoint of the tag silently "
-                                        "trains from iteration 0 and overwrites blueprint_<tag>.bin")
 def test_resume_without_its_checkpoint_refuses_and_keeps_the_latest_blueprint(tmp_path):
     out = _run(tmp_path, "--iters", "3000", gpu=False)
     assert out.returncode == 0, out.stderr[-2000:]
@@ -156,8 +162,6 @@ def test_resume_without_its_checkpoint_refuses_and_keeps_the_latest_blueprint(tm
     assert _iteration(tmp_path / "blueprint_g.bin") == 3000
 
 
-@pytest.mark.xfail(strict=True, reason="H1: --resume takes the newer FILE of checkpoint_<tag>.bin / .json "
-                                        "(fast/blueprint.py tagged_path, by mtime), not the checkpoint further on")
 def test_resume_continues_the_furthest_checkpoint_not_the_newest_file(tmp_path):
     out = _run(tmp_path, "--iters", "1000", "--json", gpu=False)  # checkpoint_g.bin and checkpoint_g.json at 1000
     assert out.returncode == 0, out.stderr[-2000:]
@@ -175,8 +179,6 @@ def test_resume_continues_the_furthest_checkpoint_not_the_newest_file(tmp_path):
     (["--batch", "64", "--linear-until", "100"], "linear_until"),
     (["--batch", "64", "--no-linear"], "linear"),
 ])
-@pytest.mark.xfail(strict=True, reason="M3: a CPU --resume neither stores nor checks --batch / --linear-until and lets a "
-                                        "linear checkpoint override --no-linear silently (the GPU path refuses these)")
 def test_a_cpu_resume_with_other_settings_is_refused(tmp_path, flags, what):
     out = _run(tmp_path, "--iters", "256", "--batch", "64", gpu=False)
     assert out.returncode == 0, out.stderr[-2000:]
@@ -213,7 +215,8 @@ def test_a_checkpoint_restores_or_refuses_the_settings_it_was_trained_with(tmp_p
 def test_a_timed_cpu_run_still_checkpoints(tmp_path):
     out = _run(tmp_path, "--seconds", "1.5", "--checkpoint-every", "2000", gpu=False)
     assert out.returncode == 0, out.stderr[-2000:]
-    snapshots = [p.name for p in tmp_path.iterdir() if ".it" in p.name]
+    final = f"blueprint_g.it{_iteration(tmp_path / 'blueprint_g.bin')}.bin"  # the final write's own snapshot (M1) is no checkpoint
+    snapshots = [p.name for p in tmp_path.iterdir() if ".it" in p.name and p.name.endswith(".bin") and p.name != final]
     assert snapshots, sorted(p.name for p in tmp_path.iterdir())
 
 

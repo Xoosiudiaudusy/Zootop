@@ -176,7 +176,7 @@ def test_failed_growth_is_reported_and_retried(batch):
 
 def test_gpu_setup_error_on_resume_keeps_the_checkpoint(tmp_path):
     """train_blueprint.py --resume --gpu with a device that does not exist: the error comes before the GPU run holds
-    the run's tables, so nothing is written -- the resumed checkpoint and its .gpu.json stay byte for byte (they were
+    the run's tables, so nothing is written -- the resumed checkpoint and its passport stay byte for byte (they were
     overwritten with untrained tables before), and a later --resume continues from them."""
     import hashlib
 
@@ -185,7 +185,7 @@ def test_gpu_setup_error_on_resume_keeps_the_checkpoint(tmp_path):
             "--backend", "cpp", "--threads", "1", "--eval-deals", "0", "--tag", "t", "--data-dir", str(tmp_path), "--batch", "64", "--gpu"]
     p = subprocess.run(base + ["0", "--gpu-emulate", "--iters", "1024"], capture_output=True, text=True, timeout=600)
     assert p.returncode == 0, p.stderr[-3000:]
-    files = [tmp_path / "checkpoint_t.bin", tmp_path / "checkpoint_t.bin.gpu.json"]
+    files = [tmp_path / "checkpoint_t.bin", tmp_path / "checkpoint_t.bin.run.json"]
     before = [hashlib.sha256(f.read_bytes()).hexdigest() for f in files]
     p = subprocess.run(base + ["97", "--resume", "--iters", "1024"], capture_output=True, text=True, timeout=600)
     assert p.returncode != 0 and "before the GPU run started: nothing written" in p.stdout + p.stderr, (p.stdout[-2000:], p.stderr[-2000:])

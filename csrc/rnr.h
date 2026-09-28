@@ -10,8 +10,10 @@
 // Node keys are numeric as in mccfr.h (nodetable.h); the model table is indexed by the same
 // numeric keys, the warm start (read once, when a node is created) by the key string.
 #pragma once
+#include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -27,6 +29,29 @@ struct StratEntry {
 };
 using StratTable = std::unordered_map<std::string, StratEntry>;
 
+// H4 (negpluribus/cfr/strategy.py policy_of_row, csrc/persist.h BlueprintTable::policy_at): the entry's raise sizes
+// that `legal` lacks and that are larger than every raise size `legal` shares with the entry are the all-in at this
+// node; their probability goes to "a" when that is legal, in entry order.  In the RNR's own game (the blueprint's)
+// every stored name is legal and nothing moves.
+inline void move_collapsed_sizes(const StratEntry& e, const ActionList& legal, const BetGrid& grid, double* vals) {
+    auto listed = [&](const std::string& n) {
+        for (int i = 0; i < legal.n; i++) if (grid.names[legal.a[i].id] == n) return true;
+        return false;
+    };
+    int ia = -1;
+    for (int i = 0; i < legal.n && ia < 0; i++) if (grid.names[legal.a[i].id] == "a") ia = i;
+    bool missing = false;
+    for (const std::string& n : e.names) missing = missing || !listed(n);
+    if (ia < 0 || !missing) return;
+    double top = -std::numeric_limits<double>::infinity(), f;
+    for (int i = 0; i < legal.n; i++) {
+        const std::string& n = grid.names[legal.a[i].id];
+        if (size_fraction(n, f) && f > top && std::find(e.names.begin(), e.names.end(), n) != e.names.end()) top = f;
+    }
+    for (size_t j = 0; j < e.names.size(); j++)
+        if (size_fraction(e.names[j], f) && f > top && !listed(e.names[j])) vals[ia] += e.probs[j];
+}
+
 // BlueprintStrategy.policy(key, legal): probabilities aligned with ``legal`` or None (false)
 inline bool blueprint_policy(const StratEntry& e, const ActionList& legal, const BetGrid& grid, double* out) {
     double vals[MAX_ACTIONS];
@@ -36,6 +61,7 @@ inline bool blueprint_policy(const StratEntry& e, const ActionList& legal, const
         for (size_t j = 0; j < e.names.size(); j++) if (e.names[j] == name) v = e.probs[j];  // dict(zip(...)): last wins
         vals[i] = v;
     }
+    move_collapsed_sizes(e, legal, grid, vals);
     double s = py_sum(vals, legal.n);
     if (s <= 0) return false;
     for (int i = 0; i < legal.n; i++) out[i] = vals[i] / s;

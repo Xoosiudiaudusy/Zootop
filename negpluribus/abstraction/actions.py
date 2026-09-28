@@ -9,7 +9,10 @@ Abstract actions are short names:
     "a"      all-in
 
 ``BetGrid.abstract_actions(obs)`` lists the ones that are legal *and distinct*
-right now (two fractions that clamp to the same chip amount collapse into one).
+right now (two fractions that clamp to the same chip amount collapse into one;
+a fraction whose chips reach the stack is the all-in "a").  A blueprint row
+stored at a deeper stack still has those sizes: the lookups give their
+probability to "a" (``cfr/strategy.py`` ``policy_of_row``).
 ``to_concrete`` turns a name into an engine ``Action``.
 
 The reverse direction matters just as much: opponents bet whatever they like.
@@ -27,6 +30,11 @@ example: A = pot, B = all-in).  So a bet above the largest grid size is translat
 size and the actor's all-in, not clamped to the largest size: until 2026-09-24 it was clamped,
 and a 60bb bet into a 2bb pot was read as a pot-size bet (the HUNL blueprint lost to a random
 bettor because of it).  Sizes at or above the actor's all-in are the all-in in that spot.
+
+The translation is always an action of the node where the raise was made: at a raise-capped node
+(``max_raises_per_street`` reached) the grid has only f / c / a, so any raise there is "a" (until
+2026-09-29 it became "r1" / "r3", which that node does not have, and every later key of the hand
+was unknown: QA-1).
 """
 from __future__ import annotations
 
@@ -121,6 +129,10 @@ class BetGrid:
         fracs = self.fracs_for(ev.street)
         if all_in and self.allow_all_in:
             return ALL_IN
+        if ev.raises_this_street >= self.max_raises_per_street:
+            # a raise-capped node: its actions are f / c / a (abstract_actions), so the raise is the all-in
+            # (the call, the nearest by amount, in a grid without one) -- never a size the node lacks (QA-1)
+            return ALL_IN if self.allow_all_in else CALL_NAME
         if not fracs:
             return ALL_IN  # only fold/call/all-in exist in this grid
         x = self.observed_frac(ev)

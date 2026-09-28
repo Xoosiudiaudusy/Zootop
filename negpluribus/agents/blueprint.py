@@ -6,6 +6,11 @@ the key stays consistent across streets (see ``abstraction/infoset.py``).
 
 Unknown keys (spots never reached in training) fall back to check/call and are
 counted in ``n_fallback`` so you can see how often the blueprint is off-map.
+
+A blueprint deeper than the table (or a spot after an off-grid bet) can store
+probability on raise sizes that are the all-in here; the lookup gives it to the
+all-in (``cfr/strategy.py`` ``policy_of_row``).  With ``count_all_in`` the agent
+counts such decisions in ``n_all_in`` (one more lookup per decision).
 """
 from __future__ import annotations
 
@@ -13,7 +18,7 @@ import random
 from typing import Optional
 
 from ..abstraction import BetGrid, EquityBucketer, infoset_key
-from ..cfr.strategy import BlueprintStrategy
+from ..cfr.strategy import BlueprintStrategy, policy_of_row
 from ..engine import Action, HandRecord, Observation
 from .base import Agent
 
@@ -29,14 +34,17 @@ class BlueprintAgent(Agent):
         name: Optional[str] = None,
         seed: Optional[int] = None,
         randomize_translation: bool = True,
+        count_all_in: bool = False,
     ):
         super().__init__(name=name, seed=seed)
         self.strategy = strategy
         self.bucketer = bucketer
         self.grid = grid
         self.randomize_translation = randomize_translation
+        self.count_all_in = count_all_in
         self.n_decisions = 0
         self.n_fallback = 0
+        self.n_all_in = 0  # with count_all_in: decisions whose lookup moved probability to the all-in
         self._nonce: Optional[int] = None
         self._new_hand = True
 
@@ -58,6 +66,11 @@ class BlueprintAgent(Agent):
         key = infoset_key(obs, self.bucketer, self.grid, event_rng=self._event_rng if self.randomize_translation else None)
         probs = self.strategy.policy(key, legal)
         self.n_decisions += 1
+        if self.count_all_in:
+            get = getattr(self.strategy, "get", None)
+            row = get(key) if get is not None else None
+            if row is not None and policy_of_row(row[0], row[1], legal)[1] > 0.0:
+                self.n_all_in += 1
         if probs is None:
             self.n_fallback += 1
             return self.grid.to_concrete(obs, "c")
