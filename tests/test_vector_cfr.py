@@ -203,3 +203,18 @@ def test_river_exact_lowers_the_turn_floor(trained):
         s.solve()
         ex[exact] = s.subgame_exploitability(0, 2)[0]
     assert ex[True] < 0.5 * ex[False], ex
+
+
+@pytest.mark.parametrize("line", [TURN, RIVER, RIVER_BET])
+@pytest.mark.parametrize("discount", [0, 1, 2])
+def test_played_average_is_the_table_average(trained, line, discount):
+    """The vector CFR plays the average its table holds (the one subgame_exploitability measures), under Linear,
+    CFR+ and DCFR (t^2 weights) alike: equal to the last bit, on turn and river roots, one and four threads."""
+    spec, game = trained[2]
+    st, acts = play(spec, line)
+    for threads in (1, 4):
+        s = search(game, st, acts, iterations=60 if line is TURN else 150, threads=threads, vector_cfr=True, vector_discount=discount)
+        r = s.solve()
+        assert s.vector_eligible
+        assert r["average"] == r["average_table"], (r["average"], r["average_table"])
+        assert abs(sum(r["average"]) - 1.0) < 1e-9

@@ -646,7 +646,13 @@ public:
             for (const Ctx& c : ctxs)
                 for (int i = 0; i < na.n; i++) ours[i] += c.ours[i];
             for (int i = 0; i < na.n; i++) s += ours[i];
-            if (s > 0.0) {
+            // the vector CFR plays its table's average (the row of our hole's class, with the solve's own weights:
+            // t, or t^2 under DCFR), the strategy the exploitability is measured on.  (It added up the class's
+            // current strategy per iteration before: read after the iteration's update, i.e. sigma(t+1), and
+            // weighted by t under every discount -- 0.02..0.05 off the table under DCFR, 1e-3 under Linear.)
+            if (use_vector) {
+                r.average_strategy = r.table_average;
+            } else if (s > 0.0) {
                 for (int i = 0; i < na.n; i++) r.average_strategy[(size_t)i] = ours[i] / s;
             } else {
                 r.average_strategy = r.table_average;
@@ -3084,15 +3090,8 @@ private:
                 v_walk(troot_, p, o, reach_[(size_t)p].data(), reach_[(size_t)o].data(), r, weight, ctx, vc, v.data());
                 ctx.traversals++;
             }
-            if (vour_ && !vour_->vreg.empty() && vour_->na.n == our_n) {
-                double sg[MAX_ACTIONS];
-                const int cp = class_of_[(size_t)our_combo_];
-                vour_->vlock.lock();
-                v_regret_matching(&vour_->vreg[(size_t)cp * our_n], our_n, sg);
-                vour_->vlock.unlock();
-                for (int i = 0; i < our_n; i++) ctx.ours[i] += weight * sg[i];
-            }
             (void)our_key;
+            (void)our_n;
             ctx.iterations++;
             if (params_.time_budget > 0 && std::chrono::steady_clock::now() >= deadline) stop.store(true, std::memory_order_relaxed);
         }
