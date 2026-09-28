@@ -1234,6 +1234,28 @@ PYBIND11_MODULE(_fastcore, m) {
             d["depth"] = t.game.depth;
             return d;
         })
+        .def("partition_stats", [](FlatTrainer& t, int boundary, long long lo, long long hi) {
+            FlatTrainer::PartitionStats ps;
+            {
+                py::gil_scoped_release nogil;
+                ps = t.partition_stats(boundary, lo, hi);
+            }
+            py::dict d;
+            d["roots"] = ps.roots;
+            d["cells"] = ps.cells;
+            d["items"] = ps.items;
+            d["crossings"] = ps.crossings;
+            d["head_items"] = ps.head_items;
+            d["head_cells"] = ps.head_cells;
+            d["jobs"] = ps.jobs;
+            d["head_records"] = ps.head_records;
+            d["sub_records"] = ps.sub_records;
+            d["head_distinct"] = ps.head_distinct;
+            d["batches"] = ps.batches;
+            return d;
+        }, py::arg("boundary"), py::arg("lo"), py::arg("hi"),
+           "analysis for a tree-partitioned trainer: subtrees from street `boundary`; cells, items and crossings per subtree "
+           "over the forward passes of iterations lo..hi (nothing updated)")
         .def_readwrite("gpu_pass", &FlatTrainer::gpu_pass)
         .def_readwrite("emulate_gpu", &FlatTrainer::emulate_gpu)
         .def("use_gpu", [](FlatTrainer& t, int device) { py::gil_scoped_release nogil; t.use_gpu(device); }, py::arg("device") = 0)

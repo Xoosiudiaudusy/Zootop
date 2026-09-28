@@ -561,6 +561,108 @@ private:
         }
     }
 
+public:
+    // ---- analysis for a tree-partitioned (multi-machine) trainer: the subtrees that start on street
+    // `boundary` (a decision of that street whose parent is on an earlier one) would each live on one
+    // machine.  Runs the forward pass of iterations lo..hi (current regrets, nothing is updated) and
+    // counts, per subtree: its cells, the items (node visits, terminals included) that fall in it and
+    // the crossings (items at its root: one request to its owner and one value back).  owner[d] = the
+    // subtree of decision d, -1 above the boundary.
+    struct PartitionStats {
+        std::vector<int32_t> roots;             // decision ids of the subtree roots
+        std::vector<uint64_t> cells, items, crossings;
+        uint64_t head_items = 0, head_cells = 0, jobs = 0;
+        uint64_t head_records = 0, sub_records = 0;
+        uint64_t head_distinct = 0, batches = 0;  // distinct head cells updated per batch of 16384 (summed over batches)  // update records (regret: traverser nodes; strategy sum + visits: others)
+    };
+    PartitionStats partition_stats(int boundary, long long lo, long long hi) {
+        const size_t D = game.n_decisions();
+        std::vector<int32_t> owner(D, -1);
+        PartitionStats ps;
+        for (size_t d = 0; d < D; d++) {
+            if (game.street[d] >= boundary) continue;
+            const int32_t* ch = &game.child[game.child_base[d]];
+            for (int a = 0; a < game.na[d]; a++)
+                if (ch[a] >= 0 && game.street[(size_t)ch[a]] >= boundary && owner[(size_t)ch[a]] < 0) {
+                    owner[(size_t)ch[a]] = (int32_t)ps.roots.size();
+                    ps.roots.push_back(ch[a]);
+                }
+        }
+        // decisions are numbered depth first: a subtree root's descendants follow it; propagate downwards
+        for (size_t d = 0; d < D; d++) {
+            if (owner[d] < 0) continue;
+            const int32_t* ch = &game.child[game.child_base[d]];
+            for (int a = 0; a < game.na[d]; a++) if (ch[a] >= 0) owner[(size_t)ch[a]] = owner[d];
+        }
+        const size_t R = ps.roots.size();
+        ps.cells.assign(R, 0);
+        ps.items.assign(R, 0);
+        ps.crossings.assign(R, 0);
+        for (size_t d = 0; d < D; d++) {
+            const uint64_t c = (uint64_t)game.n_cache[d] * game.na[d];
+            if (owner[d] < 0) ps.head_cells += c; else ps.cells[(size_t)owner[d]] += c;
+        }
+        const int n = spec.n_players;
+        Scratch sc;
+        std::vector<Iter> iters;
+        std::vector<uint32_t> stamp(game.n_cells, 0);
+        uint32_t batch_no = 0;
+        for (long long t0 = lo; t0 <= hi; t0 += 16384) {
+            const long long t1 = std::min(hi, t0 + 16383);
+            batch_no++;
+            ps.batches++;
+            const int n_iter = (int)(t1 - t0 + 1);
+            iters.resize((size_t)n_iter);
+            for (int k = 0; k < n_iter; k++) prepare_iter(t0 + k, iters[(size_t)k], sc.order);
+            std::vector<std::pair<int32_t, uint32_t>> cur, nxt;  // (node, job)
+            for (uint32_t j = 0; j < (uint32_t)(n_iter * n); j++) cur.push_back({0, j});
+            ps.jobs += (uint64_t)n_iter * n;
+            double sigma[MAX_ACTIONS];
+            while (!cur.empty()) {
+                nxt.clear();
+                for (const auto& item : cur) {
+                    const int32_t node = item.first;
+                    const Iter& it = iters[item.second / (uint32_t)n];
+                    const int p = (int)(item.second % (uint32_t)n);
+                    if (node < 0) continue;
+                    const size_t d = (size_t)node;
+                    const int32_t o = owner[d];
+                    if (o < 0) ps.head_items++; else ps.items[(size_t)o]++;
+                    if (o >= 0 && ps.roots[(size_t)o] == node) ps.crossings[(size_t)o]++;
+                    const int na = game.na[d];
+                    const int seat = (game.rel[d] + it.button) % n;
+                    const int b = row_of(d, it.bucket[seat][game.n_board[d]]);
+                    regret_matching(&regret[game.cell_base[d] + (uint64_t)b * (uint64_t)na], na, sigma);
+                    const int32_t* ch = &game.child[game.child_base[d]];
+                    auto push = [&](int32_t c) {
+                        if (c < 0) { if (o < 0) ps.head_items++; else ps.items[(size_t)o]++; } else nxt.push_back({c, item.second});
+                    };
+                    (o < 0 ? ps.head_records : ps.sub_records) += seat == p ? (uint64_t)na : (uint64_t)na + 1;
+                    if (o < 0) {
+                        const uint64_t c0 = game.cell_base[d] + (uint64_t)b * (uint64_t)na;
+                        for (int a = 0; a < na; a++)
+                            if (stamp[c0 + (uint64_t)a] != batch_no) { stamp[c0 + (uint64_t)a] = batch_no; ps.head_distinct += seat == p ? 1 : 2; }
+                    }
+                    if (seat == p) {
+                        for (int a = 0; a < na; a++) push(ch[a]);
+                        continue;
+                    }
+                    const double r = philox_sample_u01(seed, (uint64_t)it.t, p, game.hh_a[d], game.hh_b[d]);
+                    int a = na - 1;
+                    double acc = 0.0;
+                    for (int i = 0; i < na; i++) {
+                        acc += sigma[i];
+                        if (r < acc) { a = i; break; }
+                    }
+                    push(ch[a]);
+                }
+                cur.swap(nxt);
+            }
+        }
+        return ps;
+    }
+
+private:
     int row_of(size_t d, int b) const {
         if (b < 0 || b >= game.n_cache[d]) throw std::runtime_error("flat trainer: bucket outside the node's rows");
         return b;

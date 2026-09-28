@@ -1,0 +1,28 @@
+game: 3 players, 100bb stacks, betting through river, grid preflop (0.5, 1.0, 3.0) / postflop (0.5, 1.0, 2.0, 4.0) + all-in, 16 postflop buckets (potential); cells 38,440,599, infosets 16,245,518
+trained 2,000,000 iterations in 850s
+
+== boundary: flop (5s)
+subtrees 1,077; head (above the boundary): 3.5307% of cells (5,428,956 at 64 buckets... preflop rows do not scale), 6.91% of work
+largest subtrees by work: 15.9% work / 2.2% cells, 10.1% work / 0.9% cells, 9.6% work / 1.7% cells, 6.9% work / 0.5% cells, 4.9% work / 0.7% cells
+largest subtree by cells: 26.6% of all cells
+crossings: 8.3 per iteration -> x 8 bytes (one double back to the head) = 1.08 MB per batch of 16384
+update records per iteration: head 213.3, subtrees 2022.1; head records to every machine (12 bytes each: cell + value) = 41.9 MB per batch of 16384
+distinct head cells updated per batch of 16384 (regret or strategy sum): 359,384 -> summed per machine, 4.3 MB per machine per batch
+head replicated on every machine (only boundary values travel, bit for bit): speed-up 2 machines x1.87, 3 machines x2.64, 4 machines x3.31, 8 machines x5.39
+  2 machines: busiest 50.0% of subtree work (ideal 50.0%), most cells 59.7%
+  3 machines: busiest 33.3% of subtree work (ideal 33.3%), most cells 57.2%
+  4 machines: busiest 25.0% of subtree work (ideal 25.0%), most cells 46.5%
+  8 machines: busiest 17.1% of subtree work (ideal 12.5%), most cells 33.9%
+
+== boundary: turn (5s)
+subtrees 15,787; head (above the boundary): 8.3993% of cells (12,914,908 at 64 buckets... preflop rows do not scale), 21.74% of work
+largest subtrees by work: 3.5% work / 0.4% cells, 2.8% work / 0.3% cells, 2.7% work / 0.2% cells, 2.3% work / 0.2% cells, 2.0% work / 0.1% cells
+largest subtree by cells: 5.5% of all cells
+crossings: 18.3 per iteration -> x 8 bytes (one double back to the head) = 2.40 MB per batch of 16384
+update records per iteration: head 608.0, subtrees 1627.3; head records to every machine (12 bytes each: cell + value) = 119.5 MB per batch of 16384
+distinct head cells updated per batch of 16384 (regret or strategy sum): 968,715 -> summed per machine, 11.6 MB per machine per batch
+head replicated on every machine (only boundary values travel, bit for bit): speed-up 2 machines x1.64, 3 machines x2.09, 4 machines x2.42, 8 machines x3.17
+  2 machines: busiest 50.0% of subtree work (ideal 50.0%), most cells 48.8%
+  3 machines: busiest 33.3% of subtree work (ideal 33.3%), most cells 39.1%
+  4 machines: busiest 25.0% of subtree work (ideal 25.0%), most cells 36.8%
+  8 machines: busiest 12.5% of subtree work (ideal 12.5%), most cells 24.1%
