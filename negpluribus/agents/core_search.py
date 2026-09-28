@@ -78,6 +78,11 @@ class SearchConfig:
     bias: float = 5.0
     min_prob: float = 1e-3
     focus: float = 0.5
+    # vector Linear CFR where it applies (2 live players, turn / river root, no leaves; SubgameSearch vector_cfr),
+    # with its own iterations per street (a vector iteration walks every hole pair); a street without an entry
+    # there uses its time budget
+    vector_cfr: bool = False
+    vector_street_iterations: Dict[int, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.play not in ("average", "final"):
@@ -206,6 +211,10 @@ def add_search_args(ap) -> None:
     ap.add_argument("--no-preflop-search", action="store_true",
                     help="never search preflop: the blueprint translates every size (unknown keys: its check/call)")
     ap.add_argument("--presample", action="store_true", help="rollouts play pre-sampled blueprint actions (leaves only)")
+    ap.add_argument("--search-vector", action="store_true",
+                    help="vector Linear CFR where it applies (2 live players, turn / river root, no leaves); elsewhere the MCCFR")
+    ap.add_argument("--search-vector-iterations", default="",
+                    help='vector-CFR iterations per street, e.g. "turn=300,river=600" (others: the street\'s time budget)')
 
 
 def search_config_from_args(args) -> "SearchConfig":
@@ -217,7 +226,9 @@ def search_config_from_args(args) -> "SearchConfig":
                         search_to_street={"flop": 1, "turn": 2, "river": 3}[args.search_to_street],
                         threads=args.search_threads, play=args.search_play,
                         depth=args.search_depth, preflop_offgrid=float("inf") if no_pre else args.preflop_offgrid,
-                        preflop_unknown=not no_pre)
+                        preflop_unknown=not no_pre, vector_cfr=getattr(args, "search_vector", False),
+                        vector_street_iterations={k: int(v) for k, v in
+                                                  parse_street_budgets(getattr(args, "search_vector_iterations", "")).items()})
 
 
 def raise_offgrid_distance(obs: Observation, amount: int, grid) -> float:
@@ -417,7 +428,11 @@ class CoreSearchAgent(Agent):
             self.res.game, self._starting_stacks(obs), obs.button, actions, list(obs.board), obs.seat, list(obs.hole),
             iterations=iters, time_budget=0.0 if iters > 0 else budget,
             threads=self.cfg.threads, seed=self.rng.getrandbits(32), focus=self.cfg.focus, min_prob=self.cfg.min_prob,
-            linear=True, overrides=overrides or None, depth=self.cfg.depth, rollouts=self.cfg.rollouts, bias=self.cfg.bias)
+            linear=True, overrides=overrides or None, depth=self.cfg.depth, rollouts=self.cfg.rollouts, bias=self.cfg.bias,
+            vector_cfr=self.cfg.vector_cfr)
+        if self.cfg.vector_cfr and s.vector_eligible:
+            vi = int(self.cfg.vector_street_iterations.get(street, 0))
+            s.set_budget(vi, 0.0 if vi > 0 else budget)
         r = s.solve()
         probs = r["average"] if self.cfg.play == "average" else r["final"]
         # the uniform draw comes from the inner blueprint agent's stream, where a BlueprintAgent reset

@@ -2363,6 +2363,11 @@ private:
     TNode* vour_ = nullptr;              // our decision's node in the public tree
 
   public:
+    // the budget of the next solve() (e.g. vector-CFR iterations once vector_eligible() is known)
+    void set_budget(long long iterations, double time_budget) {
+        params_.iterations = iterations;
+        params_.time_budget = time_budget;
+    }
     bool vector_eligible() const {
         if (!params_.vector_cfr || frozen_ || params_.legacy_traverse) return false;
         if (root_street_ < TURN || limit_street_ < RIVER || raise_limit_ > 0) return false;

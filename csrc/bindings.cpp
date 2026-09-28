@@ -1639,6 +1639,8 @@ PYBIND11_MODULE(_fastcore, m) {
             py::arg("legacy_traverse") = false, py::arg("vector_cfr") = false,
             "the subgame of the hand so far: root at the start of the current round, ranges by Bayes over the blueprint; "
             "depth 'end' / 'pluribus' / 'hu_flop_limit' / 'next_street' (leaves: four continuations, `rollouts` rollouts each)")
+        .def("set_budget", &SubgameSearch::set_budget, py::arg("iterations"), py::arg("time_budget"),
+             "the budget of the next solve(): iterations (0: none) and seconds (0: none)")
         .def_property_readonly("vector_eligible", &SubgameSearch::vector_eligible,
                                "vector_cfr would run here (2 live players, turn / river root, no leaves, not frozen)")
         .def("solve", [](SubgameSearch& s) {
