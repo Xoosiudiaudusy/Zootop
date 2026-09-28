@@ -2516,6 +2516,7 @@ private:
     struct VBoard {                      // one river board: strengths, combos in increasing strength, buckets
         std::vector<int64_t> strength;
         std::vector<int> order;
+        std::vector<int> off;            // the combos holding a board card (not in order)
         std::vector<int> bucket;         // turn root: the subgame's river bucket (search_bucket); -1: the combo holds a board card
         std::vector<int> rank;           // river_exact: the combo's class, the index of its strength among the board's (-1: on the board)
         int n_rank = 0;                  // distinct strengths
@@ -2585,7 +2586,10 @@ private:
             B.strength.assign((size_t)N_COMBOS, 0);
             B.bucket.assign((size_t)N_COMBOS, -1);
             for (int c = 0; c < N_COMBOS; c++) {
-                if (on[ct.c0[c]] || on[ct.c1[c]]) continue;
+                if (on[ct.c0[c]] || on[ct.c1[c]]) {
+                    B.off.push_back(c);
+                    continue;
+                }
                 int cards[7] = {ct.c0[c], ct.c1[c], b[0], b[1], b[2], b[3], b[4]};
                 B.strength[(size_t)c] = evaluate(cards, 7);
                 B.order.push_back(c);
@@ -2687,14 +2691,17 @@ private:
         }
         const VBoard& B = vboards_[(size_t)bidx];
         const double nw = v_showdown_net(t, p, o, 1), nt = v_showdown_net(t, p, o, 0), nl = v_showdown_net(t, p, o, -1);
-        for (int c = 0; c < N_COMBOS; c++) v[c] = 0.0;
+        for (const int c : B.off) v[c] = 0.0;  // (every combo of B.order is written below)
         double total = 0.0, card[52] = {0.0}, gcard[52] = {0.0};
         size_t i = 0;
         const size_t m = B.order.size();
         // wins and ties by prefix sums over the combos in increasing strength, card removal by per-card sums
+        // (win / tie of a combo of B.order are written before they are read: no clearing)
         static thread_local std::vector<double> win, tie;
-        win.assign((size_t)N_COMBOS, 0.0);
-        tie.assign((size_t)N_COMBOS, 0.0);
+        if (win.size() < (size_t)N_COMBOS) {
+            win.resize((size_t)N_COMBOS);
+            tie.resize((size_t)N_COMBOS);
+        }
         while (i < m) {
             size_t j = i;
             const int64_t sv = B.strength[(size_t)B.order[i]];
@@ -2906,10 +2913,7 @@ private:
                 const int from = std::max(1, (int)f.last[cp]);
                 if (f.last[cp] > 0 && from < it) {
                     double fp = 1.0;
-                    for (int k = from; k < it; k++) {
-                        const double p = std::pow((double)k, 1.5);
-                        fp *= p / (p + 1.0);
-                    }
+                    for (int k = from; k < it; k++) fp *= dcfr_factor(k);
                     const double fn = std::ldexp(1.0, -(it - from));
                     for (int a = 0; a < na; a++) R[a] *= R[a] > 0.0 ? fp : fn;
                 }
@@ -2933,6 +2937,22 @@ private:
             else f.dvis[cp] += 1;
         }
         t->vlock.unlock();
+    }
+
+    // DCFR's positive-regret discount of iteration k, k^1.5 / (k^1.5 + 1): the same double as computed in place,
+    // from a table for the first 2^16 iterations (the pow per row and iteration was 5 % of a turn solve)
+    static double dcfr_factor(int k) {
+        static const std::vector<double> tab = [] {
+            std::vector<double> v((size_t)1 << 16);
+            for (size_t i = 0; i < v.size(); i++) {
+                const double p = std::pow((double)i, 1.5);
+                v[i] = p / (p + 1.0);
+            }
+            return v;
+        }();
+        if (k >= 0 && (size_t)k < tab.size()) return tab[(size_t)k];
+        const double p = std::pow((double)k, 1.5);
+        return p / (p + 1.0);
     }
 
     // the average strategy of p below t where o's reach is zero: no values, no regrets (both would be
@@ -3058,19 +3078,22 @@ private:
         for (int a = 0; a < na; a++) vc.get();
         double* S[MAX_ACTIONS];
         for (int a = 0; a < na; a++) S[a] = vc.buf[base + (size_t)a].data();
-        for (int a = 0; a < na; a++) {
-            double* __restrict Sa = S[a];
+        {  // one pass over the combos (a row per combo, a zero row outside the round), not one per action
+            const double zero_row[MAX_ACTIONS] = {0.0};
             for (int c = 0; c < N_COMBOS; c++) {
                 const int cp = cpv[c];
-                Sa[c] = (cp >= 0 && cp < nc) ? sg[(size_t)cp * na + a] : 0.0;
+                const double* row = (cp >= 0 && cp < nc) ? &sg[(size_t)cp * na] : zero_row;
+                for (int a = 0; a < na; a++) S[a][c] = row[a];
             }
         }
         if (forced >= 0)
             for (int a = 0; a < na; a++) S[a][forced] = a == t->path_index ? 1.0 : 0.0;
-        std::fill(v, v + N_COMBOS, 0.0);
+        // v = 0.0 + the first term + ... : the first term's pass writes 0.0 + x (not x: the same signed zeros)
+        // instead of clearing v in a pass of its own
         if (q == o) {
             double* ro2 = vc.get();
             double* va = vc.get();
+            bool first = true;
             for (int a = 0; a < na; a++) {
                 const double* __restrict Sa = S[a];
                 double mass = 0.0;
@@ -3092,8 +3115,14 @@ private:
                     continue;
                 }
                 v_child(t, a, p, o, rp, ro2, r, weight, ctx, vc, va);
-                for (int c = 0; c < N_COMBOS; c++) v[c] += va[c];
+                if (first) {
+                    for (int c = 0; c < N_COMBOS; c++) v[c] = 0.0 + va[c];
+                    first = false;
+                } else {
+                    for (int c = 0; c < N_COMBOS; c++) v[c] += va[c];
+                }
             }
+            if (first) std::fill(v, v + N_COMBOS, 0.0);
             vc.release((size_t)na + 2);
             vc.depth--;
             return;
@@ -3108,7 +3137,8 @@ private:
             for (int d = 0; d < N_COMBOS; d++) rp2[d] = rp[d] * S[a][d];
             v_child(t, a, p, o, rp2, ro, r, weight, ctx, vc, vs[a]);
         }
-        for (int a = 0; a < na; a++)
+        for (int c = 0; c < N_COMBOS; c++) v[c] = 0.0 + S[0][c] * vs[0][c];
+        for (int a = 1; a < na; a++)
             for (int c = 0; c < N_COMBOS; c++) v[c] += S[a][c] * vs[a][c];
         double* reg = sg + (size_t)nc * na;
         double* ss = reg + (size_t)nc * na;
