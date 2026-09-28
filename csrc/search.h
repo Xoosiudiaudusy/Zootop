@@ -305,6 +305,15 @@ struct SearchParams {
     // being its hand strength there (equal strength, one class); rows per river card, kept as floats in the
     // public tree (never in the search's table).  Off: the vector CFR's numbers unchanged.
     bool river_exact = false;
+    // vector CFR on a turn root, river_exact off: > 0, the river's infosets by K buckets of hand strength on the
+    // river board (the bucket of a hole = the quantile of its strength among the board's holes, equal strengths
+    // together), shared by all river cards as the blueprint's buckets are (Pluribus: 500 per round); 0: the
+    // blueprint's buckets (the vector CFR's numbers unchanged)
+    int river_buckets = 0;
+    // vector CFR's regret / average weighting: 0 Linear CFR (Pluribus; the numbers unchanged), 1 CFR+ (regrets
+    // floored at 0, linear average), 2 DCFR(1.5, 0, 2) (Brown & Sandholm 2019: positive regrets x t^1.5/(t^1.5+1),
+    // negative x 1/2 after each iteration, the average weighted by t^2); the MCCFR is always Linear
+    int vector_discount = 0;
 };
 
 struct LeafInfo {  // tests: one leaf of the public tree
@@ -512,6 +521,7 @@ public:
         const NodeKey our_key = search_key(root_street_, hand_.our_seat, class_of_[our_combo_], our_ph);
         const bool use_vector = vector_eligible();
         vexact_ = false;
+        vriver_k_ = 0;
         vriver_nodes_.clear();
         if (use_vector) prepare_vector();
         group_->begin(T);
@@ -1117,7 +1127,8 @@ private:
                 }
                 continue;
             }
-            const int card = st.street == root_street_ ? class_of_[(size_t)x] : bx;
+            const int card = st.street == root_street_ ? class_of_[(size_t)x]
+                             : (vriver_k_ > 0 && st.street == RIVER) ? vboards_[(size_t)st.board[4]].qb[(size_t)x] : bx;
             const bool fz = frozen_ != nullptr && st.street == root_street_;  // the round frozen to another search's play
             (fz ? *frozen_ : *this).strategy_row(search_key(st.street, q, card, ph), na.n, fz ? frozen_kind_ : ex.kind, row);
         }
@@ -2156,13 +2167,14 @@ private:
         // vector CFR: regrets, strategy sums and visits of every card part, [cp * na + a] (allocated on first use)
         std::vector<double> vreg, vss;
         std::vector<int64_t> vvis;
+        std::vector<int32_t> vlast;  // DCFR: the iteration of the row's last update (its discounts are applied lazily)
         SpinLock vlock;
         std::once_flag vonce;
         // river_exact, a river node of a turn root: the rows of each river card, [class * na + a], made on first use
         struct VRiver {
             int nc = 0;
             std::vector<float> reg, ss;
-            std::vector<int32_t> vis;
+            std::vector<int32_t> vis, last;
         };
         std::unique_ptr<std::atomic<VRiver*>[]> vriv;  // [river card]
         std::vector<std::unique_ptr<VRiver>> vriv_own;
@@ -2400,7 +2412,9 @@ private:
         std::vector<int> bucket;         // -1: the combo holds a board card
         std::vector<int> rank;           // river_exact: the combo's class, the index of its strength among the board's (-1: on the board)
         int n_rank = 0;                  // distinct strengths
+        std::vector<int> qb;             // river_buckets K: the combo's strength bucket 0..K-1 (-1: on the board)
     };
+    int vriver_k_ = 0;                   // river_buckets on this turn root (0: off)
     std::vector<VBoard> vboards_;        // [river card] on a turn root, [52] on a river root
     bool vexact_ = false;                // river_exact on this turn root
     std::unordered_map<uint64_t, TNode*> vriver_nodes_;  // river_exact, after the solve: river decision nodes by path hash (a)
@@ -2443,6 +2457,8 @@ private:
 
   private:
     void prepare_vector() {
+        if (params_.vector_discount < 0 || params_.vector_discount > 2) throw std::invalid_argument("vector_discount: 0 (Linear), 1 (CFR+), 2 (DCFR)");
+        if (params_.vector_discount != 0 && !params_.linear) throw std::invalid_argument("vector_discount needs linear=True (the iteration count)");
         vour_ = troot_;
         for (const PathStep& ps : path_) vour_ = tchild(vour_, ps.index);
         int k = 0;
@@ -2474,8 +2490,22 @@ private:
                 }
                 B.n_rank = k + 1;
             }
+            if (vriver_k_ > 0) {  // quantile of the strength among the board's holes: a tie group at its middle position
+                const size_t m = B.order.size();
+                B.qb.assign((size_t)N_COMBOS, -1);
+                size_t i = 0;
+                while (i < m) {
+                    size_t j = i;
+                    while (j < m && B.strength[(size_t)B.order[j]] == B.strength[(size_t)B.order[i]]) j++;
+                    const double mid = 0.5 * (double)(i + j - 1);
+                    const int q = std::min(vriver_k_ - 1, (int)((double)vriver_k_ * mid / (double)m));
+                    for (size_t x = i; x < j; x++) B.qb[(size_t)B.order[x]] = q;
+                    i = j;
+                }
+            }
         };
         vexact_ = params_.river_exact && root_.n_board == 4;
+        vriver_k_ = !vexact_ && root_.n_board == 4 && params_.river_buckets > 0 ? params_.river_buckets : 0;
         int b5[5];
         for (int i = 0; i < root_.n_board; i++) b5[i] = root_.board[i];
         if (root_.n_board == 5) {
@@ -2610,6 +2640,7 @@ private:
         float* freg = nullptr;
         float* fss = nullptr;
         int32_t* fvis = nullptr;
+        int32_t* last = nullptr;  // DCFR only
     };
     VRef v_ref(TNode* t, int r) {
         VRef f;
@@ -2631,6 +2662,7 @@ private:
                         nb->reg.assign((size_t)nb->nc * na, 0.0f);
                         nb->ss.assign((size_t)nb->nc * na, 0.0f);
                         nb->vis.assign((size_t)nb->nc, 0);
+                        if (params_.vector_discount == 2) nb->last.assign((size_t)nb->nc, 0);
                         b = nb.get();
                         t->vriv_own.push_back(std::move(nb));
                     } catch (...) {
@@ -2646,16 +2678,21 @@ private:
             f.freg = b->reg.data();
             f.fss = b->ss.data();
             f.fvis = b->vis.data();
+            f.last = b->last.empty() ? nullptr : b->last.data();
             return f;
         }
-        const int nc = t->n_cache;
+        const bool kq = river_part && vriver_k_ > 0;  // river_buckets: K strength buckets shared by the river cards
+        const int nc = kq ? vriver_k_ : t->n_cache;
         std::call_once(t->vonce, [&]() {
             t->vreg.assign((size_t)nc * na, 0.0);
             t->vss.assign((size_t)nc * na, 0.0);
             t->vvis.assign((size_t)nc, 0);
+            if (params_.vector_discount == 2) t->vlast.assign((size_t)nc, 0);
         });
+        f.last = t->vlast.empty() ? nullptr : t->vlast.data();
         f.nc = nc;
-        f.cpv = river_part ? vboards_[(size_t)(root_.n_board == 5 ? 52 : r)].bucket.data() : class_of_.data();
+        f.cpv = kq ? vboards_[(size_t)r].qb.data()
+                   : river_part ? vboards_[(size_t)(root_.n_board == 5 ? 52 : r)].bucket.data() : class_of_.data();
         f.dreg = t->vreg.data();
         f.dss = t->vss.data();
         f.dvis = t->vvis.data();
@@ -2677,6 +2714,10 @@ private:
     }
     // weight x (regret increments, if given, and strategy-sum increments) into the rows with cnt > 0
     void v_add(TNode* t, const VRef& f, int na, const std::vector<int>& cnt, const double* reg, const double* ss, double weight) {
+        if (params_.vector_discount != 0) {
+            v_add_discounted(t, f, na, cnt, reg, ss, weight);
+            return;
+        }
         t->vlock.lock();
         for (int cp = 0; cp < f.nc; cp++) {
             if (!cnt[(size_t)cp]) continue;
@@ -2694,6 +2735,53 @@ private:
                 }
                 f.dvis[cp] += 1;
             }
+        }
+        t->vlock.unlock();
+    }
+
+    // CFR+ / DCFR(1.5, 0, 2); `weight` is the iteration t (Linear weights on)
+    void v_add_discounted(TNode* t, const VRef& f, int na, const std::vector<int>& cnt, const double* reg, const double* ss,
+                          double weight) {
+        const int it = (int)std::llround(weight);
+        const bool dcfr = params_.vector_discount == 2;
+        const double ws = dcfr ? weight * weight : weight;  // the average: t^2 (DCFR gamma = 2), t (CFR+)
+        t->vlock.lock();
+        for (int cp = 0; cp < f.nc; cp++) {
+            if (!cnt[(size_t)cp]) continue;
+            const size_t o = (size_t)cp * na;
+            double R[MAX_ACTIONS];
+            for (int a = 0; a < na; a++) R[a] = f.freg ? (double)f.freg[o + a] : f.dreg[o + a];
+            if (reg && dcfr && f.last) {
+                // the discounts of the iterations since the row's last update (last .. it - 1): positive regrets
+                // x k^1.5 / (k^1.5 + 1) each, negative x 1/2 each (beta = 0)
+                const int from = std::max(1, (int)f.last[cp]);
+                if (f.last[cp] > 0 && from < it) {
+                    double fp = 1.0;
+                    for (int k = from; k < it; k++) {
+                        const double p = std::pow((double)k, 1.5);
+                        fp *= p / (p + 1.0);
+                    }
+                    const double fn = std::ldexp(1.0, -(it - from));
+                    for (int a = 0; a < na; a++) R[a] *= R[a] > 0.0 ? fp : fn;
+                }
+                f.last[cp] = it;
+            }
+            if (reg)
+                for (int a = 0; a < na; a++) {
+                    R[a] += reg[o + a];  // unweighted increments (CFR+ and DCFR discount instead)
+                    if (!dcfr && R[a] < 0.0) R[a] = 0.0;  // CFR+: floored at zero
+                }
+            for (int a = 0; a < na; a++) {
+                if (f.freg) {
+                    f.freg[o + a] = (float)R[a];
+                    f.fss[o + a] += (float)(ws * ss[o + a]);
+                } else {
+                    f.dreg[o + a] = R[a];
+                    f.dss[o + a] += ws * ss[o + a];
+                }
+            }
+            if (f.freg) f.fvis[cp] += 1;
+            else f.dvis[cp] += 1;
         }
         t->vlock.unlock();
     }
@@ -2903,7 +2991,7 @@ private:
             if (vexact_ && !t->terminal && !t->leaf && t->street == RIVER) vriver_nodes_[t->ph.a] = t;
             if (t->terminal || t->leaf || t->vvis.empty()) continue;
             const int na = t->na.n;
-            for (int cp = 0; cp < t->n_cache; cp++) {
+            for (int cp = 0; cp < (int)t->vvis.size(); cp++) {
                 if (t->vvis[(size_t)cp] == 0) continue;
                 Node* node = table_->get_or_create(search_key(t->street, t->seat, cp, t->ph), 0, na, [&](Node& nd, NodeArena&) {
                     nd.init(t->na.id, na);

@@ -85,6 +85,11 @@ class SearchConfig:
     vector_street_iterations: Dict[int, int] = field(default_factory=dict)
     # with vector_cfr on a turn root: river infosets by exact hand strength instead of the blueprint's buckets
     river_exact: bool = False
+    # with vector_cfr on a turn root (river_exact off): > 0, the river by this many strength buckets shared by the
+    # river cards (Pluribus: 500); 0: the blueprint's buckets
+    river_buckets: int = 0
+    # vector CFR's weighting: 0 Linear CFR, 1 CFR+, 2 DCFR(1.5, 0, 2)
+    vector_discount: int = 0
 
     def __post_init__(self) -> None:
         if self.play not in ("average", "final"):
@@ -219,6 +224,10 @@ def add_search_args(ap) -> None:
                     help='vector-CFR iterations per street, e.g. "turn=300,river=600" (others: the street\'s time budget)')
     ap.add_argument("--search-river-exact", action="store_true",
                     help="with --search-vector on a turn root: river infosets by exact hand strength, not the blueprint's buckets")
+    ap.add_argument("--search-river-buckets", type=int, default=0,
+                    help="with --search-vector on a turn root: the river by K strength buckets shared by the river cards (0: blueprint's)")
+    ap.add_argument("--search-vector-discount", choices=("linear", "cfr+", "dcfr"), default="linear",
+                    help="the vector CFR's weighting (the MCCFR is always Linear)")
 
 
 def search_config_from_args(args) -> "SearchConfig":
@@ -233,7 +242,9 @@ def search_config_from_args(args) -> "SearchConfig":
                         preflop_unknown=not no_pre, vector_cfr=getattr(args, "search_vector", False),
                         vector_street_iterations={k: int(v) for k, v in
                                                   parse_street_budgets(getattr(args, "search_vector_iterations", "")).items()},
-                        river_exact=getattr(args, "search_river_exact", False))
+                        river_exact=getattr(args, "search_river_exact", False),
+                        river_buckets=getattr(args, "search_river_buckets", 0),
+                        vector_discount={"linear": 0, "cfr+": 1, "dcfr": 2}[getattr(args, "search_vector_discount", "linear")])
 
 
 def raise_offgrid_distance(obs: Observation, amount: int, grid) -> float:
@@ -434,7 +445,8 @@ class CoreSearchAgent(Agent):
             iterations=iters, time_budget=0.0 if iters > 0 else budget,
             threads=self.cfg.threads, seed=self.rng.getrandbits(32), focus=self.cfg.focus, min_prob=self.cfg.min_prob,
             linear=True, overrides=overrides or None, depth=self.cfg.depth, rollouts=self.cfg.rollouts, bias=self.cfg.bias,
-            vector_cfr=self.cfg.vector_cfr, river_exact=self.cfg.river_exact)
+            vector_cfr=self.cfg.vector_cfr, river_exact=self.cfg.river_exact, river_buckets=self.cfg.river_buckets,
+            vector_discount=self.cfg.vector_discount)
         if self.cfg.vector_cfr and s.vector_eligible:
             vi = int(self.cfg.vector_street_iterations.get(street, 0))
             s.set_budget(vi, 0.0 if vi > 0 else budget)
