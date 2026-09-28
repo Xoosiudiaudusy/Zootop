@@ -199,7 +199,7 @@ def test_river_exact_lowers_the_turn_floor(trained):
     st, acts = play(spec, TURN)
     ex = {}
     for exact in (False, True):
-        s = search(game, st, acts, iterations=3000, threads=4, vector_cfr=True, river_exact=exact)
+        s = search(game, st, acts, iterations=3000, threads=1, vector_cfr=True, river_exact=exact)
         s.solve()
         ex[exact] = s.subgame_exploitability(0, 2)[0]
     assert ex[True] < 0.5 * ex[False], ex
