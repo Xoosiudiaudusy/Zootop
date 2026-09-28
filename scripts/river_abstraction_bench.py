@@ -6,7 +6,8 @@ the MCCFR, the vector CFR with the river by the blueprint's buckets, by K streng
         --configs mccfr,vec,k16,k64,k200,k500,exact
     python scripts/river_abstraction_bench.py ... --street river --configs vec,vec+,vecd
 
-Configs: mccfr | vec (blueprint's river buckets) | k<K> (K strength buckets) | exact; a suffix "+" = CFR+,
+Configs: mccfr | vec (blueprint's river buckets) | k<K> (K strength buckets) | exact | warm<K>_<percent> (exact river
+warm-started from K buckets after <percent> % of the budget); a suffix "+" = CFR+,
 "d" = DCFR(1.5, 0, 2) (e.g. k200d, vecd).  Exact exploitability of the average strategy (subgame_exploitability,
 kind 0, the best responder deviating from the root's street), bb per deal of the subgame; MCCFR: mean of --seeds.
 """
@@ -46,6 +47,9 @@ def parse(cfg):
         return dict(vector_cfr=True, vector_discount=disc)
     if cfg == "exact":
         return dict(vector_cfr=True, river_exact=True, vector_discount=disc)
+    if cfg.startswith("warm"):  # warm<K>_<percent>: K bucket phase for <percent> % of the budget, then the exact river
+        k, pct = cfg[4:].split("_")
+        return dict(vector_cfr=True, river_exact=True, river_buckets=int(k), river_warm=float(pct) / 100.0)
     if cfg.startswith("k"):
         return dict(vector_cfr=True, river_buckets=int(cfg[1:]), vector_discount=disc)
     raise SystemExit(f"unknown config {cfg}")

@@ -314,6 +314,12 @@ struct SearchParams {
     // floored at 0, linear average), 2 DCFR(1.5, 0, 2) (Brown & Sandholm 2019: positive regrets x t^1.5/(t^1.5+1),
     // negative x 1/2 after each iteration, the average weighted by t^2); the MCCFR is always Linear
     int vector_discount = 0;
+    // river_exact with river_buckets K > 0: warm start (Brown & Sandholm 2016, from the solution of a coarser
+    // abstraction).  The first `river_warm` share of the budget (time, or iterations if given) learns the river by
+    // the K shared strength buckets; then every exact river row starts from its bucket row's average strategy, its
+    // regrets and strategy sums set as if that strategy had been played the T_w iterations so far (Linear weights
+    // 1..T_w), and learns exactly from there.  0: off
+    double river_warm = 0.0;
 };
 
 struct LeafInfo {  // tests: one leaf of the public tree
@@ -1110,7 +1116,8 @@ private:
                 for (int a = 0; a < na.n; a++) row[a] = memo[b][a];
                 continue;
             }
-            if (vx) {
+            // (river_warm: a block never made or never updated plays its bucket rows, read below by their keys)
+            if (vx && ((vb && !vb->warm.load()) || vriver_k_ == 0)) {
                 const int k = vrank[x];
                 if (!vb || k < 0 || k >= vb->nc) {
                     for (int a = 0; a < na.n; a++) row[a] = 1.0 / na.n;
@@ -2175,6 +2182,7 @@ private:
             int nc = 0;
             std::vector<float> reg, ss;
             std::vector<int32_t> vis, last;
+            std::atomic<bool> warm{false};  // warm start pending: sigma from the bucket rows until the first update
         };
         std::unique_ptr<std::atomic<VRiver*>[]> vriv;  // [river card]
         std::vector<std::unique_ptr<VRiver>> vriv_own;
@@ -2413,8 +2421,12 @@ private:
         std::vector<int> rank;           // river_exact: the combo's class, the index of its strength among the board's (-1: on the board)
         int n_rank = 0;                  // distinct strengths
         std::vector<int> qb;             // river_buckets K: the combo's strength bucket 0..K-1 (-1: on the board)
+        std::vector<int> rank_qb;        // river_warm: exact class -> its strength bucket
     };
     int vriver_k_ = 0;                   // river_buckets on this turn root (0: off)
+    bool vwarm_ = false;                 // river_warm: bucket phase, then exact rows warm-started
+    std::atomic<bool> vswitched_{false}; // river_warm: the exact phase has begun
+    std::atomic<long long> vwarm_t_{0};  // river_warm: iterations of the bucket phase (T_w)
     std::vector<VBoard> vboards_;        // [river card] on a turn root, [52] on a river root
     bool vexact_ = false;                // river_exact on this turn root
     std::unordered_map<uint64_t, TNode*> vriver_nodes_;  // river_exact, after the solve: river decision nodes by path hash (a)
@@ -2459,6 +2471,7 @@ private:
     void prepare_vector() {
         if (params_.vector_discount < 0 || params_.vector_discount > 2) throw std::invalid_argument("vector_discount: 0 (Linear), 1 (CFR+), 2 (DCFR)");
         if (params_.vector_discount != 0 && !params_.linear) throw std::invalid_argument("vector_discount needs linear=True (the iteration count)");
+        if (params_.river_warm > 0.0 && params_.vector_discount != 0) throw std::invalid_argument("river_warm: with Linear CFR only");
         vour_ = troot_;
         for (const PathStep& ps : path_) vour_ = tchild(vour_, ps.index);
         int k = 0;
@@ -2502,10 +2515,19 @@ private:
                     for (size_t x = i; x < j; x++) B.qb[(size_t)B.order[x]] = q;
                     i = j;
                 }
+                if (vexact_) {
+                    B.rank_qb.assign((size_t)B.n_rank, 0);
+                    for (int c : B.order) B.rank_qb[(size_t)B.rank[(size_t)c]] = B.qb[(size_t)c];
+                }
             }
         };
         vexact_ = params_.river_exact && root_.n_board == 4;
-        vriver_k_ = !vexact_ && root_.n_board == 4 && params_.river_buckets > 0 ? params_.river_buckets : 0;
+        vwarm_ = vexact_ && params_.river_warm > 0.0 && params_.river_buckets > 0;
+        if (vexact_ && params_.river_warm > 0.0 && params_.river_buckets <= 0)
+            throw std::invalid_argument("river_warm needs river_buckets > 0 (the coarser abstraction it starts from)");
+        vswitched_.store(false);
+        vwarm_t_.store(0);
+        vriver_k_ = (!vexact_ || vwarm_) && root_.n_board == 4 && params_.river_buckets > 0 ? params_.river_buckets : 0;
         int b5[5];
         for (int i = 0; i < root_.n_board; i++) b5[i] = root_.board[i];
         if (root_.n_board == 5) {
@@ -2641,12 +2663,14 @@ private:
         float* fss = nullptr;
         int32_t* fvis = nullptr;
         int32_t* last = nullptr;  // DCFR only
+        TNode::VRiver* blk = nullptr;  // the exact block (river_exact)
+        int r = -1;                    // its river card
     };
     VRef v_ref(TNode* t, int r) {
         VRef f;
         const int na = t->na.n;
         const bool river_part = t->street != root_street_;
-        if (vexact_ && river_part) {
+        if (vexact_ && river_part && (!vwarm_ || vswitched_.load(std::memory_order_acquire))) {
             std::call_once(t->vriv_once, [&]() {
                 t->vriv.reset(new std::atomic<TNode::VRiver*>[52]);
                 for (int i = 0; i < 52; i++) t->vriv[(size_t)i].store(nullptr, std::memory_order_relaxed);
@@ -2663,6 +2687,7 @@ private:
                         nb->ss.assign((size_t)nb->nc * na, 0.0f);
                         nb->vis.assign((size_t)nb->nc, 0);
                         if (params_.vector_discount == 2) nb->last.assign((size_t)nb->nc, 0);
+                        nb->warm.store(vwarm_);
                         b = nb.get();
                         t->vriv_own.push_back(std::move(nb));
                     } catch (...) {
@@ -2679,6 +2704,8 @@ private:
             f.fss = b->ss.data();
             f.fvis = b->vis.data();
             f.last = b->last.empty() ? nullptr : b->last.data();
+            f.blk = b;
+            f.r = r;
             return f;
         }
         const bool kq = river_part && vriver_k_ > 0;  // river_buckets: K strength buckets shared by the river cards
@@ -2700,6 +2727,20 @@ private:
     }
     // sigma of every row (a snapshot of the regrets)
     void v_sigma(TNode* t, const VRef& f, int na, double* sg) {
+        if (f.blk && f.blk->warm.load(std::memory_order_acquire)) {
+            // river_warm, a new exact block: its classes play their bucket rows' average strategy until its first update
+            const VBoard& B = vboards_[(size_t)f.r];
+            t->vlock.lock();
+            for (int k = 0; k < f.nc; k++) {
+                const size_t q = (size_t)B.rank_qb[(size_t)k];
+                double s = 0.0;
+                if (t->vss.size() >= (q + 1) * (size_t)na)
+                    for (int a = 0; a < na; a++) s += t->vss[q * na + a];
+                for (int a = 0; a < na; a++) sg[(size_t)k * na + a] = s > 0.0 ? t->vss[q * na + a] / s : 1.0 / na;
+            }
+            t->vlock.unlock();
+            return;
+        }
         t->vlock.lock();
         if (f.freg) {
             double tmp[MAX_ACTIONS];
@@ -2717,6 +2758,13 @@ private:
         if (params_.vector_discount != 0) {
             v_add_discounted(t, f, na, cnt, reg, ss, weight);
             return;
+        }
+        if (f.blk && f.blk->warm.load(std::memory_order_acquire)) {
+            // the warm start: the bucket strategy's regrets and sums as if played in the bucket phase's T_w iterations
+            // (Linear weights 1..T_w), in the share of them that would have dealt this block's river card (1 / 48)
+            const double tw = (double)vwarm_t_.load();
+            weight = (params_.linear ? 0.5 * tw * (tw + 1.0) : tw) / (double)std::max<size_t>(1, vriver_.size());
+            if (reg) f.blk->warm.store(false, std::memory_order_release);
         }
         t->vlock.lock();
         for (int cp = 0; cp < f.nc; cp++) {
@@ -3011,12 +3059,24 @@ private:
         // a river root has no chance to sample: concurrent full-width iterations would only read each other's
         // stale regrets (measured: 4 threads converge 5x slower per second), so it runs on one thread
         if (vriver_.empty() && ctx.tid > 0) return;
+        const auto t_start = deadline - std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                            std::chrono::duration<double>(params_.time_budget > 0 ? params_.time_budget : 0.0));
         VCtx vc;
         std::vector<double> v((size_t)N_COMBOS);
         while (!stop.load(std::memory_order_relaxed)) {
             const long long t = next_t.fetch_add(1);
             if (params_.iterations > 0 && t > params_.iterations) break;
             const double weight = params_.linear ? (double)t : 1.0;
+            if (vwarm_ && !vswitched_.load(std::memory_order_acquire)) {
+                const bool done = params_.iterations > 0
+                                      ? (double)t > params_.river_warm * (double)params_.iterations
+                                      : std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count() >=
+                                            params_.river_warm * params_.time_budget;
+                if (done) {
+                    long long expected = 0;
+                    if (vwarm_t_.compare_exchange_strong(expected, t - 1)) vswitched_.store(true, std::memory_order_release);
+                }
+            }
             const int r = vriver_.empty() ? -1 : vriver_[(size_t)ctx.rng.below((int)vriver_.size())];
             for (int i = 0; i < 2; i++) {
                 const int p = vseat_[i], o = vseat_[1 - i];
