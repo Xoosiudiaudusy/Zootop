@@ -83,6 +83,8 @@ class SearchConfig:
     # there uses its time budget
     vector_cfr: bool = False
     vector_street_iterations: Dict[int, int] = field(default_factory=dict)
+    # with vector_cfr on a turn root: river infosets by exact hand strength instead of the blueprint's buckets
+    river_exact: bool = False
 
     def __post_init__(self) -> None:
         if self.play not in ("average", "final"):
@@ -215,6 +217,8 @@ def add_search_args(ap) -> None:
                     help="vector Linear CFR where it applies (2 live players, turn / river root, no leaves); elsewhere the MCCFR")
     ap.add_argument("--search-vector-iterations", default="",
                     help='vector-CFR iterations per street, e.g. "turn=300,river=600" (others: the street\'s time budget)')
+    ap.add_argument("--search-river-exact", action="store_true",
+                    help="with --search-vector on a turn root: river infosets by exact hand strength, not the blueprint's buckets")
 
 
 def search_config_from_args(args) -> "SearchConfig":
@@ -228,7 +232,8 @@ def search_config_from_args(args) -> "SearchConfig":
                         depth=args.search_depth, preflop_offgrid=float("inf") if no_pre else args.preflop_offgrid,
                         preflop_unknown=not no_pre, vector_cfr=getattr(args, "search_vector", False),
                         vector_street_iterations={k: int(v) for k, v in
-                                                  parse_street_budgets(getattr(args, "search_vector_iterations", "")).items()})
+                                                  parse_street_budgets(getattr(args, "search_vector_iterations", "")).items()},
+                        river_exact=getattr(args, "search_river_exact", False))
 
 
 def raise_offgrid_distance(obs: Observation, amount: int, grid) -> float:
@@ -429,7 +434,7 @@ class CoreSearchAgent(Agent):
             iterations=iters, time_budget=0.0 if iters > 0 else budget,
             threads=self.cfg.threads, seed=self.rng.getrandbits(32), focus=self.cfg.focus, min_prob=self.cfg.min_prob,
             linear=True, overrides=overrides or None, depth=self.cfg.depth, rollouts=self.cfg.rollouts, bias=self.cfg.bias,
-            vector_cfr=self.cfg.vector_cfr)
+            vector_cfr=self.cfg.vector_cfr, river_exact=self.cfg.river_exact)
         if self.cfg.vector_cfr and s.vector_eligible:
             vi = int(self.cfg.vector_street_iterations.get(street, 0))
             s.set_budget(vi, 0.0 if vi > 0 else budget)

@@ -38,6 +38,7 @@ ap.add_argument("--hands", type=int, default=2)
 ap.add_argument("--seeds", type=int, default=2, help="MCCFR seeds per budget")
 ap.add_argument("--seed", type=int, default=7)
 ap.add_argument("--spots", default="")
+ap.add_argument("--exact", action="store_true", help="also the vector CFR with river_exact on turn roots")
 args = ap.parse_args()
 bk = load_bucketer(args.buckets)
 spec = GameSpec(n_players=2, stack_bb=200, max_street=Street.RIVER, preflop_fracs=(0.5, 1.0, 3.0),
@@ -49,6 +50,7 @@ budgets = [float(x) for x in args.seconds.split(",")]
 wanted = [w.strip() for w in args.spots.split(",") if w.strip()]
 rng = random.Random(args.seed)
 summary = {}
+classes, river_mb = [], []
 print(f"{args.threads} threads; exploitability in bb per deal of the subgame (avg / final profile)", flush=True)
 for spot, line in SPOTS.items():
     for h in range(args.hands):
@@ -67,21 +69,33 @@ for spot, line in SPOTS.items():
         br = int(st.street)
         print(f"\n[{spot} #{h}] hole {obs.hole} board {obs.board}", flush=True)
 
-        def run(sec, seed, vec):
+        def run(sec, seed, vec, exact=False):
             s = core.SubgameSearch(game, list(st.starting_stacks), 0, acts, list(obs.board), obs.seat, list(obs.hole),
-                                   iterations=0, time_budget=sec, threads=args.threads, seed=seed, depth="pluribus", vector_cfr=vec)
+                                   iterations=0, time_budget=sec, threads=args.threads, seed=seed, depth="pluribus", vector_cfr=vec,
+                                   river_exact=exact)
             r = s.solve()
+            if exact and sec == budgets[0]:
+                rc = [c for c in s.river_classes() if c]
+                classes.extend(rc)
+                print(f"  river classes per board: mean {statistics.fmean(rc):.0f} (min {min(rc)}, max {max(rc)})", flush=True)
+            if exact:
+                river_mb.append(s.river_bytes / 1e6)
             return s.subgame_exploitability(0, br)[0], s.subgame_exploitability(1, br)[0], r["iterations"], s.vector_eligible
 
         for sec in budgets:
             mc = [run(sec, sd, False) for sd in range(1, args.seeds + 1)]
             vx = run(sec, 1, True)
             assert vx[3], "vector CFR not eligible here"
+            ve = run(sec, 1, True, True) if br == 2 and args.exact else (float("nan"), float("nan"), 0, True)
             ma = statistics.fmean(x[0] for x in mc)
             mf = statistics.fmean(x[1] for x in mc)
-            print(f"  {sec:5.2f}s  MCCFR {ma:7.3f} / {mf:7.3f} ({mc[0][2]:>9,} it)   vector {vx[0]:7.3f} / {vx[1]:7.3f} ({vx[2]:>6,} it)", flush=True)
-            summary.setdefault((spot.split(",")[0], sec), []).append((ma, mf, vx[0], vx[1]))
-print("\nmean over roots: street, seconds: MCCFR avg / final, vector avg / final")
+            print(f"  {sec:5.2f}s  MCCFR {ma:7.3f} / {mf:7.3f} ({mc[0][2]:>9,} it)   vector {vx[0]:7.3f} / {vx[1]:7.3f} ({vx[2]:>6,} it)"
+                  f"   vector+exact {ve[0]:7.3f} / {ve[1]:7.3f} ({ve[2]:>6,} it)", flush=True)
+            summary.setdefault((spot.split(",")[0], sec), []).append((ma, mf, vx[0], vx[1], ve[0], ve[1]))
+print("\nmean over roots: street, seconds: MCCFR avg / final, vector avg / final, vector+river_exact avg / final")
 for (street, sec), rows in summary.items():
-    m = [statistics.fmean(r[i] for r in rows) for i in range(4)]
-    print(f"  {street:6s} {sec:5.2f}s  MCCFR {m[0]:7.3f} / {m[1]:7.3f}   vector {m[2]:7.3f} / {m[3]:7.3f}")
+    m = [statistics.fmean(r[i] for r in rows) for i in range(6)]
+    print(f"  {street:6s} {sec:5.2f}s  MCCFR {m[0]:7.3f} / {m[1]:7.3f}   vector {m[2]:7.3f} / {m[3]:7.3f}   exact {m[4]:7.3f} / {m[5]:7.3f}")
+if classes:
+    print(f"river classes per board over the turn roots: mean {statistics.fmean(classes):.0f}, max {max(classes)}; "
+          f"river rows at the end of a solve: max {max(river_mb):.0f} MB")

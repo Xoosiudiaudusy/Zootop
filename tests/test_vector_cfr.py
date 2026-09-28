@@ -144,3 +144,62 @@ def test_our_actual_hole_plays_the_real_action(trained):
         assert row[step["index"]] == 1.0
         checked += 1
     assert checked >= 1
+
+
+# ---- river_exact: a turn root's river infosets by hand strength instead of the blueprint's buckets
+
+def test_river_exact_class_is_the_strength_on_the_board(trained):
+    spec, game = trained[2]
+    st, acts = play(spec, TURN)
+    s = search(game, st, acts, iterations=3, vector_cfr=True, river_exact=True)
+    s.solve()
+    board = list(st.observe(st.current_player).board)
+    classes = s.river_classes()
+    rivers = [r for r in range(52) if r not in board]
+    assert all(classes[r] > 0 for r in rivers) and all(classes[c] == 0 for c in board)
+    combos = [(a, b) for a in range(52) for b in range(a + 1, 52)]
+    for r in rivers[:6]:
+        b5 = board + [r]
+        seen = {}
+        for i, (a, b) in enumerate(combos):
+            k = s.river_class(r, i)
+            if a in b5 or b in b5:
+                assert k == -1
+                continue
+            strength = core.evaluate([a, b] + b5)
+            seen.setdefault(strength, set()).add(k)
+        # one class per strength, classes in the order of the strengths, 0 .. n - 1
+        assert all(len(v) == 1 for v in seen.values())
+        ks = [next(iter(seen[x])) for x in sorted(seen)]
+        assert ks == list(range(len(ks))) and classes[r] == len(ks)
+
+
+def test_river_exact_one_thread_is_deterministic_and_off_elsewhere(trained):
+    spec, game = trained[2]
+    st, acts = play(spec, TURN)
+    outs = []
+    for _ in range(2):
+        s = search(game, st, acts, iterations=20, vector_cfr=True, river_exact=True, seed=4)
+        r = s.solve()
+        outs.append((r["final"], r["average"], s.likelihood(0), s.likelihood(1), s.subgame_exploitability(0, 2)))
+    assert outs[0] == outs[1]
+    # a river root is lossless already: river_exact changes nothing there
+    st, acts = play(spec, RIVER_BET)
+    a = search(game, st, acts, iterations=30, vector_cfr=True, river_exact=True)
+    b = search(game, st, acts, iterations=30, vector_cfr=True)
+    ra, rb = a.solve(), b.solve()
+    assert (ra["final"], ra["average"]) == (rb["final"], rb["average"]) and a.river_bytes == 0
+
+
+def test_river_exact_lowers_the_turn_floor(trained):
+    """With the river by buckets the turn subgame's exploitability stops at the abstraction's floor (~0.5-0.65 here,
+    not falling from 600 to 12000 iterations); with the exact river it keeps falling (0.2 at 3000, 0.04 at 12000).
+    Each river card's rows learn only in the iterations that deal it, so the exact river starts slower."""
+    spec, game = trained[2]
+    st, acts = play(spec, TURN)
+    ex = {}
+    for exact in (False, True):
+        s = search(game, st, acts, iterations=3000, threads=4, vector_cfr=True, river_exact=exact)
+        s.solve()
+        ex[exact] = s.subgame_exploitability(0, 2)[0]
+    assert ex[True] < 0.5 * ex[False], ex

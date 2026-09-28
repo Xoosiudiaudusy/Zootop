@@ -301,6 +301,10 @@ struct SearchParams {
     // table, outputs and exploitability as the MCCFR.  Only 2 live players, a turn or river root, no
     // leaves, no frozen round; anywhere else the MCCFR runs.  Off by default (the MCCFR, bit for bit).
     bool vector_cfr = false;
+    // vector CFR on a turn root: river infosets without the blueprint's buckets, a hole's class on a river board
+    // being its hand strength there (equal strength, one class); rows per river card, kept as floats in the
+    // public tree (never in the search's table).  Off: the vector CFR's numbers unchanged.
+    bool river_exact = false;
 };
 
 struct LeafInfo {  // tests: one leaf of the public tree
@@ -507,6 +511,8 @@ public:
         for (const PathStep& s : path_) our_ph.step(s.index);
         const NodeKey our_key = search_key(root_street_, hand_.our_seat, class_of_[our_combo_], our_ph);
         const bool use_vector = vector_eligible();
+        vexact_ = false;
+        vriver_nodes_.clear();
         if (use_vector) prepare_vector();
         group_->begin(T);
         std::mutex err_mu;
@@ -1066,6 +1072,16 @@ private:
         const Board5& B = ex.boards[(size_t)(st.n_board == 5 && root_.n_board == 4 ? st.board[4] : 52)];
         double memo[256][MAX_ACTIONS];
         bool have[256] = {false};
+        // river_exact: this river node's rows of the dealt river card, by strength rank (uniform if never reached)
+        const bool vx = !by_bucket && vexact_ && st.street == RIVER && root_street_ == TURN;
+        const TNode::VRiver* vb = nullptr;
+        const int* vrank = nullptr;
+        if (vx) {
+            const auto it = vriver_nodes_.find(ph.a);
+            const TNode* t = it != vriver_nodes_.end() && it->second->ph.b == ph.b ? it->second : nullptr;
+            vb = t && t->vriv ? t->vriv[(size_t)st.board[4]].load(std::memory_order_acquire) : nullptr;
+            vrank = vboards_[(size_t)st.board[4]].rank.data();
+        }
         for (int x = 0; x < N_COMBOS; x++) {
             const int bx = B.bucket.empty() ? 0 : B.bucket[(size_t)x];
             if (B.bucket.empty() ? class_of_[(size_t)x] < 0 : bx < 0) continue;  // on the board
@@ -1082,6 +1098,23 @@ private:
                     have[b] = true;
                 }
                 for (int a = 0; a < na.n; a++) row[a] = memo[b][a];
+                continue;
+            }
+            if (vx) {
+                const int k = vrank[x];
+                if (!vb || k < 0 || k >= vb->nc) {
+                    for (int a = 0; a < na.n; a++) row[a] = 1.0 / na.n;
+                    continue;
+                }
+                double w[MAX_ACTIONS];
+                for (int a = 0; a < na.n; a++) w[a] = (double)(ex.kind == 0 ? vb->ss : vb->reg)[(size_t)k * na.n + a];
+                if (ex.kind == 0) {
+                    double s = 0.0;
+                    for (int a = 0; a < na.n; a++) s += w[a];
+                    for (int a = 0; a < na.n; a++) row[a] = s > 0.0 ? w[a] / s : 1.0 / na.n;
+                } else {
+                    v_regret_matching(w, na.n, row);
+                }
                 continue;
             }
             const int card = st.street == root_street_ ? class_of_[(size_t)x] : bx;
@@ -2125,6 +2158,15 @@ private:
         std::vector<int64_t> vvis;
         SpinLock vlock;
         std::once_flag vonce;
+        // river_exact, a river node of a turn root: the rows of each river card, [class * na + a], made on first use
+        struct VRiver {
+            int nc = 0;
+            std::vector<float> reg, ss;
+            std::vector<int32_t> vis;
+        };
+        std::unique_ptr<std::atomic<VRiver*>[]> vriv;  // [river card]
+        std::vector<std::unique_ptr<VRiver>> vriv_own;
+        std::once_flag vriv_once;
     };
     std::vector<std::unique_ptr<TNode>> tnodes_;
     std::mutex tree_mu_;
@@ -2356,13 +2398,36 @@ private:
         std::vector<int64_t> strength;
         std::vector<int> order;
         std::vector<int> bucket;         // -1: the combo holds a board card
+        std::vector<int> rank;           // river_exact: the combo's class, the index of its strength among the board's (-1: on the board)
+        int n_rank = 0;                  // distinct strengths
     };
     std::vector<VBoard> vboards_;        // [river card] on a turn root, [52] on a river root
+    bool vexact_ = false;                // river_exact on this turn root
+    std::unordered_map<uint64_t, TNode*> vriver_nodes_;  // river_exact, after the solve: river decision nodes by path hash (a)
     std::vector<int> vriver_;            // the river cards a turn root samples from
     int vseat_[2] = {0, 1};              // the two live seats
     TNode* vour_ = nullptr;              // our decision's node in the public tree
 
   public:
+    // river_exact, after a solve on a turn root: per river card (52 entries, 0 for board cards) the number of
+    // classes (distinct strengths), and the class of a combo on a river card (-1: holds a board card)
+    std::vector<int> river_classes() const {
+        std::vector<int> out(52, 0);
+        if (!vexact_) return out;
+        for (int r : vriver_) out[(size_t)r] = vboards_[(size_t)r].n_rank;
+        return out;
+    }
+    int river_class(int r, int combo) const {
+        if (!vexact_ || r < 0 || r >= 52 || combo < 0 || combo >= N_COMBOS || vboards_[(size_t)r].rank.empty()) return -1;
+        return vboards_[(size_t)r].rank[(size_t)combo];
+    }
+    // river_exact: bytes of the river rows made in the last solve (floats and visit counters)
+    size_t river_bytes() const {
+        size_t b = 0;
+        for (const auto& up : tnodes_)
+            for (const auto& v : up->vriv_own) b += v->reg.capacity() * sizeof(float) * 2 + v->vis.capacity() * sizeof(int32_t);
+        return b;
+    }
     // the budget of the next solve() (e.g. vector-CFR iterations once vector_eligible() is known)
     void set_budget(long long iterations, double time_budget) {
         params_.iterations = iterations;
@@ -2400,7 +2465,17 @@ private:
                 if (root_.n_board == 4) B.bucket[(size_t)c] = later_bucket(hole, b, 5);
             }
             std::sort(B.order.begin(), B.order.end(), [&](int a, int c2) { return B.strength[(size_t)a] < B.strength[(size_t)c2]; });
+            if (vexact_) {
+                B.rank.assign((size_t)N_COMBOS, -1);
+                int k = -1;
+                for (size_t i = 0; i < B.order.size(); i++) {
+                    if (i == 0 || B.strength[(size_t)B.order[i]] != B.strength[(size_t)B.order[i - 1]]) k++;
+                    B.rank[(size_t)B.order[i]] = k;
+                }
+                B.n_rank = k + 1;
+            }
         };
+        vexact_ = params_.river_exact && root_.n_board == 4;
         int b5[5];
         for (int i = 0; i < root_.n_board; i++) b5[i] = root_.board[i];
         if (root_.n_board == 5) {
@@ -2524,6 +2599,105 @@ private:
         for (int a = 0; a < na; a++) out[a] = reg[a] > 0.0 ? reg[a] / sum : 0.0;
     }
 
+    // the rows of node t on river card r: the node's own (class on the root's round, bucket on the river; doubles),
+    // or with river_exact at a river node the block of card r (class = strength rank there; floats, made on first use)
+    struct VRef {
+        int nc = 0;
+        const int* cpv = nullptr;  // combo -> row (card part), < 0: not in the round
+        double* dreg = nullptr;
+        double* dss = nullptr;
+        int64_t* dvis = nullptr;
+        float* freg = nullptr;
+        float* fss = nullptr;
+        int32_t* fvis = nullptr;
+    };
+    VRef v_ref(TNode* t, int r) {
+        VRef f;
+        const int na = t->na.n;
+        const bool river_part = t->street != root_street_;
+        if (vexact_ && river_part) {
+            std::call_once(t->vriv_once, [&]() {
+                t->vriv.reset(new std::atomic<TNode::VRiver*>[52]);
+                for (int i = 0; i < 52; i++) t->vriv[(size_t)i].store(nullptr, std::memory_order_relaxed);
+            });
+            TNode::VRiver* b = t->vriv[(size_t)r].load(std::memory_order_acquire);
+            if (!b) {
+                t->vlock.lock();
+                b = t->vriv[(size_t)r].load(std::memory_order_relaxed);
+                if (!b) {
+                    try {
+                        std::unique_ptr<TNode::VRiver> nb(new TNode::VRiver);
+                        nb->nc = vboards_[(size_t)r].n_rank;
+                        nb->reg.assign((size_t)nb->nc * na, 0.0f);
+                        nb->ss.assign((size_t)nb->nc * na, 0.0f);
+                        nb->vis.assign((size_t)nb->nc, 0);
+                        b = nb.get();
+                        t->vriv_own.push_back(std::move(nb));
+                    } catch (...) {
+                        t->vlock.unlock();
+                        throw;  // (out of memory: the worker's handler, a Python exception)
+                    }
+                    t->vriv[(size_t)r].store(b, std::memory_order_release);
+                }
+                t->vlock.unlock();
+            }
+            f.nc = b->nc;
+            f.cpv = vboards_[(size_t)r].rank.data();
+            f.freg = b->reg.data();
+            f.fss = b->ss.data();
+            f.fvis = b->vis.data();
+            return f;
+        }
+        const int nc = t->n_cache;
+        std::call_once(t->vonce, [&]() {
+            t->vreg.assign((size_t)nc * na, 0.0);
+            t->vss.assign((size_t)nc * na, 0.0);
+            t->vvis.assign((size_t)nc, 0);
+        });
+        f.nc = nc;
+        f.cpv = river_part ? vboards_[(size_t)(root_.n_board == 5 ? 52 : r)].bucket.data() : class_of_.data();
+        f.dreg = t->vreg.data();
+        f.dss = t->vss.data();
+        f.dvis = t->vvis.data();
+        return f;
+    }
+    // sigma of every row (a snapshot of the regrets)
+    void v_sigma(TNode* t, const VRef& f, int na, double* sg) {
+        t->vlock.lock();
+        if (f.freg) {
+            double tmp[MAX_ACTIONS];
+            for (int cp = 0; cp < f.nc; cp++) {
+                for (int a = 0; a < na; a++) tmp[a] = (double)f.freg[(size_t)cp * na + a];
+                v_regret_matching(tmp, na, &sg[(size_t)cp * na]);
+            }
+        } else {
+            for (int cp = 0; cp < f.nc; cp++) v_regret_matching(&f.dreg[(size_t)cp * na], na, &sg[(size_t)cp * na]);
+        }
+        t->vlock.unlock();
+    }
+    // weight x (regret increments, if given, and strategy-sum increments) into the rows with cnt > 0
+    void v_add(TNode* t, const VRef& f, int na, const std::vector<int>& cnt, const double* reg, const double* ss, double weight) {
+        t->vlock.lock();
+        for (int cp = 0; cp < f.nc; cp++) {
+            if (!cnt[(size_t)cp]) continue;
+            const size_t o = (size_t)cp * na;
+            if (f.freg) {
+                for (int a = 0; a < na; a++) {
+                    if (reg) f.freg[o + a] += (float)(weight * reg[o + a]);
+                    f.fss[o + a] += (float)(weight * ss[o + a]);
+                }
+                f.fvis[cp] += 1;
+            } else {
+                for (int a = 0; a < na; a++) {
+                    if (reg) f.dreg[o + a] += weight * reg[o + a];
+                    f.dss[o + a] += weight * ss[o + a];
+                }
+                f.dvis[cp] += 1;
+            }
+        }
+        t->vlock.unlock();
+    }
+
     // the average strategy of p below t where o's reach is zero: no values, no regrets (both would be
     // zero), but p's strategy sums still add p's own reach x sigma, as at every node p reaches
     void v_avg(TNode* t, int p, const double* rp, int r, double weight, VCtx& vc) {
@@ -2535,12 +2709,6 @@ private:
         }
         const int q = t->seat;
         const int na = t->na.n;
-        const int nc = t->n_cache;
-        std::call_once(t->vonce, [&]() {
-            t->vreg.assign((size_t)nc * na, 0.0);
-            t->vss.assign((size_t)nc * na, 0.0);
-            t->vvis.assign((size_t)nc, 0);
-        });
         auto child = [&](int a, const double* rpa) {
             TNode* c = tchild(t, a);
             if (r >= 0 && t->n_board == 4 && c->n_board == 5) {
@@ -2557,8 +2725,9 @@ private:
             for (int a = 0; a < na; a++) child(a, rp);
             return;
         }
-        const bool river_part = t->street != root_street_;
-        const int* cpv = river_part ? vboards_[(size_t)(root_.n_board == 5 ? 52 : r)].bucket.data() : class_of_.data();
+        const VRef f = v_ref(t, r);
+        const int nc = f.nc;
+        const int* cpv = f.cpv;
         const int forced = t->path_node && q == hand_.our_seat ? our_combo_ : -1;
         const int dep = vc.depth++;
         if ((int)vc.rows.size() <= dep) {
@@ -2569,9 +2738,7 @@ private:
         if (rows.size() < (size_t)nc * na * 3) rows.resize((size_t)nc * na * 3);
         double* sg = rows.data();
         double* ss = sg + (size_t)nc * na;
-        t->vlock.lock();
-        for (int cp = 0; cp < nc; cp++) v_regret_matching(&t->vreg[(size_t)cp * na], na, &sg[(size_t)cp * na]);
-        t->vlock.unlock();
+        v_sigma(t, f, na, sg);
         std::fill(ss, ss + (size_t)nc * na, 0.0);
         std::vector<int>& cnt = vc.ints[(size_t)dep];
         cnt.assign((size_t)nc, 0);
@@ -2581,13 +2748,7 @@ private:
             cnt[(size_t)cp]++;
             for (int a = 0; a < na; a++) ss[(size_t)cp * na + a] += rp[c] * sg[(size_t)cp * na + a];
         }
-        t->vlock.lock();
-        for (int cp = 0; cp < nc; cp++) {
-            if (!cnt[(size_t)cp]) continue;
-            for (int a = 0; a < na; a++) t->vss[(size_t)cp * na + a] += weight * ss[(size_t)cp * na + a];
-            t->vvis[(size_t)cp] += 1;
-        }
-        t->vlock.unlock();
+        v_add(t, f, na, cnt, nullptr, ss, weight);
         double* rp2 = vc.get();
         for (int a = 0; a < na; a++) {
             for (int c = 0; c < N_COMBOS; c++) {
@@ -2641,14 +2802,9 @@ private:
         ctx.nodes++;
         const int q = t->seat;
         const int na = t->na.n;
-        const int nc = t->n_cache;
-        std::call_once(t->vonce, [&]() {
-            t->vreg.assign((size_t)nc * na, 0.0);
-            t->vss.assign((size_t)nc * na, 0.0);
-            t->vvis.assign((size_t)nc, 0);
-        });
-        const bool river_part = t->street != root_street_;
-        const int* cpv = river_part ? vboards_[(size_t)(root_.n_board == 5 ? 52 : r)].bucket.data() : class_of_.data();
+        const VRef f = v_ref(t, r);
+        const int nc = f.nc;
+        const int* cpv = f.cpv;
         const int forced = t->path_node && q == hand_.our_seat ? our_combo_ : -1;  // our actual hole plays the real action
         const int dep = vc.depth++;
         if ((int)vc.rows.size() <= dep) {
@@ -2659,9 +2815,7 @@ private:
         std::vector<double>& rows = vc.rows[(size_t)dep];
         if (rows.size() < (size_t)nc * na * 3) rows.resize((size_t)nc * na * 3);
         double* sg = rows.data();
-        t->vlock.lock();
-        for (int cp = 0; cp < nc; cp++) v_regret_matching(&t->vreg[(size_t)cp * na], na, &sg[(size_t)cp * na]);
-        t->vlock.unlock();
+        v_sigma(t, f, na, sg);
         // S[a][c]: sigma of combo c (0 for combos not in the round: on the board, or holding the river card)
         const size_t base = vc.top;
         for (int a = 0; a < na; a++) vc.get();
@@ -2736,20 +2890,7 @@ private:
                 sm[a] += rpc * S[a][c];
             }
         }
-        t->vlock.lock();
-        for (int cp = 0; cp < nc; cp++) {
-            if (!cnt[(size_t)cp]) continue;
-            double* R = &t->vreg[(size_t)cp * na];
-            double* M = &t->vss[(size_t)cp * na];
-            const double* rg = &reg[(size_t)cp * na];
-            const double* sm = &ss[(size_t)cp * na];
-            for (int a = 0; a < na; a++) {
-                R[a] += weight * rg[a];
-                M[a] += weight * sm[a];
-            }
-            t->vvis[(size_t)cp] += 1;
-        }
-        t->vlock.unlock();
+        v_add(t, f, na, cnt, reg, ss, weight);
         vc.release((size_t)na * 2 + 1);
         vc.depth--;
     }
@@ -2759,6 +2900,7 @@ private:
     void vector_write_back() {
         for (const auto& up : tnodes_) {
             TNode* t = up.get();
+            if (vexact_ && !t->terminal && !t->leaf && t->street == RIVER) vriver_nodes_[t->ph.a] = t;
             if (t->terminal || t->leaf || t->vvis.empty()) continue;
             const int na = t->na.n;
             for (int cp = 0; cp < t->n_cache; cp++) {

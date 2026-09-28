@@ -1596,7 +1596,7 @@ PYBIND11_MODULE(_fastcore, m) {
                          const std::vector<std::pair<int, int>>& actions, const std::vector<int>& board, int seat,
                          const std::vector<int>& hole, long long iterations, double time_budget, int threads, uint64_t seed,
                          double focus, double min_prob, bool linear, const py::object& overrides, const py::object& depth,
-                         int rollouts, double bias, int debug_leaves, bool legacy_traverse, bool vector_cfr) {
+                         int rollouts, double bias, int debug_leaves, bool legacy_traverse, bool vector_cfr, bool river_exact) {
             HandInput h;
             h.stacks = stacks;
             h.button = button;
@@ -1630,17 +1630,23 @@ PYBIND11_MODULE(_fastcore, m) {
             p.debug_leaves = debug_leaves;
             p.legacy_traverse = legacy_traverse;
             p.vector_cfr = vector_cfr;
+            p.river_exact = river_exact;
             py::gil_scoped_release nogil;
             return new SubgameSearch(std::shared_ptr<const SearchGame>(game), h, p);
         }), py::arg("game"), py::arg("stacks"), py::arg("button"), py::arg("actions"), py::arg("board"), py::arg("seat"),
             py::arg("hole"), py::arg("iterations") = 0, py::arg("time_budget") = 2.0, py::arg("threads") = 15, py::arg("seed") = 0,
             py::arg("focus") = 0.5, py::arg("min_prob") = 1e-3, py::arg("linear") = true, py::arg("overrides") = py::none(),
             py::arg("depth") = "end", py::arg("rollouts") = 3, py::arg("bias") = 5.0, py::arg("debug_leaves") = 0,
-            py::arg("legacy_traverse") = false, py::arg("vector_cfr") = false,
+            py::arg("legacy_traverse") = false, py::arg("vector_cfr") = false, py::arg("river_exact") = false,
             "the subgame of the hand so far: root at the start of the current round, ranges by Bayes over the blueprint; "
             "depth 'end' / 'pluribus' / 'hu_flop_limit' / 'next_street' (leaves: four continuations, `rollouts` rollouts each)")
         .def("set_budget", &SubgameSearch::set_budget, py::arg("iterations"), py::arg("time_budget"),
              "the budget of the next solve(): iterations (0: none) and seconds (0: none)")
+        .def("river_classes", &SubgameSearch::river_classes,
+             "river_exact, after a solve on a turn root: classes (distinct strengths) per river card, 52 entries")
+        .def("river_class", &SubgameSearch::river_class, py::arg("card"), py::arg("combo"),
+             "river_exact: a combo's class on the river card (its strength rank there; -1 on the board)")
+        .def_property_readonly("river_bytes", &SubgameSearch::river_bytes, "river_exact: bytes of the river rows of the last solve")
         .def_property_readonly("vector_eligible", &SubgameSearch::vector_eligible,
                                "vector_cfr would run here (2 live players, turn / river root, no leaves, not frozen)")
         .def("solve", [](SubgameSearch& s) {
