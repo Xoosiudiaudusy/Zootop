@@ -93,17 +93,21 @@ def test_batched_trainer_keeps_the_last_batch_and_resumes_exactly(threads):
 
 
 @pytest.mark.parametrize("threads", [1, 2, 4, 8])
-@pytest.mark.parametrize("mode", ["cpu", "emu"])
+@pytest.mark.parametrize("mode", ["cpu", "emu", "emu-pool1", "emu-pool3"])
 def test_flat_and_gpu_host_keep_the_last_batch_and_continue_exactly(threads, mode):
-    """The flat trainer (CPU levels, or the GPU path with the device emulated): a preparation that fails ends
-    train() with an error, the tables stay those of the last whole batch, and training continues from the same
-    object to the tables of a run that never failed."""
+    """The flat trainer (CPU levels, or the GPU path with the device emulated: threads per batch, or the persistent
+    preparation pool with a ring of 1 or 3 batches ahead): a preparation that fails ends train() with an error, the
+    tables stay those of the last whole batch the device ran, and training continues from the same object to the
+    tables of a run that never failed."""
+    emu, pool, depth = mode != "cpu", mode.startswith("emu-pool"), int(mode[-1]) if mode.startswith("emu-pool") else 1
     out = run('''
         def flat():
             ft = core.FlatTrainer(spec_to_dict(spec), core_bucketer(bk), 5, True, {threads})
             ft.batch_size = 64
             ft.gpu_pass = 16
             ft.emulate_gpu = {emu}
+            ft.prep_pool = {pool}
+            ft.prep_depth = {depth}
             return ft
         def export(ft):
             return {{k: (list(r), list(s), v) for k, (r, s, v) in ft.export_nodes().items()}}
@@ -124,7 +128,7 @@ def test_flat_and_gpu_host_keep_the_last_batch_and_continue_exactly(threads, mod
             flat().train(640)
         except RuntimeError as e:
             print("every preparation failing: raised", ft.iteration == 1280)
-    ''', threads=threads, emu="True" if mode == "emu" else "False")
+    ''', threads=threads, emu=emu, pool=pool, depth=depth)
     assert "raised True True True True" in out and "continued identical True" in out and "failing: raised True" in out, out
 
 
