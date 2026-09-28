@@ -56,13 +56,14 @@ def spec_to_dict(spec: GameSpec) -> dict:
     }
 
 
-def core_bucketer(bucketer, cache_caps=None):
+def core_bucketer(bucketer, cache_caps=None, tables=None):
     """The C++ twin of a fitted Python bucketer (its cache starts empty): ``Bucketer`` for an
     ``EquityBucketer`` (same boundaries / sample count), ``PotentialBucketer`` for a
     ``PotentialAwareBucketer`` (same centroids, river cut points, samples, bins).
     ``cache_caps``: (flop, turn, river) cache capacities in entries (None: env / defaults).
-    With ``NEGPLURIBUS_BUCKET_TABLES`` pointing at a directory that holds a precomputed table of
-    this bucketer (fast/tables.py), the result answers from it: same buckets, no Monte-Carlo."""
+    With ``tables`` (default: ``NEGPLURIBUS_BUCKET_TABLES``) pointing at a directory that holds a
+    precomputed table of this bucketer (fast/tables.py), the result answers from it: same buckets,
+    no Monte-Carlo."""
     c = core()
     caps = list(resolve_cache_caps(cache_caps))
     boundaries = {int(k): list(v) for k, v in bucketer.boundaries.items()}
@@ -71,8 +72,8 @@ def core_bucketer(bucketer, cache_caps=None):
             raise RuntimeError("the built C++ core predates potential-aware buckets; run `python scripts/build_fast.py`")
         centroids = {int(k): [list(cdf) for cdf in v] for k, v in bucketer.centroids.items()}
         return tabulated(c.PotentialBucketer(bucketer.n_buckets, bucketer.samples, bucketer.bins, centroids, boundaries, caps,
-                                             exact=bool(getattr(bucketer, "exact", False))))
-    return tabulated(c.Bucketer(bucketer.n_buckets, bucketer.samples, boundaries, caps))
+                                             exact=bool(getattr(bucketer, "exact", False))), tables)
+    return tabulated(c.Bucketer(bucketer.n_buckets, bucketer.samples, boundaries, caps), tables)
 
 
 def _to_node(row) -> Node:

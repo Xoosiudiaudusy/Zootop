@@ -65,6 +65,35 @@ def test_plays_legal_hands_against_arbitrary_sizes_with_nothing_off_the_map(game
     assert s.preflop_reasons.get("off-grid size", 0) > 0 and s.inserted > 0
 
 
+def test_a_failed_search_is_played_by_the_blueprint_and_counted(game, monkeypatch):
+    """A search that raises (as solve() does when its node table cannot grow: tests/test_search_oom.py) is played by
+    the blueprint and counted: SearchStats.errors, the summary line of the check files next to "off the map", and the
+    decision info (played = "blueprint after a search error" and the error, both kept by eval_archetypes
+    --log-hands), so a run under memory pressure is visible.  Every search fails here (deterministic: a real table
+    growth happens or not depending on the hands)."""
+    from negpluribus.agents.core_search import SearchStats
+    from negpluribus.eval.duel import duplicate_duel
+
+    assert "off the map 0 (0.00%); search errors 0 (fallback to the blueprint)" in SearchStats().summary()
+    spec, bk, res = game
+    hero = agent(game)
+    calls = []
+
+    def failing(obs, reason):
+        calls.append(int(obs.street))
+        raise RuntimeError("search failed: out of memory growing the node table")
+
+    monkeypatch.setattr(hero, "_search", failing)
+    infos = []
+    r = duplicate_duel(hero, [RandomAgent(seed=5, name="random")], n_deals=6, seed=1, sb=spec.sb, bb=spec.bb,
+                       stack_bb=spec.stack_bb, luck=False, on_hand=lambda d, seat, rec, luck, inf: infos.extend(inf))
+    s = hero.stats
+    failed = [i for i in infos if i.get("played") == "blueprint after a search error"]
+    assert r.n_hands == 12 and s.n_errors == len(failed) == len(calls) > 0, s.summary()
+    assert all(i["error"] == "RuntimeError: search failed: out of memory growing the node table" for i in failed)
+    assert f"search errors {s.n_errors} (fallback to the blueprint)" in s.summary()
+
+
 def test_preflop_blueprint_unless_the_size_is_far_off_the_grid_or_the_key_unknown(game):
     from negpluribus.agents.core_search import raise_offgrid_distance
 
@@ -323,3 +352,108 @@ def test_the_value_overbettor_overbets_only_its_strong_raises(game):
                 same += 1
             st.apply(a)
     assert overbets > 5 and same > 3 * overbets and ob.n_overbets == overbets  # about 15-25 of 780 decisions
+
+
+def test_the_search_can_key_its_later_rounds_on_a_bucketer_of_its_own(game, tmp_path):
+    """SearchResources with a search bucketer: the game keys the subgame's later rounds on it while the inner blueprint
+    agent keeps the blueprint's bucketer; the agent plays legal hands, every postflop decision searched; a saved cache
+    of the search bucketer loads; a search bucketer with the blueprint's identity is the blueprint's (nothing separate)."""
+    from negpluribus.abstraction import PotentialAwareBucketer
+    from negpluribus.agents.core_search import CoreSearchAgent, SearchConfig, SearchResources
+    from negpluribus.eval.duel import duplicate_duel
+    from negpluribus.fast.trainer import core_bucketer
+
+    spec, bk, res = game
+    fine = PotentialAwareBucketer(n_buckets=24, samples=6, bins=10).fit(n_situations=200, seed=5)
+    cache = str(tmp_path / "fine_cache.bin")
+    c = core_bucketer(fine)
+    c.bucket([0, 1], [10, 20, 30])
+    c.bucket([0, 1], [10, 20, 30, 40])
+    c.save_cache(cache, [1, 2])
+    r2 = SearchResources.build(spec, bk, res.blueprint, search_bucketer=fine, search_cache_path=cache)
+    assert r2.game.separate_buckets and r2.search_bucketer is fine and r2.search_core_bucketer is not None
+    assert [x[0] for x in r2.search_cache_loaded] == [1, 2] and all(x[1] >= 1 for x in r2.search_cache_loaded)
+    assert "the subgame's rounds after its root: 24 potential" in r2.describe_buckets()
+    hero = CoreSearchAgent(r2, SearchConfig(iterations=300, threads=2), seed=3)
+    assert hero.blueprint_agent.bucketer is bk
+    r = duplicate_duel(hero, [RandomAgent(seed=5, name="random")], n_deals=12, seed=1, sb=spec.sb, bb=spec.bb,
+                       stack_bb=spec.stack_bb, luck=False)
+    s = hero.stats
+    assert r.n_hands == 24 and not s.errors and s.off_map == 0
+    postflop = sum(v for k, v in s.decisions.items() if k > 0)
+    assert postflop > 0 and sum(v for k, v in s.searches.items() if k > 0) == postflop
+    r3 = SearchResources.build(spec, bk, res.blueprint, search_bucketer=bk)
+    assert not r3.game.separate_buckets and r3.search_bucketer is None and r3.search_core_bucketer is None
+    assert not res.game.separate_buckets and "after its root: the blueprint's" in res.describe_buckets()
+
+
+def test_resources_of_two_blueprints_share_one_bucketer_bit_for_bit(game, tmp_path):
+    """Two SearchResources of different blueprints (30bb and 20bb) on one card abstraction, the second built on the
+    first's C++ bucketers (the blueprint's, and the subgame's own with its saved cache): on one thread at fixed
+    iterations every search is bit for bit that of two independent resources (direct solves at flop / turn / river
+    roots: strategies, ranges, likelihoods; and whole hands of the search agent).  A C++ bucketer of another
+    abstraction, or a cache path next to a shared bucketer, is refused."""
+    from negpluribus.abstraction import PotentialAwareBucketer
+    from negpluribus.agents.core_search import CoreSearchAgent, SearchConfig, SearchResources
+    from negpluribus.eval.duel import duplicate_duel
+    from negpluribus.fast.trainer import core_bucketer
+
+    spec, bk, res = game
+    spec20 = GameSpec(n_players=2, stack_bb=20, max_street=Street.RIVER, n_buckets=bk.n_buckets, max_raises_per_street=2,
+                      preflop_fracs=(1.0,), postflop_fracs=(0.5, 1.0))
+    bp20 = MCCFRTrainer(spec20, bk, seed=4, backend="cpp", threads=4).train(4000).blueprint()
+    fine = PotentialAwareBucketer(n_buckets=24, samples=6, bins=10).fit(n_situations=200, seed=5)
+    cache = str(tmp_path / "fine_cache.bin")
+    c = core_bucketer(fine)
+    c.bucket([0, 1], [10, 20, 30])
+    c.save_cache(cache, [1, 2])
+    games = [(spec, res.blueprint), (spec20, bp20)]
+
+    def solves(r, sp):
+        out = []
+        for line in (["r1", "c"], ["r1", "c", "c", "c"], ["r1", "c", "c", "c", "c", "c"]):
+            order = list(range(52))
+            random.Random(len(line)).shuffle(order)
+            st = sp.new_hand(order, button=0)
+            acts = []
+            for name in line:
+                a = sp.grid.to_concrete(st.observe(st.current_player), name)
+                acts.append((int(a.type), int(a.amount) if a.type == ActionType.RAISE else 0))
+                st.apply(a)
+            obs = st.observe(st.current_player)
+            s = core.SubgameSearch(r.game, list(st.starting_stacks), st.button, acts, list(obs.board), obs.seat,
+                                   list(obs.hole), iterations=1500, time_budget=0.0, threads=1, seed=3, depth="end")
+            x = s.solve()
+            out.append(({k: x[k] for k in ("final", "average", "iterations", "table_size", "nodes_touched")},
+                        s.ranges(), [s.likelihood(p) for p in range(2)]))
+        return out
+
+    def hands(r, sp):
+        hero = CoreSearchAgent(r, SearchConfig(iterations=300, threads=1), seed=3)
+        log = []
+        duplicate_duel(hero, [RandomAgent(seed=5, name="random")], n_deals=6, seed=2, sb=sp.sb, bb=sp.bb,
+                       stack_bb=sp.stack_bb, luck=False,
+                       on_hand=lambda d, seat, rec, luck, infos: log.append(
+                           ([(e.seat, int(e.action.type), e.action.amount) for e in rec.events],
+                            [{k: v for k, v in i.items() if k not in ("s", "search_s")} for i in infos])))
+        assert hero.stats.n_searches > 0 and not hero.stats.errors
+        return log
+
+    for sbk in (None, fine):
+        alone = [SearchResources.build(sp, bk, bp, search_bucketer=sbk, search_cache_path=cache if sbk else None)
+                 for sp, bp in games]
+        first = SearchResources.build(spec, bk, res.blueprint, search_bucketer=sbk, search_cache_path=cache if sbk else None)
+        second = SearchResources.build(spec20, bk, bp20, search_bucketer=sbk, core_bucketer=first.core_bucketer,
+                                       search_core_bucketer=first.search_core_bucketer)
+        assert second.core_bucketer is first.core_bucketer and second.cache_loaded is None
+        assert second.search_core_bucketer is first.search_core_bucketer and (sbk is None) == (second.search_core_bucketer is None)
+        assert second.game.separate_buckets == (sbk is not None)
+        for (sp, _), a, b in zip(games, alone, (first, second)):
+            assert solves(a, sp) == solves(b, sp)
+            assert hands(a, sp) == hands(b, sp)
+    with pytest.raises(ValueError, match="not the C\\+\\+ twin"):
+        SearchResources.build(spec20, bk, bp20, core_bucketer=first.search_core_bucketer)
+    with pytest.raises(ValueError, match="cache_path with a shared core_bucketer"):
+        SearchResources.build(spec20, bk, bp20, core_bucketer=first.core_bucketer, cache_path=cache)
+    with pytest.raises(ValueError, match="without the Python search_bucketer"):
+        SearchResources.build(spec20, bk, bp20, core_bucketer=first.core_bucketer, search_core_bucketer=first.search_core_bucketer)

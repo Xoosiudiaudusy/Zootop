@@ -92,7 +92,9 @@ def main() -> int:
         name = os.path.splitext(os.path.basename(args.blueprint))[0]
         if args.agent == "search":
             res = SearchResources.load(spec, args.blueprint, bucketer=bk, cache_path=args.cache,
-                                       presample_seed=args.seed if args.presample else None)
+                                       presample_seed=args.seed if args.presample else None,
+                                       search_buckets_path=args.search_buckets, search_tables=args.search_tables,
+                                       search_cache_path=args.search_cache)
             bp = res.blueprint
             cfg = search_config_from_args(args)
             name = f"search_{name}"
@@ -100,6 +102,9 @@ def main() -> int:
             print(f"search agent: {cfg}")
             print(f"bucket cache: {res.cache_loaded if args.cache else 'none (the first searches on a board compute buckets)'}")
             meta.update(search=vars(cfg), cache=args.cache)
+            if args.search_buckets:
+                print(res.describe_buckets())
+                meta.update(search_buckets=args.search_buckets)
         else:
             bp = load_blueprint(args.blueprint)
             agent = BlueprintAgent(bp, bk, spec.grid, name=name, seed=args.seed)

@@ -11,6 +11,8 @@ and the likelihood() of both seats, as hex.  With --threads 1 and a fixed seed t
 two builds with the same logic give the same fingerprints; --compare reports the first difference.
 A warm-up search per hand runs first (bucket caches), so the timed searches measure the solver; --cold skips it, and
 "solve" then includes the bucket work of a new board (every hand has one), as in play.
+--search-buckets (with --search-tables / --search-cache) gives the subgame an abstraction of its own for the rounds after
+the root's; --infosets counts the subgame's infosets of those rounds per street (and the largest bucket keyed).
 """
 from __future__ import annotations
 
@@ -64,6 +66,11 @@ def main() -> int:
     ap.add_argument("--spots", default="", help="comma-separated prefixes of spot names")
     ap.add_argument("--depth", default="pluribus")
     ap.add_argument("--cold", action="store_true", help="no warm-up search: the timed search pays the board's bucket work, as in play")
+    ap.add_argument("--cache", default=None, help="saved bucket cache of --buckets to load first")
+    ap.add_argument("--search-buckets", default=None, help="the subgame's own buckets for the rounds after the root's (JSON)")
+    ap.add_argument("--search-tables", default=None, help="bucket-table directory for --search-buckets (default $NEGPLURIBUS_BUCKET_TABLES)")
+    ap.add_argument("--search-cache", default=None, help="saved bucket cache of --search-buckets")
+    ap.add_argument("--infosets", action="store_true", help="count the subgame's infosets after the root's round per street")
     ap.add_argument("--out", default=None, help="write the fingerprints (JSON)")
     ap.add_argument("--compare", default=None, help="fingerprints of another build to compare with")
     args = ap.parse_args()
@@ -73,7 +80,18 @@ def main() -> int:
                     bucket_kind=getattr(bk, "kind", "ehs"))
     bp = load_blueprint(args.blueprint)
     cbk = core_bucketer(bk, (8_000_000, 64_000_000, 4_000_000))
-    game = core.SearchGame(spec_to_dict(spec), cbk, bp.lookup)
+    if args.cache:
+        t = time.perf_counter()
+        print(f"bucket cache {args.cache}: {cbk.load_cache(args.cache)} in {time.perf_counter() - t:.1f}s", flush=True)
+    scbk = None
+    if args.search_buckets:
+        t = time.perf_counter()
+        scbk = core_bucketer(load_bucketer(args.search_buckets), (8_000_000, 64_000_000, 4_000_000), tables=args.search_tables)
+        if args.search_cache:
+            getattr(scbk, "inner", scbk).load_cache(args.search_cache)
+        print(f"search buckets {args.search_buckets}: {scbk.identity['n_buckets']} ({type(scbk).__name__}) in "
+              f"{time.perf_counter() - t:.1f}s", flush=True)
+    game = core.SearchGame(spec_to_dict(spec), cbk, bp.lookup, search_bucketer=scbk)
     rng = random.Random(args.seed)
     wanted = [s.strip() for s in args.spots.split(",") if s.strip()]
     fps = {}
@@ -117,8 +135,12 @@ def main() -> int:
             tt[0] += r["iterations"]
             tt[1] += r["seconds"]
             tt[2] += tb
+            extra = ""
+            if args.infosets:
+                names = {1: "flop", 2: "turn", 3: "river"}
+                extra = "  later infosets " + ", ".join(f"{names[k]} {v[0]:,} (max bucket {v[1]})" for k, v in sorted(s._later_infosets().items()))
             print(f"{key:36s} build {tb * 1000:7.1f} ms  solve {r['seconds']:7.3f}s  {r['iterations']:>9,} it  {it_s:>12,.0f} it/s  "
-                  f"table {r['table_size']:,}", flush=True)
+                  f"table {r['table_size']:,}{extra}", flush=True)
     print()
     for street, (it, sec, tb) in totals.items():
         print(f"{street:6s}: {it / max(sec, 1e-9):>12,.0f} it/s over {it:,} iterations; build {tb / max(1, args.hands * 2) * 1000:.1f} ms per search")

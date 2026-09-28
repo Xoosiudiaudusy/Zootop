@@ -36,6 +36,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "workers.h"
 #include "abstraction.h"
 #include "evaluator.h"
 #include "flatgame.h"
@@ -75,6 +76,17 @@ public:
     }
 
     long long iteration() const { return iteration_; }
+    // after train() raised: whether the tables are those of iteration() (a checkpoint of them resumes exactly).
+    // False until the first train(): before it the tables are not a run's (an error while setting up, e.g. no
+    // device, must not have them saved over a checkpoint)
+    bool tables_consistent() const { return trained_ && tables_consistent_; }
+    // tests: the n-th prepare_iter from now fails with std::bad_alloc (0: never; < 0: every one), as an exhausted
+    // commit would in the host's preparation of a batch
+    static std::atomic<long long>& debug_fail_prepare() {
+        static std::atomic<long long> n{0};
+        return n;
+    }
+
 
     int gpu_pass = 0;  // GPU mode: iterations traversed at once (0: the whole batch); memory only
     // emulation of the GPU trainer on the host: the kernels' functions (gpukernels.h) in loops, the same
@@ -141,6 +153,7 @@ public:
 
     void train(long long iterations) {
         if (batch_size < 1) throw std::invalid_argument("flat trainer: batch_size >= 1");
+        trained_ = true;
         const long long target = iteration_ + iterations;
         if (gpu_ || emulate_gpu) { train_gpu(target); return; }
         const int T = threads;
@@ -151,20 +164,30 @@ public:
             const long long hi = std::min(target, (iteration_ / batch_size + 1) * batch_size);
             const long long P = std::max(1, pass_iterations);
             std::atomic<long long> next{lo};
+            WorkerErrors errs;
             auto work = [&](int tid) {
                 Scratch sc;
-                for (long long a = next.fetch_add(P); a <= hi; a = next.fetch_add(P)) run_pass(a, std::min(hi, a + P - 1), sc, recs[tid]);
+                for (long long a = next.fetch_add(P); a <= hi && !errs.failed.load(std::memory_order_relaxed); a = next.fetch_add(P))
+                    run_pass(a, std::min(hi, a + P - 1), sc, recs[tid]);
             };
-            if (T == 1) {
-                work(0);
-            } else {
-                std::vector<std::thread> pool;
-                for (int t = 1; t < T; t++) pool.emplace_back(work, t);
-                work(0);
-                for (auto& th : pool) th.join();
-            }
+            run_workers(T, errs, work, [](int) {});
             all.clear();
-            for (auto& r : recs) { all.insert(all.end(), r.begin(), r.end()); r.clear(); }
+            if (!errs.failed.load()) {
+                try {
+                    for (auto& r : recs) { all.insert(all.end(), r.begin(), r.end()); r.clear(); }
+                } catch (...) {
+                    errs.record(current_error_text());
+                }
+            }
+            if (errs.failed.load()) {  // the passes only read the tables and nothing was applied
+                for (auto& r : recs) { r.clear(); r.shrink_to_fit(); }
+                all.clear();
+                all.shrink_to_fit();
+                tables_consistent_ = true;
+                throw std::runtime_error("training failed in the batch of iterations " + std::to_string(lo) + ".." + std::to_string(hi) +
+                                         ": " + errs.message() + ". The tables are those of iteration " + std::to_string(iteration_) +
+                                         " (the batch was not applied): a checkpoint of them resumes exactly");
+            }
             std::sort(all.begin(), all.end(), [](const Rec& x, const Rec& y) {
                 if (x.kind != y.kind) return x.kind < y.kind;
                 if (x.cell != y.cell) return x.cell < y.cell;
@@ -273,6 +296,8 @@ private:
 
     HistTree tree_;
     long long iteration_ = 0;
+    bool tables_consistent_ = true;
+    bool trained_ = false;  // train() was called (tables_consistent)
     std::unordered_map<std::string, int32_t> key_index_;  // key without its bucket -> decision (begin_load)
 
     // "street|position|n_active|b<bucket>|history" without "|b<bucket>"; *bucket = the bucket (-1: not found)
@@ -296,6 +321,10 @@ private:
 
     // what iteration t needs from its deal: weight, button, buckets, showdown strengths
     void prepare_iter(long long t, Iter& it, int* order) {
+        {
+            const long long f = debug_fail_prepare().load(std::memory_order_relaxed);
+            if (f < 0 || (f > 0 && debug_fail_prepare().fetch_sub(1) == 1)) throw std::bad_alloc();
+        }
         const int n = spec.n_players;
         it.t = t;
         it.weight = linear ? (double)(linear_until > 0 && t > linear_until ? linear_until : t) : 1.0;
@@ -424,19 +453,15 @@ private:
     void prepare_batch(long long lo, int k, std::vector<Iter>& out) {
         out.resize((size_t)k);
         std::atomic<int> next{0};
-        auto work = [&]() {
+        WorkerErrors errs;
+        auto work = [&](int) {
             int order[52];
-            for (int i = next.fetch_add(64); i < k; i = next.fetch_add(64))
+            for (int i = next.fetch_add(64); i < k && !errs.failed.load(std::memory_order_relaxed); i = next.fetch_add(64))
                 for (int j = i; j < std::min(k, i + 64); j++) prepare_iter(lo + j, out[(size_t)j], order);
         };
-        if (threads == 1) {
-            work();
-        } else {
-            std::vector<std::thread> pool;
-            for (int t = 1; t < threads; t++) pool.emplace_back(work);
-            work();
-            for (auto& th : pool) th.join();
-        }
+        run_workers(threads, errs, work, [](int) {});
+        if (errs.failed.load()) throw std::runtime_error("preparing the batch of iterations " + std::to_string(lo) + ".." +
+                                                         std::to_string(lo + k - 1) + ": " + errs.message());
     }
 
     // the host prepares batch i + 1 while the device runs batch i (the preparation is a pure function of
@@ -449,7 +474,8 @@ private:
         std::vector<Iter> buf[2];
         long long lo = iteration_ + 1, hi = batch_end(iteration_);
         const auto p0 = clk::now();
-        prepare_batch(lo, (int)(hi - lo + 1), buf[0]);
+        tables_consistent_ = true;
+        prepare_batch(lo, (int)(hi - lo + 1), buf[0]);  // (a failure here: nothing ran, the tables are those of iteration_)
         ms_prepare_total += ms(p0, clk::now());
         for (int w = 0;; w ^= 1) {
             const bool more = hi < target;
@@ -457,26 +483,51 @@ private:
             std::exception_ptr prep_error;
             double prep_ms = 0.0;
             std::thread prep;
-            if (more) prep = std::thread([&, w]() {
+            auto prepare_next = [&, w]() {
                 try {
                     const auto a = clk::now();
                     prepare_batch(nlo, (int)(nhi - nlo + 1), buf[w ^ 1]);
                     prep_ms = ms(a, clk::now());
                 } catch (...) { prep_error = std::current_exception(); }
-            });
+            };
+            bool prep_later = false;  // the thread could not start: prepare after the device's batch instead
+            if (more) {
+                try {
+                    prep = std::thread(prepare_next);
+                } catch (...) {
+                    prep_later = true;
+                }
+            }
             const auto d0 = clk::now();
             try {
                 if (gpu_) gpu_->run_batch(buf[w].data(), (int)(hi - lo + 1), gpu_pass);
                 else emu_run_batch(buf[w].data(), (int)(hi - lo + 1), gpu_pass);
             } catch (...) {
                 if (prep.joinable()) prep.join();
-                throw;
+                tables_consistent_ = false;  // the device's batch failed part way: its tables are not known to be whole
+                const std::string what = current_error_text();
+                throw std::runtime_error("training failed in the device's batch of iterations " + std::to_string(lo) + ".." +
+                                         std::to_string(hi) + ": " + what + ". The tables may hold part of that batch: "
+                                         "do not save them; resume from the last checkpoint on disk");
             }
             ms_device_total += ms(d0, clk::now());
             const auto j0 = clk::now();
             if (prep.joinable()) prep.join();
+            if (prep_later) prepare_next();
             ms_wait_prepare += ms(j0, clk::now());
-            if (prep_error) std::rethrow_exception(prep_error);
+            if (prep_error) {  // the device's batch is complete: the tables are those of its last iteration
+                host_stale_ = true;
+                iteration_ = hi;
+                tables_consistent_ = true;
+                std::string what;
+                try {
+                    std::rethrow_exception(prep_error);
+                } catch (...) {
+                    what = current_error_text();
+                }
+                throw std::runtime_error("training failed: " + what + ". The tables are those of iteration " + std::to_string(iteration_) +
+                                         " (every batch before it complete): a checkpoint of them resumes exactly");
+            }
             ms_prepare_total += prep_ms;
             host_stale_ = true;
             iteration_ = hi;

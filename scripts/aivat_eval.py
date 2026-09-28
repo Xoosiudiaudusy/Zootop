@@ -9,11 +9,22 @@
     # a duplicate duel log of scripts/eval_archetypes.py --log-hands (known player: the hero, a blueprint agent)
     python scripts/aivat_eval.py --duel hands.jsonl --out data/aivat/duel.jsonl ...
 
+    # the hero a depth grid (eval_archetypes --agent grid) at fixed 50bb stacks: the known player's blueprint per hand
+    python scripts/aivat_eval.py --duel hands.jsonl --known hero --blueprints data/stack_grid_pot16_s0.json \
+        --stack-bb 50 --out out/grid50_aivat.jsonl --root-dir out/roots --threads 4 --limit 20000
+
 Results are appended per hand to --out (one JSON line: hand id, deal, position, net, AIVAT value,
 base, term sums, seconds), so an interrupted run resumes where it stopped; the summary is printed
 at the end (and with --summary-only from --out alone).  Bucket tables of the abstraction are built
 once into --tables (river from per-board batches, flop and turn through the warm --cache: the same
 numbers as bucket()); the root table (u at the start of a hand) once into --root-cache.
+
+--blueprints <manifest> (negpluribus/agents/stack_grid.py): the known player (the logged hero) played each hand with
+the blueprint of one grid point, which the log names at the hero's first decision ("blueprint", else "point"; a hand
+without a hero decision: the point the grid's rule gives at the hand's stacks).  One model per blueprint, made when a
+hand first needs it, on the manifest's bucketer and bets; its root table in --root-dir (root_v1_<blueprint>_<S>bb.npz).
+A root table is computed at fixed starting stacks (--stack-bb for both seats), so every hand's logged stacks must be
+those: a duel with carried stacks is refused here (score it raw; docs/stack_grid_design.md 6.3).
 """
 from __future__ import annotations
 
@@ -53,8 +64,9 @@ def read_complete_lines(path: str):
             yield json.loads(ln)
 
 
-def load_hands(args):
-    """[(AivatHand, extra)] in log order; extra: position, deal, card-luck inputs."""
+def load_hands(args, grid=None):
+    """[(AivatHand, extra)] in log order; extra: position, deal, card-luck inputs; with a depth ``grid`` (--blueprints)
+    also the point and the blueprint of the known player in that hand."""
     out, skipped = [], {}
     if args.slumbot:
         for rec in read_complete_lines(args.slumbot):
@@ -75,14 +87,23 @@ def load_hands(args):
                 raise RuntimeError(f"hand {rec['hand']}: replayed net {h.net} != winnings {rec['winnings']}")
             out.append((h, {"position": rec.get("position"), "slumbot": rec}))
     else:
+        stack = args.stack_bb * 100
         for i, rec in enumerate(read_complete_lines(args.duel)):
             if len(rec["holes"]) != 2:
                 raise ValueError("heads-up hands only")
-            h = hand_from_duel(rec, stack=args.stack_bb * 100, hand_id=i, known=args.known)
+            h = hand_from_duel(rec, stack=stack, hand_id=i, known=args.known)
+            if h.stacks != (stack, stack):  # the root table is for these stacks (and the old lines had no others)
+                raise SystemExit(f"hand {i} (deal {rec['deal']}): starting stacks {list(h.stacks)} are not the root "
+                                 f"table's [{stack}, {stack}] (--stack-bb {args.stack_bb}); AIVAT here is at fixed stacks "
+                                 f"only: score a duel with carried stacks raw")
             luck = rec.get("luck_bb")
-            out.append((h, {"position": "SB" if h.known_seat == h.button else "BB", "deal": int(rec["deal"]),
-                            "luck_bb": None if luck is None else (luck if args.known == "hero" else -luck),
-                            "opponent": rec.get("opponent")}))
+            extra = {"position": "SB" if h.known_seat == h.button else "BB", "deal": int(rec["deal"]),
+                     "luck_bb": None if luck is None else (luck if args.known == "hero" else -luck),
+                     "opponent": rec.get("opponent")}
+            if grid is not None:
+                p = grid.point_for_hand(rec, args.stack_bb)
+                extra.update(point=p.stack_bb, blueprint=p.blueprint)
+            out.append((h, extra))
     return out, skipped
 
 
@@ -170,6 +191,12 @@ def main() -> int:
     ap.add_argument("--cache", default=None, help="saved bucket cache (scripts/precompute_buckets.py): fast flop/turn tables")
     ap.add_argument("--tables", default=os.path.join(DATA, "bucket_tables"), help="bucket table directory")
     ap.add_argument("--root-cache", default=None, help="root table .npz (default: next to --out)")
+    ap.add_argument("--blueprints", default=None,
+                    help="--duel of a depth-grid hero (eval_archetypes --agent grid): the grid's manifest; the known player's "
+                         "blueprint per hand from the log (see the module doc); --blueprint, --buckets and the bet flags are "
+                         "then the manifest's")
+    ap.add_argument("--root-dir", default=None,
+                    help="--blueprints: directory of the root tables, one per blueprint at --stack-bb (default: next to --out)")
     ap.add_argument("--known", choices=("hero", "villain"), default="hero",
                     help="--duel: whose strategy is known (the blueprint agent): the logged hero, or the other seat "
                          "(a duel search vs blueprint: the numbers are then the blueprint's, minus the hero's result)")
@@ -184,9 +211,21 @@ def main() -> int:
     ap.add_argument("--summary-only", action="store_true")
     ap.add_argument("--first", type=int, default=0, help="also summarize the first N hands (a comparison with an earlier count)")
     args = ap.parse_args()
+    grid = None
+    if args.blueprints:
+        from negpluribus.agents.stack_grid import StackGrid
+
+        if not args.duel or args.known != "hero":
+            ap.error("--blueprints: a --duel log with --known hero (the log names the hero's grid points)")
+        grid = StackGrid.load(args.blueprints)
+        args.buckets = grid.resolve(grid.bucketer)
+        args.preflop_fracs = ",".join(str(x) for x in grid.preflop_fracs)
+        args.postflop_fracs = ",".join(str(x) for x in grid.postflop_fracs)
+        args.max_raises = grid.max_raises
+        print(grid.describe(), flush=True)
 
     t0 = time.time()
-    entries, skipped = load_hands(args)
+    entries, skipped = load_hands(args, grid)
     if args.limit:
         entries = entries[: args.limit]
     print(f"{len(entries):,} hands to score ({time.time() - t0:.0f}s); skipped: {skipped or 'none'}", flush=True)
@@ -220,22 +259,49 @@ def main() -> int:
             tables.save(tpath)
             print(f"bucket tables built in {time.time() - t:.0f}s ({info}): {tpath}", flush=True)
         tb = core.TabulatedBucketer(cbk, tables)
-        bp = load_blueprint(args.blueprint, backend="cpp", n_players=2)
-        game = make_game(spec, tb, bp)
-        rc = args.root_cache or os.path.splitext(args.out)[0] + f".root_k{V1['root_rollouts']}_s{V1['seed']}.npz"
-        t = time.time()
-        rt = root_table(game, V1["root_rollouts"], seed=V1["seed"], threads=args.threads, cache_path=rc,
-                        identity={"blueprint": os.path.basename(args.blueprint), "buckets": os.path.basename(args.buckets),
-                                  "grid": [args.preflop_fracs, args.postflop_fracs, args.max_raises, args.stack_bb]})
-        print(f"root table: {rt.n_classes:,} classes, means {rt.mean[0]:+.2f} / {rt.mean[1]:+.2f} chips (SB / BB), {time.time() - t:.0f}s", flush=True)
-        ev = FastAivat(game, V1["rollouts"], V1["eq_samples"], V1["seed"], rt)
+        models = {}  # blueprint (the manifest's path; None: --blueprint) -> FastAivat on it
+
+        def model(key):
+            """The known player's model on one blueprint (built when a hand first needs it): its game and root table."""
+            ev = models.get(key)
+            if ev is not None:
+                return ev
+            if key is None:
+                bp = load_blueprint(args.blueprint, backend="cpp", n_players=2)
+                rc = args.root_cache or os.path.splitext(args.out)[0] + f".root_k{V1['root_rollouts']}_s{V1['seed']}.npz"
+                name = os.path.basename(args.blueprint)
+            else:
+                point = grid.find(key)
+                bp = load_blueprint(grid.resolve(key), backend="cpp", n_players=2)
+                grid.check_blueprint(point, bp, cbk.identity)
+                name = os.path.basename(key)
+                stem = os.path.splitext(name)[0]
+                stem = stem[len("blueprint_"):] if stem.startswith("blueprint_") else stem
+                root_dir = args.root_dir or os.path.dirname(os.path.abspath(args.out))
+                rc = os.path.join(root_dir, f"root_v1_{stem}_{args.stack_bb}bb.npz")
+            game = make_game(spec, tb, bp)
+            t = time.time()
+            rt = root_table(game, V1["root_rollouts"], seed=V1["seed"], threads=args.threads, cache_path=rc,
+                            identity={"blueprint": name, "buckets": os.path.basename(args.buckets),
+                                      "grid": [args.preflop_fracs, args.postflop_fracs, args.max_raises, args.stack_bb]})
+            print(f"root table{'' if key is None else ' of ' + name}: {rt.n_classes:,} classes, means {rt.mean[0]:+.2f} / "
+                  f"{rt.mean[1]:+.2f} chips (SB / BB), {time.time() - t:.0f}s ({rc})", flush=True)
+            ev = models[key] = FastAivat(game, V1["rollouts"], V1["eq_samples"], V1["seed"], rt)
+            return ev
+
         os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
         t_start = time.time()
         n_done = 0
         with open(args.out, "a", encoding="utf-8") as f:
             for i in range(0, len(todo), args.chunk):
                 part = todo[i: i + args.chunk]
-                res = ev.evaluate_many([h for h, _ in part], args.threads)
+                by_model = {}
+                for j, (_, e) in enumerate(part):
+                    by_model.setdefault(e.get("blueprint"), []).append(j)
+                res = [None] * len(part)
+                for key, idx in by_model.items():
+                    for j, r in zip(idx, model(key).evaluate_many([part[j][0] for j in idx], args.threads)):
+                        res[j] = r
                 for (h, e), r in zip(part, res):
                     if r["trace"]:
                         raise RuntimeError(f"hand {h.hand_id}: {r['trace'][0][0]}")
@@ -248,6 +314,8 @@ def main() -> int:
                            "terms": terms, "seconds": r["seconds"], "rollouts": r["rollouts"]}
                     if "deal" in e:
                         row["deal"] = e["deal"]
+                    if "point" in e:
+                        row["point"], row["blueprint"] = e["point"], e["blueprint"]
                     f.write(json.dumps(row) + "\n")
                     done[h.hand_id] = row
                 f.flush()
@@ -284,6 +352,14 @@ def main() -> int:
     for pos, rs in sorted(by_pos.items()):
         s1, s2 = stats([r["net"] / 100 for r in rs]), stats([r["value"] / 100 for r in rs])
         print(f"  as {pos}: {len(rs):,} hands, raw {s1['bb100']:+.1f} +/- {s1['ci95']:.1f}, AIVAT {s2['bb100']:+.1f} +/- {s2['ci95']:.1f}")
+    if grid is not None:  # per grid point (hands, not deals: the two hands of a deal may sit at different points)
+        by_point = {}
+        for r in rows:
+            by_point.setdefault(r.get("point"), []).append(r)
+        for p, rs in sorted(by_point.items(), key=lambda x: (x[0] is None, x[0] or 0)):
+            s1, s2 = stats([r["net"] / 100 for r in rs]), stats([r["value"] / 100 for r in rs])
+            print(f"  at the {p}bb point: {len(rs):,} hands, raw {s1['bb100']:+.1f} +/- {s1['ci95']:.1f}, "
+                  f"AIVAT {s2['bb100']:+.1f} +/- {s2['ci95']:.1f}")
     return 0
 
 

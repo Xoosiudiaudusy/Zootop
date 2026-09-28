@@ -11,8 +11,9 @@
 //            this round is INSERTED as one more valid action at the node where it was taken
 //   fixed    our own actions already taken in this round are forced for our actual hole only;
 //            our other holes and every opponent stay free
-//   cards    lossless on the current round (infoset = canonical form of hole + board), the
-//            blueprint's buckets on later rounds
+//   cards    lossless on the current round (infoset = canonical form of hole + board); later
+//            rounds on the subgame's own abstraction (SearchGame::search_bucketer: the blueprint's
+//            buckets unless another bucketer is given, e.g. finer ones, as Pluribus' 500 per round)
 //   solver   Linear external-sampling MCCFR on N threads, to the end of the hand (depth limits and
 //            continuation leaves are part 2); returns the final-iteration strategy of our actual
 //            hole at our current decision, its average strategy, and timing; the node table stays
@@ -170,8 +171,9 @@ inline void apply_continuation(const int* kind, int n, int choice, double bias, 
 // from a flop or turn root (Bucketer::river_buckets_all, built at once; base -1 when the abstraction has
 // no batch), and, for a flop root, the turn buckets of every combo per turn card (filled on first use
 // from the bucketer).  They depend only on the bucketer and the board, so SearchGame keeps those of its
-// last boards and every search on one of those boards shares them (a lookup instead of a rebuild: the
-// agent searches a board several times, and every flop search used to rebuild 1,176 river boards).
+// last boards, one set per abstraction (the blueprint's, the subgame's own), and every search on one of
+// those boards shares them (a lookup instead of a rebuild: the agent searches a board several times,
+// and every flop search used to rebuild 1,176 river boards).
 struct SearchBoardTables {
     std::vector<int> board;                       // the root board, in the order given
     std::once_flag river_once;
@@ -187,38 +189,56 @@ struct SearchBoardTables {
 struct SearchGame {
     Spec spec;
     BetGrid grid;
+    // the blueprint's card abstraction: the keys of every blueprint lookup (the ranges at the root,
+    // rollouts from leaves, the blueprint rows of the evaluator) and the preflop classes
     std::shared_ptr<Bucketer> bucketer;
+    // the subgame's own abstraction for the rounds after the root's (its infosets there and their bucket
+    // tables): the blueprint's bucketer itself unless another one is given
+    std::shared_ptr<Bucketer> search_bucketer;
     std::shared_ptr<const BlueprintTable> blueprint;  // null: no prior (uniform ranges)
     // optional (Pluribus' compression of the continuations): per blueprint record and continuation,
     // the index among the record's actions of one action drawn in advance; empty: off
     std::vector<uint8_t> presampled;
 
-    // the bucket tables of the last boards searched (SearchBoardTables); tables_keep boards are kept
+    // the subgame has an abstraction of its own after the root's round
+    bool separate_buckets() const { return search_bucketer.get() != bucketer.get(); }
+
+    // the bucket tables of the last boards searched (SearchBoardTables), one set per abstraction:
+    // `search` asks for the subgame's own, which is the blueprint's set when both are one bucketer;
+    // tables_keep boards are kept in each
     size_t tables_keep = 8;
-    std::shared_ptr<SearchBoardTables> board_tables(const std::vector<int>& board) const {
+    std::shared_ptr<SearchBoardTables> board_tables(const std::vector<int>& board, bool search = false) const {
         std::lock_guard<std::mutex> lk(tables_mu_);
-        for (size_t i = 0; i < tables_.size(); i++)
-            if (tables_[i]->board == board) {
-                std::shared_ptr<SearchBoardTables> t = tables_[i];
-                tables_.erase(tables_.begin() + (long)i);
-                tables_.push_back(t);  // most recent last
+        std::vector<std::shared_ptr<SearchBoardTables>>& tables = search && separate_buckets() ? search_tables_ : tables_;
+        for (size_t i = 0; i < tables.size(); i++)
+            if (tables[i]->board == board) {
+                std::shared_ptr<SearchBoardTables> t = tables[i];
+                tables.erase(tables.begin() + (long)i);
+                tables.push_back(t);  // most recent last
                 return t;
             }
         std::shared_ptr<SearchBoardTables> t = std::make_shared<SearchBoardTables>();
         t->board = board;
-        tables_.push_back(t);
-        while (tables_.size() > std::max<size_t>(1, tables_keep)) tables_.erase(tables_.begin());
+        tables.push_back(t);
+        while (tables.size() > std::max<size_t>(1, tables_keep)) tables.erase(tables.begin());
         return t;
     }
     void clear_board_tables() const {
         std::lock_guard<std::mutex> lk(tables_mu_);
         tables_.clear();
+        search_tables_.clear();
     }
 
-    SearchGame(const Spec& s, std::shared_ptr<Bucketer> bk, std::shared_ptr<const BlueprintTable> bp)
+    SearchGame(const Spec& s, std::shared_ptr<Bucketer> bk, std::shared_ptr<const BlueprintTable> bp,
+               std::shared_ptr<Bucketer> search_bk = nullptr)
         : spec(s), grid(s.grid()), bucketer(std::move(bk)), blueprint(std::move(bp)) {
         if (!bucketer) throw std::invalid_argument("a bucketer is needed");
+        search_bucketer = search_bk ? std::move(search_bk) : bucketer;
         if (spec.max_street > PREFLOP && !bucketer->fitted()) throw std::invalid_argument("this spec bets postflop: pass a fitted bucketer");
+        if (separate_buckets()) {
+            if (spec.max_street > PREFLOP && !search_bucketer->fitted()) throw std::invalid_argument("the search bucketer is not fitted");
+            if (search_bucketer->identity().n_buckets > 255) throw std::invalid_argument("the search's bucket tables hold at most 255 buckets");
+        }
         if (blueprint && blueprint->codec.n_players() != spec.n_players)
             throw std::invalid_argument("the blueprint's numeric keys are for " + std::to_string(blueprint->codec.n_players()) +
                                         " players, the game has " + std::to_string(spec.n_players));
@@ -264,7 +284,8 @@ struct SearchGame {
 
 private:
     mutable std::mutex tables_mu_;
-    mutable std::vector<std::shared_ptr<SearchBoardTables>> tables_;
+    mutable std::vector<std::shared_ptr<SearchBoardTables>> tables_;         // the blueprint's abstraction
+    mutable std::vector<std::shared_ptr<SearchBoardTables>> search_tables_;  // the subgame's own (separate_buckets())
 };
 
 struct LikelihoodOverride {  // replaces sigma = blueprint for one seat's actions on one street
@@ -295,6 +316,32 @@ struct SearchParams {
     double bias = 5.0;         // the continuations' factor (Pluribus: 5)
     int debug_leaves = 0;      // tests: log this many leaf choices made inside the solver
     bool legacy_traverse = false;  // tests: traverse with the engine at every node instead of the public tree (same numbers)
+    // vector Linear CFR (Pluribus's search for small subgames): every iteration walks the public tree
+    // with the reach of all 1326 holes of both players (card removal), one river card sampled per
+    // iteration on a turn root; the same infosets (class on the root's round, the subgame's bucket on the
+    // river: SearchGame::search_bucketer, the blueprint's unless another is given),
+    // table, outputs and exploitability as the MCCFR.  Only 2 live players, a turn or river root, no
+    // leaves, no frozen round; anywhere else the MCCFR runs.  Off by default (the MCCFR, bit for bit).
+    bool vector_cfr = false;
+    // vector CFR on a turn root: river infosets without the subgame's buckets, a hole's class on a river board
+    // being its hand strength there (equal strength, one class); rows per river card, kept as floats in the
+    // public tree (never in the search's table).  Off: the vector CFR's numbers unchanged.
+    bool river_exact = false;
+    // vector CFR on a turn root, river_exact off: > 0, the river's infosets by K buckets of hand strength on the
+    // river board (the bucket of a hole = the quantile of its strength among the board's holes, equal strengths
+    // together), shared by all river cards as the subgame's buckets are (Pluribus: 500 per round); 0: the
+    // subgame's buckets (search_bucketer, the blueprint's unless another is given; the vector CFR's numbers unchanged)
+    int river_buckets = 0;
+    // vector CFR's regret / average weighting: 0 Linear CFR (Pluribus; the numbers unchanged), 1 CFR+ (regrets
+    // floored at 0, linear average), 2 DCFR(1.5, 0, 2) (Brown & Sandholm 2019: positive regrets x t^1.5/(t^1.5+1),
+    // negative x 1/2 after each iteration, the average weighted by t^2); the MCCFR is always Linear
+    int vector_discount = 0;
+    // river_exact with river_buckets K > 0: warm start (Brown & Sandholm 2016, from the solution of a coarser
+    // abstraction).  The first `river_warm` share of the budget (time, or iterations if given) learns the river by
+    // the K shared strength buckets; then every exact river row starts from its bucket row's average strategy, its
+    // regrets and strategy sums set as if that strategy had been played the T_w iterations so far (Linear weights
+    // 1..T_w), and learns exactly from there.  0: off
+    double river_warm = 0.0;
 };
 
 struct LeafInfo {  // tests: one leaf of the public tree
@@ -368,6 +415,7 @@ public:
             for (size_t i = 0; i < grid_to_bp_.size(); i++)
                 grid_to_bp_[i] = game_->blueprint->name_index(game_->grid.names[i].data(), game_->grid.names[i].size());
         bt_ = game_->board_tables(hand_.board);
+        sbt_ = game_->board_tables(hand_.board, true);  // bt_ itself when the subgame uses the blueprint's abstraction
         build_river_table();
         init_turn_table();
     }
@@ -388,7 +436,10 @@ public:
     int n_classes() const { return n_classes_; }
     double range_seconds() const { return range_seconds_; }
     double river_table_seconds() const { return river_seconds_; }
-    int river_table_boards() const { return (int)(bt_->river_b.size() / N_COMBOS); }
+    // boards in the river bucket table of the subgame's own abstraction (0: none, e.g. a bucketer that answers
+    // from precomputed bucket tables, which the search then reads directly) and of the blueprint's
+    int river_table_boards() const { return (int)(sbt_->river_b.size() / N_COMBOS); }
+    int blueprint_river_table_boards() const { return (int)(bt_->river_b.size() / N_COMBOS); }
     int limit_street() const { return limit_street_; }
     int raise_limit() const { return raise_limit_; }
     NodeActions actions_at(const HandState& st, int k) const {
@@ -500,6 +551,11 @@ public:
         PathHash our_ph;
         for (const PathStep& s : path_) our_ph.step(s.index);
         const NodeKey our_key = search_key(root_street_, hand_.our_seat, class_of_[our_combo_], our_ph);
+        const bool use_vector = vector_eligible();
+        vexact_ = false;
+        vriver_k_ = 0;
+        vriver_nodes_.clear();
+        if (use_vector) prepare_vector();
         group_->begin(T);
         std::mutex err_mu;
         std::string err;
@@ -509,6 +565,9 @@ public:
             ctx.rng.reseed(params_.seed * 0x9E3779B97F4A7C15ULL + (uint64_t)tid * 0xD1B54A32D192ED03ULL + 1);
             std::memcpy(ctx.deck, deck_, sizeof deck_);
             try {
+                if (use_vector) {
+                    vector_loop(ctx, next_t, stop, deadline, our_key, our_na.n);
+                } else
                 while (!stop.load(std::memory_order_relaxed)) {
                     const long long t = next_t.fetch_add(1);
                     if (params_.iterations > 0 && t > params_.iterations) break;
@@ -556,13 +615,27 @@ public:
         if (T == 1) {
             work(0);
         } else {
+            // no exception may leave while a worker runs (a joinable std::thread destroyed: std::terminate):
+            // a thread that cannot be started stops the solve, its slot leaves the group, the others are joined
             std::vector<std::thread> pool;
-            for (int t = 1; t < T; t++) pool.emplace_back(work, t);
+            try {
+                pool.reserve((size_t)T - 1);
+                for (int t = 1; t < T; t++) pool.emplace_back(work, t);
+            } catch (const std::exception& e) {
+                {
+                    std::lock_guard<std::mutex> lk(err_mu);
+                    if (err.empty()) err = std::string("starting the search threads: ") + e.what();
+                }
+                stop.store(true);
+                for (int t = (int)pool.size() + 1; t < T; t++) group_->leave();
+            }
             work(0);
             for (auto& th : pool) th.join();
         }
         group_->end();
+        if (err.empty() && group_->failed()) err = group_->failure();
         if (!err.empty()) throw std::runtime_error("search failed: " + err);
+        if (use_vector) vector_write_back();
         SearchResult r;
         r.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         r.threads = T;
@@ -612,7 +685,13 @@ public:
             for (const Ctx& c : ctxs)
                 for (int i = 0; i < na.n; i++) ours[i] += c.ours[i];
             for (int i = 0; i < na.n; i++) s += ours[i];
-            if (s > 0.0) {
+            // the vector CFR plays its table's average (the row of our hole's class, with the solve's own weights:
+            // t, or t^2 under DCFR), the strategy the exploitability is measured on.  (It added up the class's
+            // current strategy per iteration before: read after the iteration's update, i.e. sigma(t+1), and
+            // weighted by t under every discount -- 0.02..0.05 off the table under DCFR, 1e-3 under Linear.)
+            if (use_vector) {
+                r.average_strategy = r.table_average;
+            } else if (s > 0.0) {
                 for (int i = 0; i < na.n; i++) r.average_strategy[(size_t)i] = ours[i] / s;
             } else {
                 r.average_strategy = r.table_average;
@@ -731,7 +810,11 @@ public:
         }
         const ComboTable& ct = combo_table();
         ex.boards.assign(53, Board5());
-        const bool need_buckets = kind == 2 || ex.leaf_river || root_street_ < RIVER;
+        // the blueprint's rows (kind 2; the continuations after leaves) are keyed by the blueprint's buckets, the
+        // search's own rows after the root's round (none when it stopped at the river start) by the subgame's
+        const bool need_bp = kind == 2 || ex.leaf_river;
+        const bool need_search = kind < 2 && root_street_ < RIVER && !ex.leaf_river;
+        if (need_bp) ensure_blueprint_river_table();
         auto fill_board = [&](int idx, const int* b, int n) {
             Board5& B = ex.boards[(size_t)idx];
             bool on[52] = {false};
@@ -746,13 +829,15 @@ public:
                 }
                 std::sort(B.order.begin(), B.order.end(), [&](int a, int c2) { return B.strength[(size_t)a] < B.strength[(size_t)c2]; });
             }
-            if (need_buckets) {
-                B.bucket.assign((size_t)N_COMBOS, -1);
-                for (int c = 0; c < N_COMBOS; c++) {
-                    if (on[ct.c0[c]] || on[ct.c1[c]]) continue;
-                    const int hole[2] = {ct.c0[c], ct.c1[c]};
-                    B.bucket[(size_t)c] = later_bucket(hole, b, n);
-                }
+            const bool later = need_search && n > root_.n_board;  // a board of a later round (the root's: its classes)
+            if (need_bp) B.bucket.assign((size_t)N_COMBOS, -1);
+            if (later) B.sbucket.assign((size_t)N_COMBOS, -1);
+            if (!need_bp && !later) return;
+            for (int c = 0; c < N_COMBOS; c++) {
+                if (on[ct.c0[c]] || on[ct.c1[c]]) continue;
+                const int hole[2] = {ct.c0[c], ct.c1[c]};
+                if (need_bp) B.bucket[(size_t)c] = later_bucket(hole, b, n);
+                if (later) B.sbucket[(size_t)c] = search_bucket(hole, b, n);
             }
         };
         int b5[5];
@@ -1036,7 +1121,8 @@ private:
     struct Board5 {                     // one board: hand values and the combos in increasing value (river), buckets
         std::vector<int64_t> strength;
         std::vector<int> order;
-        std::vector<int> bucket;        // per combo, -1 on the board
+        std::vector<int> bucket;        // per combo, the blueprint's bucket (blueprint rows), -1 on the board
+        std::vector<int> sbucket;       // per combo, the subgame's bucket (its own rows after the root's round), -1 on the board
     };
     struct Ex {
         int kind = 0, br_street = RIVER, p = 0, o = 1;
@@ -1052,18 +1138,29 @@ private:
         rows.assign((size_t)N_COMBOS * MAX_ACTIONS, 0.0);
         const bool by_bucket = cont >= 0 || ex.kind == 2;
         const Board5& B = ex.boards[(size_t)(st.n_board == 5 && root_.n_board == 4 ? st.board[4] : 52)];
+        // -1 marks the combos on this board; neither list filled: the root's board, where the classes tell
+        const std::vector<int>& marks = !B.bucket.empty() ? B.bucket : B.sbucket;
         double memo[256][MAX_ACTIONS];
         bool have[256] = {false};
+        // river_exact: this river node's rows of the dealt river card, by strength rank (uniform if never reached)
+        const bool vx = !by_bucket && vexact_ && st.street == RIVER && root_street_ == TURN;
+        const TNode::VRiver* vb = nullptr;
+        const int* vrank = nullptr;
+        if (vx) {
+            const auto it = vriver_nodes_.find(ph.a);
+            const TNode* t = it != vriver_nodes_.end() && it->second->ph.b == ph.b ? it->second : nullptr;
+            vb = t && t->vriv ? t->vriv[(size_t)st.board[4]].load(std::memory_order_acquire) : nullptr;
+            vrank = vboards_[(size_t)st.board[4]].rank.data();
+        }
         for (int x = 0; x < N_COMBOS; x++) {
-            const int bx = B.bucket.empty() ? 0 : B.bucket[(size_t)x];
-            if (B.bucket.empty() ? class_of_[(size_t)x] < 0 : bx < 0) continue;  // on the board
+            if (marks.empty() ? class_of_[(size_t)x] < 0 : marks[(size_t)x] < 0) continue;  // on the board
             double* row = &rows[(size_t)x * MAX_ACTIONS];
             if (path_node && q == hand_.our_seat && x == our_combo_) {  // our actual hole plays the action taken
                 row[path_[(size_t)k].index] = 1.0;
                 continue;
             }
             if (by_bucket) {
-                const int b = bx;
+                const int b = B.bucket.empty() ? 0 : B.bucket[(size_t)x];  // the blueprint's bucket
                 if (b < 0 || b > 255) throw std::runtime_error("ex_rows: bucket out of range");
                 if (!have[b]) {  // the policy depends on the hole only through its bucket
                     rollout_probs(st, hh, b, na, cont >= 0 ? cont : CONT_BP, memo[b]);
@@ -1072,7 +1169,28 @@ private:
                 for (int a = 0; a < na.n; a++) row[a] = memo[b][a];
                 continue;
             }
-            const int card = st.street == root_street_ ? class_of_[(size_t)x] : bx;
+            // (river_warm: a block never made or never updated plays its bucket rows, read below by their keys)
+            if (vx && ((vb && !vb->warm.load()) || vriver_k_ == 0)) {
+                const int k = vrank[x];
+                if (!vb || k < 0 || k >= vb->nc) {
+                    for (int a = 0; a < na.n; a++) row[a] = 1.0 / na.n;
+                    continue;
+                }
+                double w[MAX_ACTIONS];
+                for (int a = 0; a < na.n; a++) w[a] = (double)(ex.kind == 0 ? vb->ss : vb->reg)[(size_t)k * na.n + a];
+                if (ex.kind == 0) {
+                    double s = 0.0;
+                    for (int a = 0; a < na.n; a++) s += w[a];
+                    for (int a = 0; a < na.n; a++) row[a] = s > 0.0 ? w[a] / s : 1.0 / na.n;
+                } else {
+                    v_regret_matching(w, na.n, row);
+                }
+                continue;
+            }
+            if (st.street != root_street_ && B.sbucket.empty()) throw std::runtime_error("ex_rows: no subgame buckets on this board");
+            // later rounds: the subgame's bucket; the river of a turn root with river_buckets K: its K strength buckets
+            const int card = st.street == root_street_ ? class_of_[(size_t)x]
+                             : (vriver_k_ > 0 && st.street == RIVER) ? vboards_[(size_t)st.board[4]].qb[(size_t)x] : B.sbucket[(size_t)x];
             const bool fz = frozen_ != nullptr && st.street == root_street_;  // the round frozen to another search's play
             (fz ? *frozen_ : *this).strategy_row(search_key(st.street, q, card, ph), na.n, fz ? frozen_kind_ : ex.kind, row);
         }
@@ -1318,21 +1436,26 @@ private:
         HistHash hh;
     };
 
-    // the bucket tables of the root's board, shared through the game (SearchBoardTables)
-    std::shared_ptr<SearchBoardTables> bt_;
-    double river_seconds_ = 0.0;  // seconds this search spent building the river table (0: shared)
+    // the bucket tables of the root's board, shared through the game (SearchBoardTables): the blueprint's
+    // (rollouts, the evaluator's blueprint rows) and the subgame's own (its infosets after the root's
+    // round); one object when the subgame uses the blueprint's abstraction
+    std::shared_ptr<SearchBoardTables> bt_, sbt_;
+    double river_seconds_ = 0.0;  // seconds this search spent building river tables (0: shared)
 
     void init_turn_table() {
         if (root_.n_board != 3 || game_->spec.max_street < TURN) return;
-        SearchBoardTables& t = *bt_;
+        init_turn_table_of(*bt_);
+        if (sbt_ != bt_) init_turn_table_of(*sbt_);
+    }
+    static void init_turn_table_of(SearchBoardTables& t) {
         std::call_once(t.turn_init, [&t]() {
             t.turn_b.assign((size_t)52 * N_COMBOS, 255);
             t.turn_once.reset(new std::once_flag[52]);
             t.turn_on = true;
         });
     }
-    int turn_bucket(const int* hole, const int* board4) const {
-        SearchBoardTables& tb = *bt_;
+    // the turn bucket of `hole` in the abstraction of `tb` / `bk` (a flop root's table, filled per turn card on first use)
+    int turn_bucket(SearchBoardTables& tb, Bucketer& bk, const int* hole, const int* board4) const {
         const int t = board4[3];
         std::call_once(tb.turn_once[(size_t)t], [&]() {
             const ComboTable& ct = combo_table();
@@ -1342,7 +1465,7 @@ private:
             for (int c = 0; c < N_COMBOS; c++) {
                 if (on[ct.c0[c]] || on[ct.c1[c]]) continue;
                 const int h[2] = {ct.c0[c], ct.c1[c]};
-                row[c] = (uint8_t)game_->bucketer->bucket(h, board4, 4);
+                row[c] = (uint8_t)bk.bucket(h, board4, 4);
             }
         });
         return tb.turn_b[(size_t)t * N_COMBOS + (size_t)combo_index(hole[0], hole[1])];
@@ -1384,13 +1507,28 @@ private:
 
     void build_river_table() {
         river_seconds_ = 0.0;
-        std::call_once(bt_->river_once, [&]() { build_river_table_once(*bt_); });
+        if (sbt_ == bt_) {  // one abstraction: the subgame's river keys and the rollouts read one table
+            std::call_once(bt_->river_once, [&]() { river_seconds_ = build_river_table_once(*bt_, *game_->bucketer); });
+            return;
+        }
+        // the subgame's own river keys when it searches the river; the blueprint's river buckets when rollouts from
+        // leaves reach the river (the evaluator builds the latter when it needs them: ensure_blueprint_river_table)
+        if (limit_street_ == RIVER)
+            std::call_once(sbt_->river_once, [&]() { river_seconds_ += build_river_table_once(*sbt_, *game_->search_bucketer); });
+        else
+            std::call_once(bt_->river_once, [&]() { river_seconds_ += build_river_table_once(*bt_, *game_->bucketer); });
     }
-    void build_river_table_once(SearchBoardTables& rt) {
+    void ensure_blueprint_river_table() const {
+        if (sbt_ == bt_) return;  // built with the search
+        std::call_once(bt_->river_once, [&]() { build_river_table_once(*bt_, *game_->bucketer); });
+    }
+    // the river buckets of every board the subgame can reach, in the abstraction of `bk`, into `rt`; returns the
+    // seconds spent (0 when the bucketer has no batch: bucket() then answers)
+    double build_river_table_once(SearchBoardTables& rt, const Bucketer& bk) const {
         const auto t0 = std::chrono::steady_clock::now();
         const int base = root_.n_board;
-        if (base != 3 && base != 4) return;
-        if (game_->spec.max_street < RIVER) return;  // no river decisions, in the subgame or in rollouts
+        if (base != 3 && base != 4) return 0.0;
+        if (game_->spec.max_street < RIVER) return 0.0;  // no river decisions, in the subgame or in rollouts
         std::vector<std::pair<int, int>> extras;
         bool on[52] = {false};
         for (int i = 0; i < base; i++) on[root_.board[i]] = true;
@@ -1414,7 +1552,7 @@ private:
                     board5[3] = extras[i].first;
                     board5[4] = extras[i].second;
                 }
-                if (!game_->bucketer->river_buckets_all(board5, combo_table().idx, &b[i * (size_t)N_COMBOS])) unsupported.store(true);
+                if (!bk.river_buckets_all(board5, combo_table().idx, &b[i * (size_t)N_COMBOS])) unsupported.store(true);
             }
         };
         const int T = std::max(1, std::min(params_.threads, 64));
@@ -1422,7 +1560,7 @@ private:
         for (int t = 1; t < T; t++) pool.emplace_back(work);
         work();
         for (auto& th : pool) th.join();
-        if (unsupported.load()) return;
+        if (unsupported.load()) return 0.0;
         rt.river_slot.assign(52 * 52, -1);
         for (size_t i = 0; i < extras.size(); i++) {
             const int key = base == 4 ? extras[i].second : extras[i].first * 52 + extras[i].second;
@@ -1430,13 +1568,12 @@ private:
         }
         rt.river_b = std::move(b);
         rt.river_base = base;
-        river_seconds_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     }
 
-    // bucket of `hole` on a board past the root's street: the river table on the river when it
-    // exists, else the bucketer (and its cache)
-    int later_bucket(const int* hole, const int* board, int n_board) const {
-        const SearchBoardTables& rt = *bt_;
+    // bucket of `hole` on a board past the root's street in the abstraction of `rt` / `bk`: its river table on
+    // the river when it exists, its turn table on the turn of a flop root, else the bucketer (and its cache)
+    int table_bucket(SearchBoardTables& rt, Bucketer& bk, const int* hole, const int* board, int n_board) const {
         if (n_board == 5 && rt.river_base > 0) {
             int key;
             if (rt.river_base == 4) {
@@ -1448,8 +1585,16 @@ private:
             const int32_t i = rt.river_slot[(size_t)key];
             if (i >= 0) return rt.river_b[(size_t)i * N_COMBOS + (size_t)combo_index(hole[0], hole[1])];
         }
-        if (n_board == 4 && rt.turn_on) return turn_bucket(hole, board);
-        return game_->bucketer->bucket(hole, board, n_board);
+        if (n_board == 4 && rt.turn_on) return turn_bucket(rt, bk, hole, board);
+        return bk.bucket(hole, board, n_board);
+    }
+    // the blueprint's bucket (the keys of blueprint lookups: rollouts, the evaluator's blueprint rows)
+    int later_bucket(const int* hole, const int* board, int n_board) const {
+        return table_bucket(*bt_, *game_->bucketer, hole, board, n_board);
+    }
+    // the subgame's own bucket (its infosets after the root's round)
+    int search_bucket(const int* hole, const int* board, int n_board) const {
+        return table_bucket(*sbt_, *game_->search_bucketer, hole, board, n_board);
     }
 
     // the blueprint as the agent plays it at `st` for its actor (bucket `bucket`, blueprint history
@@ -1619,10 +1764,27 @@ public:
         std::lock_guard<std::mutex> lk(log_mu_);
         return leaf_log_;
     }
-    // tests: the bucket the search uses for a hole on a board extending the root's (tables or bucketer)
-    int later_bucket_of(int h0, int h1, const std::vector<int>& board) const {
+    // tests: the bucket the search uses for a hole on a board extending the root's (tables or bucketer): the
+    // subgame's own abstraction (its infosets), or with `blueprint` the blueprint's (rollouts)
+    int later_bucket_of(int h0, int h1, const std::vector<int>& board, bool blueprint) const {
         const int hole[2] = {h0, h1};
-        return later_bucket(hole, board.data(), (int)board.size());
+        return blueprint ? later_bucket(hole, board.data(), (int)board.size()) : search_bucket(hole, board.data(), (int)board.size());
+    }
+    // tests: the subgame's infosets after the root's round in the table, per street (index FLOP..RIVER): the
+    // number of (public node, bucket) keys found among buckets 0..255 at every public node the last solve
+    // created, and the largest bucket among them (-1: none); a solve on the public tree (not legacy, not frozen)
+    std::vector<std::pair<long long, int>> later_infosets() const {
+        if (!table_) throw std::runtime_error("solve first");
+        std::vector<std::pair<long long, int>> out(4, std::make_pair(0LL, -1));
+        for (const std::unique_ptr<TNode>& t : tnodes_) {
+            if (t->terminal || t->leaf || t->street <= root_street_) continue;
+            for (int b = 0; b < 256; b++)
+                if (table_->find(search_key(t->street, t->seat, b, t->ph)).node) {
+                    out[(size_t)t->street].first++;
+                    out[(size_t)t->street].second = std::max(out[(size_t)t->street].second, b);
+                }
+        }
+        return out;
     }
 
 private:
@@ -1998,7 +2160,7 @@ private:
     int card_part(const HandState& st, int seat, Ctx& ctx) const {
         if (st.street == root_street_) return class_of_[(size_t)ctx.combo[seat]];
         int& m = ctx.bucket_memo[seat][st.n_board];
-        if (m < 0) m = later_bucket(st.players[seat].hole, st.board, st.n_board);
+        if (m < 0) m = search_bucket(st.players[seat].hole, st.board, st.n_board);
         return m;
     }
 
@@ -2108,6 +2270,22 @@ private:
         std::unique_ptr<std::atomic<TNode*>[]> child;
         std::unique_ptr<std::atomic<Node*>[]> cache;
         int n_cache = 0;
+        // vector CFR: regrets, strategy sums and visits of every card part, [cp * na + a] (allocated on first use)
+        std::vector<double> vreg, vss;
+        std::vector<int64_t> vvis;
+        std::vector<int32_t> vlast;  // DCFR: the iteration of the row's last update (its discounts are applied lazily)
+        SpinLock vlock;
+        std::once_flag vonce;
+        // river_exact, a river node of a turn root: the rows of each river card, [class * na + a], made on first use
+        struct VRiver {
+            int nc = 0;
+            std::vector<float> reg, ss;
+            std::vector<int32_t> vis, last;
+            std::atomic<bool> warm{false};  // warm start pending: sigma from the bucket rows until the first update
+        };
+        std::unique_ptr<std::atomic<VRiver*>[]> vriv;  // [river card]
+        std::vector<std::unique_ptr<VRiver>> vriv_own;
+        std::once_flag vriv_once;
     };
     std::vector<std::unique_ptr<TNode>> tnodes_;
     std::mutex tree_mu_;
@@ -2189,7 +2367,7 @@ private:
         return c;
     }
 
-    int tree_buckets_ = 1;  // card parts cached per node past the root's street: the bucketer's bucket count
+    int tree_buckets_ = 1;  // card parts cached per node past the root's street: the subgame bucketer's bucket count
 
     // the card-independent part of HandState::finish at terminal t (see TNode)
     void prepare_terminal(TNode& t) const {
@@ -2227,7 +2405,7 @@ private:
     }
 
     void build_troot() {
-        tree_buckets_ = std::max(1, game_->bucketer->identity().n_buckets);
+        tree_buckets_ = std::max(1, game_->search_bucketer->identity().n_buckets);
         tnodes_.clear();
         HandState st(root_);
         troot_ = make_tnode(nullptr, 0, st, PathHash(), 0, true);
@@ -2274,7 +2452,7 @@ private:
     int tree_card_part(const TNode* t, int seat, Ctx& ctx) const {
         if (t->street == root_street_) return class_of_[(size_t)ctx.combo[seat]];
         int& m = ctx.bucket_memo[seat][t->n_board];
-        if (m < 0) m = later_bucket(ctx.holes[seat], ctx.board5, t->n_board);
+        if (m < 0) m = search_bucket(ctx.holes[seat], ctx.board5, t->n_board);
         return m;
     }
 
@@ -2332,6 +2510,686 @@ private:
         }
         const int a = sample(sigma, na.n, ctx.rng);
         return traverse_tree(tchild(t, a), traverser, weight, w_imp, focused, ctx);
+    }
+
+    // ---- vector Linear CFR (SearchParams::vector_cfr)
+    struct VBoard {                      // one river board: strengths, combos in increasing strength, buckets
+        std::vector<int64_t> strength;
+        std::vector<int> order;
+        std::vector<int> bucket;         // turn root: the subgame's river bucket (search_bucket); -1: the combo holds a board card
+        std::vector<int> rank;           // river_exact: the combo's class, the index of its strength among the board's (-1: on the board)
+        int n_rank = 0;                  // distinct strengths
+        std::vector<int> qb;             // river_buckets K: the combo's strength bucket 0..K-1 (-1: on the board)
+        std::vector<int> rank_qb;        // river_warm: exact class -> its strength bucket
+    };
+    int vriver_k_ = 0;                   // river_buckets on this turn root (0: off)
+    bool vwarm_ = false;                 // river_warm: bucket phase, then exact rows warm-started
+    std::atomic<bool> vswitched_{false}; // river_warm: the exact phase has begun
+    std::atomic<long long> vwarm_t_{0};  // river_warm: iterations of the bucket phase (T_w)
+    std::vector<VBoard> vboards_;        // [river card] on a turn root, [52] on a river root
+    bool vexact_ = false;                // river_exact on this turn root
+    std::unordered_map<uint64_t, TNode*> vriver_nodes_;  // river_exact, after the solve: river decision nodes by path hash (a)
+    std::vector<int> vriver_;            // the river cards a turn root samples from
+    int vseat_[2] = {0, 1};              // the two live seats
+    TNode* vour_ = nullptr;              // our decision's node in the public tree
+
+  public:
+    // river_exact, after a solve on a turn root: per river card (52 entries, 0 for board cards) the number of
+    // classes (distinct strengths), and the class of a combo on a river card (-1: holds a board card)
+    std::vector<int> river_classes() const {
+        std::vector<int> out(52, 0);
+        if (!vexact_) return out;
+        for (int r : vriver_) out[(size_t)r] = vboards_[(size_t)r].n_rank;
+        return out;
+    }
+    int river_class(int r, int combo) const {
+        if (!vexact_ || r < 0 || r >= 52 || combo < 0 || combo >= N_COMBOS || vboards_[(size_t)r].rank.empty()) return -1;
+        return vboards_[(size_t)r].rank[(size_t)combo];
+    }
+    // river_exact: bytes of the river rows made in the last solve (floats and visit counters)
+    size_t river_bytes() const {
+        size_t b = 0;
+        for (const auto& up : tnodes_)
+            for (const auto& v : up->vriv_own) b += v->reg.capacity() * sizeof(float) * 2 + v->vis.capacity() * sizeof(int32_t);
+        return b;
+    }
+    // the budget of the next solve() (e.g. vector-CFR iterations once vector_eligible() is known)
+    void set_budget(long long iterations, double time_budget) {
+        params_.iterations = iterations;
+        params_.time_budget = time_budget;
+    }
+    bool vector_eligible() const {
+        if (!params_.vector_cfr || frozen_ || params_.legacy_traverse) return false;
+        if (root_street_ < TURN || limit_street_ < RIVER || raise_limit_ > 0) return false;
+        int live = 0;
+        for (int s = 0; s < root_.n; s++) if (!root_.players[s].folded) live++;
+        return live == 2;
+    }
+
+  private:
+    void prepare_vector() {
+        if (params_.vector_discount < 0 || params_.vector_discount > 2) throw std::invalid_argument("vector_discount: 0 (Linear), 1 (CFR+), 2 (DCFR)");
+        if (params_.vector_discount != 0 && !params_.linear) throw std::invalid_argument("vector_discount needs linear=True (the iteration count)");
+        if (params_.river_warm > 0.0 && params_.vector_discount != 0) throw std::invalid_argument("river_warm: with Linear CFR only");
+        vour_ = troot_;
+        for (const PathStep& ps : path_) vour_ = tchild(vour_, ps.index);
+        int k = 0;
+        for (int s = 0; s < root_.n; s++) if (!root_.players[s].folded && k < 2) vseat_[k++] = s;
+        const ComboTable& ct = combo_table();
+        vboards_.assign(53, VBoard());
+        vriver_.clear();
+        auto fill = [&](int idx, const int* b) {
+            VBoard& B = vboards_[(size_t)idx];
+            bool on[52] = {false};
+            for (int i = 0; i < 5; i++) on[b[i]] = true;
+            B.strength.assign((size_t)N_COMBOS, 0);
+            B.bucket.assign((size_t)N_COMBOS, -1);
+            for (int c = 0; c < N_COMBOS; c++) {
+                if (on[ct.c0[c]] || on[ct.c1[c]]) continue;
+                int cards[7] = {ct.c0[c], ct.c1[c], b[0], b[1], b[2], b[3], b[4]};
+                B.strength[(size_t)c] = evaluate(cards, 7);
+                B.order.push_back(c);
+                const int hole[2] = {ct.c0[c], ct.c1[c]};
+                // the subgame's own river bucket, as the MCCFR's card parts (tree_card_part) and the evaluator's
+                // own rows (Board5::sbucket) key the river; the blueprint's (later_bucket) only with the same bucketer
+                if (root_.n_board == 4) B.bucket[(size_t)c] = search_bucket(hole, b, 5);
+            }
+            std::sort(B.order.begin(), B.order.end(), [&](int a, int c2) { return B.strength[(size_t)a] < B.strength[(size_t)c2]; });
+            if (vexact_) {
+                B.rank.assign((size_t)N_COMBOS, -1);
+                int k = -1;
+                for (size_t i = 0; i < B.order.size(); i++) {
+                    if (i == 0 || B.strength[(size_t)B.order[i]] != B.strength[(size_t)B.order[i - 1]]) k++;
+                    B.rank[(size_t)B.order[i]] = k;
+                }
+                B.n_rank = k + 1;
+            }
+            if (vriver_k_ > 0) {  // quantile of the strength among the board's holes: a tie group at its middle position
+                const size_t m = B.order.size();
+                B.qb.assign((size_t)N_COMBOS, -1);
+                size_t i = 0;
+                while (i < m) {
+                    size_t j = i;
+                    while (j < m && B.strength[(size_t)B.order[j]] == B.strength[(size_t)B.order[i]]) j++;
+                    const double mid = 0.5 * (double)(i + j - 1);
+                    const int q = std::min(vriver_k_ - 1, (int)((double)vriver_k_ * mid / (double)m));
+                    for (size_t x = i; x < j; x++) B.qb[(size_t)B.order[x]] = q;
+                    i = j;
+                }
+                if (vexact_) {
+                    B.rank_qb.assign((size_t)B.n_rank, 0);
+                    for (int c : B.order) B.rank_qb[(size_t)B.rank[(size_t)c]] = B.qb[(size_t)c];
+                }
+            }
+        };
+        vexact_ = params_.river_exact && root_.n_board == 4;
+        vwarm_ = vexact_ && params_.river_warm > 0.0 && params_.river_buckets > 0;
+        if (vexact_ && params_.river_warm > 0.0 && params_.river_buckets <= 0)
+            throw std::invalid_argument("river_warm needs river_buckets > 0 (the coarser abstraction it starts from)");
+        vswitched_.store(false);
+        vwarm_t_.store(0);
+        vriver_k_ = (!vexact_ || vwarm_) && root_.n_board == 4 && params_.river_buckets > 0 ? params_.river_buckets : 0;
+        int b5[5];
+        for (int i = 0; i < root_.n_board; i++) b5[i] = root_.board[i];
+        if (root_.n_board == 5) {
+            fill(52, b5);
+        } else {
+            bool on[52] = {false};
+            for (int i = 0; i < 4; i++) on[root_.board[i]] = true;
+            for (int r = 0; r < 52; r++) {
+                if (on[r]) continue;
+                b5[4] = r;
+                fill(r, b5);
+                vriver_.push_back(r);
+            }
+        }
+    }
+
+    // p's net in bb at showdown terminal t against o: cmp > 0 p's hand is better, 0 a tie, < 0 worse
+    double v_showdown_net(const TNode* t, int p, int o, int cmp) const {
+        int won = 0;
+        for (int li = 0; li < t->n_levels; li++) {
+            const int n_el = t->n_el[li];
+            const int8_t* el = t->el[li];
+            if (n_el == 1) {
+                if (el[0] == p) won += t->portion[li];
+                continue;
+            }
+            // the eligible seats are p and o (the others folded); winners in the prepared (odd chip) order
+            int n_ws = 0, mine = -1;
+            for (int j = 0; j < n_el; j++) {
+                const int s = el[j];
+                const bool wins = s == p ? cmp >= 0 : cmp <= 0;
+                if (!wins) continue;
+                if (s == p) mine = n_ws;
+                n_ws++;
+            }
+            if (mine >= 0) won += t->portion[li] / n_ws + (mine < t->portion[li] % n_ws ? 1 : 0);
+        }
+        return (double)(won - t->invested[p]) / (double)game_->spec.bb;
+    }
+
+    // p's counterfactual values at terminal t (o's reach ro; river board index bidx)
+    void v_terminal(const TNode* t, int p, int o, const double* ro, int bidx, double* v) const {
+        const ComboTable& ct = combo_table();
+        if (t->n_act <= 1) {  // a fold: the same net for every disjoint pair
+            const double net = t->fixed_value[p];
+            double total = 0.0, card[52] = {0.0};
+            for (int d = 0; d < N_COMBOS; d++) {
+                const double w = ro[d];
+                if (w == 0.0) continue;
+                total += w;
+                card[ct.c0[d]] += w;
+                card[ct.c1[d]] += w;
+            }
+            for (int c = 0; c < N_COMBOS; c++) v[c] = net * (total - card[ct.c0[c]] - card[ct.c1[c]] + ro[c]);
+            return;
+        }
+        const VBoard& B = vboards_[(size_t)bidx];
+        const double nw = v_showdown_net(t, p, o, 1), nt = v_showdown_net(t, p, o, 0), nl = v_showdown_net(t, p, o, -1);
+        for (int c = 0; c < N_COMBOS; c++) v[c] = 0.0;
+        double total = 0.0, card[52] = {0.0}, gcard[52] = {0.0};
+        size_t i = 0;
+        const size_t m = B.order.size();
+        // wins and ties by prefix sums over the combos in increasing strength, card removal by per-card sums
+        static thread_local std::vector<double> win, tie;
+        win.assign((size_t)N_COMBOS, 0.0);
+        tie.assign((size_t)N_COMBOS, 0.0);
+        while (i < m) {
+            size_t j = i;
+            const int64_t sv = B.strength[(size_t)B.order[i]];
+            double gt = 0.0;
+            while (j < m && B.strength[(size_t)B.order[j]] == sv) {
+                const int d = B.order[j];
+                gt += ro[d];
+                gcard[ct.c0[d]] += ro[d];
+                gcard[ct.c1[d]] += ro[d];
+                j++;
+            }
+            for (size_t q = i; q < j; q++) {
+                const int c = B.order[q];
+                win[(size_t)c] = total - card[ct.c0[c]] - card[ct.c1[c]];
+                tie[(size_t)c] = gt - gcard[ct.c0[c]] - gcard[ct.c1[c]] + ro[c];
+            }
+            for (size_t q = i; q < j; q++) {
+                const int d = B.order[q];
+                card[ct.c0[d]] += ro[d];
+                card[ct.c1[d]] += ro[d];
+                gcard[ct.c0[d]] = 0.0;
+                gcard[ct.c1[d]] = 0.0;
+            }
+            total += gt;
+            i = j;
+        }
+        for (size_t q = 0; q < m; q++) {
+            const int c = B.order[q];
+            const double all = total - card[ct.c0[c]] - card[ct.c1[c]] + ro[c];
+            const double lose = all - win[(size_t)c] - tie[(size_t)c];
+            v[c] = nw * win[(size_t)c] + nt * tie[(size_t)c] + nl * lose;
+        }
+    }
+
+    struct VCtx {  // scratch of one thread, reused by depth: vectors of 1326, card-part rows
+        std::vector<std::vector<double>> buf;
+        size_t top = 0;
+        std::vector<std::vector<double>> rows;   // per depth: sigma / regret / sum rows of the card parts
+        std::vector<std::vector<int>> ints;      // per depth: counts of the card parts' combos
+        int depth = 0;
+        double* get() {
+            if (top == buf.size()) buf.emplace_back((size_t)N_COMBOS, 0.0);
+            return buf[top++].data();
+        }
+        void release(size_t n) { top -= n; }
+    };
+
+    static void v_regret_matching(const double* reg, int na, double* out) {
+        double sum = 0.0;
+        for (int a = 0; a < na; a++) sum += reg[a] > 0.0 ? reg[a] : 0.0;
+        if (sum <= 0.0) {
+            for (int a = 0; a < na; a++) out[a] = 1.0 / na;
+            return;
+        }
+        for (int a = 0; a < na; a++) out[a] = reg[a] > 0.0 ? reg[a] / sum : 0.0;
+    }
+
+    // the rows of node t on river card r: the node's own (class on the root's round, bucket on the river; doubles),
+    // or with river_exact at a river node the block of card r (class = strength rank there; floats, made on first use)
+    struct VRef {
+        int nc = 0;
+        const int* cpv = nullptr;  // combo -> row (card part), < 0: not in the round
+        double* dreg = nullptr;
+        double* dss = nullptr;
+        int64_t* dvis = nullptr;
+        float* freg = nullptr;
+        float* fss = nullptr;
+        int32_t* fvis = nullptr;
+        int32_t* last = nullptr;  // DCFR only
+        TNode::VRiver* blk = nullptr;  // the exact block (river_exact)
+        int r = -1;                    // its river card
+    };
+    VRef v_ref(TNode* t, int r) {
+        VRef f;
+        const int na = t->na.n;
+        const bool river_part = t->street != root_street_;
+        if (vexact_ && river_part && (!vwarm_ || vswitched_.load(std::memory_order_acquire))) {
+            std::call_once(t->vriv_once, [&]() {
+                t->vriv.reset(new std::atomic<TNode::VRiver*>[52]);
+                for (int i = 0; i < 52; i++) t->vriv[(size_t)i].store(nullptr, std::memory_order_relaxed);
+            });
+            TNode::VRiver* b = t->vriv[(size_t)r].load(std::memory_order_acquire);
+            if (!b) {
+                t->vlock.lock();
+                b = t->vriv[(size_t)r].load(std::memory_order_relaxed);
+                if (!b) {
+                    try {
+                        std::unique_ptr<TNode::VRiver> nb(new TNode::VRiver);
+                        nb->nc = vboards_[(size_t)r].n_rank;
+                        nb->reg.assign((size_t)nb->nc * na, 0.0f);
+                        nb->ss.assign((size_t)nb->nc * na, 0.0f);
+                        nb->vis.assign((size_t)nb->nc, 0);
+                        if (params_.vector_discount == 2) nb->last.assign((size_t)nb->nc, 0);
+                        nb->warm.store(vwarm_);
+                        b = nb.get();
+                        t->vriv_own.push_back(std::move(nb));
+                    } catch (...) {
+                        t->vlock.unlock();
+                        throw;  // (out of memory: the worker's handler, a Python exception)
+                    }
+                    t->vriv[(size_t)r].store(b, std::memory_order_release);
+                }
+                t->vlock.unlock();
+            }
+            f.nc = b->nc;
+            f.cpv = vboards_[(size_t)r].rank.data();
+            f.freg = b->reg.data();
+            f.fss = b->ss.data();
+            f.fvis = b->vis.data();
+            f.last = b->last.empty() ? nullptr : b->last.data();
+            f.blk = b;
+            f.r = r;
+            return f;
+        }
+        const bool kq = river_part && vriver_k_ > 0;  // river_buckets: K strength buckets shared by the river cards
+        const int nc = kq ? vriver_k_ : t->n_cache;
+        std::call_once(t->vonce, [&]() {
+            t->vreg.assign((size_t)nc * na, 0.0);
+            t->vss.assign((size_t)nc * na, 0.0);
+            t->vvis.assign((size_t)nc, 0);
+            if (params_.vector_discount == 2) t->vlast.assign((size_t)nc, 0);
+        });
+        f.last = t->vlast.empty() ? nullptr : t->vlast.data();
+        f.nc = nc;
+        f.cpv = kq ? vboards_[(size_t)r].qb.data()
+                   : river_part ? vboards_[(size_t)(root_.n_board == 5 ? 52 : r)].bucket.data() : class_of_.data();
+        f.dreg = t->vreg.data();
+        f.dss = t->vss.data();
+        f.dvis = t->vvis.data();
+        return f;
+    }
+    // sigma of every row (a snapshot of the regrets)
+    void v_sigma(TNode* t, const VRef& f, int na, double* sg) {
+        if (f.blk && f.blk->warm.load(std::memory_order_acquire)) {
+            // river_warm, a new exact block: its classes play their bucket rows' average strategy until its first update
+            const VBoard& B = vboards_[(size_t)f.r];
+            t->vlock.lock();
+            for (int k = 0; k < f.nc; k++) {
+                const size_t q = (size_t)B.rank_qb[(size_t)k];
+                double s = 0.0;
+                if (t->vss.size() >= (q + 1) * (size_t)na)
+                    for (int a = 0; a < na; a++) s += t->vss[q * na + a];
+                for (int a = 0; a < na; a++) sg[(size_t)k * na + a] = s > 0.0 ? t->vss[q * na + a] / s : 1.0 / na;
+            }
+            t->vlock.unlock();
+            return;
+        }
+        t->vlock.lock();
+        if (f.freg) {
+            double tmp[MAX_ACTIONS];
+            for (int cp = 0; cp < f.nc; cp++) {
+                for (int a = 0; a < na; a++) tmp[a] = (double)f.freg[(size_t)cp * na + a];
+                v_regret_matching(tmp, na, &sg[(size_t)cp * na]);
+            }
+        } else {
+            for (int cp = 0; cp < f.nc; cp++) v_regret_matching(&f.dreg[(size_t)cp * na], na, &sg[(size_t)cp * na]);
+        }
+        t->vlock.unlock();
+    }
+    // weight x (regret increments, if given, and strategy-sum increments) into the rows with cnt > 0
+    void v_add(TNode* t, const VRef& f, int na, const std::vector<int>& cnt, const double* reg, const double* ss, double weight) {
+        if (params_.vector_discount != 0) {
+            v_add_discounted(t, f, na, cnt, reg, ss, weight);
+            return;
+        }
+        if (f.blk && f.blk->warm.load(std::memory_order_acquire)) {
+            // the warm start: the bucket strategy's regrets and sums as if played in the bucket phase's T_w iterations
+            // (Linear weights 1..T_w), in the share of them that would have dealt this block's river card (1 / 48)
+            const double tw = (double)vwarm_t_.load();
+            weight = (params_.linear ? 0.5 * tw * (tw + 1.0) : tw) / (double)std::max<size_t>(1, vriver_.size());
+            if (reg) f.blk->warm.store(false, std::memory_order_release);
+        }
+        t->vlock.lock();
+        for (int cp = 0; cp < f.nc; cp++) {
+            if (!cnt[(size_t)cp]) continue;
+            const size_t o = (size_t)cp * na;
+            if (f.freg) {
+                for (int a = 0; a < na; a++) {
+                    if (reg) f.freg[o + a] += (float)(weight * reg[o + a]);
+                    f.fss[o + a] += (float)(weight * ss[o + a]);
+                }
+                f.fvis[cp] += 1;
+            } else {
+                for (int a = 0; a < na; a++) {
+                    if (reg) f.dreg[o + a] += weight * reg[o + a];
+                    f.dss[o + a] += weight * ss[o + a];
+                }
+                f.dvis[cp] += 1;
+            }
+        }
+        t->vlock.unlock();
+    }
+
+    // CFR+ / DCFR(1.5, 0, 2); `weight` is the iteration t (Linear weights on)
+    void v_add_discounted(TNode* t, const VRef& f, int na, const std::vector<int>& cnt, const double* reg, const double* ss,
+                          double weight) {
+        const int it = (int)std::llround(weight);
+        const bool dcfr = params_.vector_discount == 2;
+        const double ws = dcfr ? weight * weight : weight;  // the average: t^2 (DCFR gamma = 2), t (CFR+)
+        t->vlock.lock();
+        for (int cp = 0; cp < f.nc; cp++) {
+            if (!cnt[(size_t)cp]) continue;
+            const size_t o = (size_t)cp * na;
+            double R[MAX_ACTIONS];
+            for (int a = 0; a < na; a++) R[a] = f.freg ? (double)f.freg[o + a] : f.dreg[o + a];
+            if (reg && dcfr && f.last) {
+                // the discounts of the iterations since the row's last update (last .. it - 1): positive regrets
+                // x k^1.5 / (k^1.5 + 1) each, negative x 1/2 each (beta = 0)
+                const int from = std::max(1, (int)f.last[cp]);
+                if (f.last[cp] > 0 && from < it) {
+                    double fp = 1.0;
+                    for (int k = from; k < it; k++) {
+                        const double p = std::pow((double)k, 1.5);
+                        fp *= p / (p + 1.0);
+                    }
+                    const double fn = std::ldexp(1.0, -(it - from));
+                    for (int a = 0; a < na; a++) R[a] *= R[a] > 0.0 ? fp : fn;
+                }
+                f.last[cp] = it;
+            }
+            if (reg)
+                for (int a = 0; a < na; a++) {
+                    R[a] += reg[o + a];  // unweighted increments (CFR+ and DCFR discount instead)
+                    if (!dcfr && R[a] < 0.0) R[a] = 0.0;  // CFR+: floored at zero
+                }
+            for (int a = 0; a < na; a++) {
+                if (f.freg) {
+                    f.freg[o + a] = (float)R[a];
+                    f.fss[o + a] += (float)(ws * ss[o + a]);
+                } else {
+                    f.dreg[o + a] = R[a];
+                    f.dss[o + a] += ws * ss[o + a];
+                }
+            }
+            if (f.freg) f.fvis[cp] += 1;
+            else f.dvis[cp] += 1;
+        }
+        t->vlock.unlock();
+    }
+
+    // the average strategy of p below t where o's reach is zero: no values, no regrets (both would be
+    // zero), but p's strategy sums still add p's own reach x sigma, as at every node p reaches
+    void v_avg(TNode* t, int p, const double* rp, int r, double weight, VCtx& vc) {
+        if (t->terminal || t->leaf) return;
+        {
+            bool any = false;
+            for (int d = 0; d < N_COMBOS && !any; d++) any = rp[d] != 0.0;
+            if (!any) return;
+        }
+        const int q = t->seat;
+        const int na = t->na.n;
+        auto child = [&](int a, const double* rpa) {
+            TNode* c = tchild(t, a);
+            if (r >= 0 && t->n_board == 4 && c->n_board == 5) {
+                const ComboTable& ct = combo_table();
+                double* rp2 = vc.get();
+                for (int d = 0; d < N_COMBOS; d++) rp2[d] = (ct.c0[d] == r || ct.c1[d] == r) ? 0.0 : rpa[d];
+                v_avg(c, p, rp2, r, weight, vc);
+                vc.release(1);
+                return;
+            }
+            v_avg(c, p, rpa, r, weight, vc);
+        };
+        if (q != p) {
+            for (int a = 0; a < na; a++) child(a, rp);
+            return;
+        }
+        const VRef f = v_ref(t, r);
+        const int nc = f.nc;
+        const int* cpv = f.cpv;
+        const int forced = t->path_node && q == hand_.our_seat ? our_combo_ : -1;
+        const int dep = vc.depth++;
+        if ((int)vc.rows.size() <= dep) {
+            vc.rows.resize((size_t)dep + 1);
+            vc.ints.resize((size_t)dep + 1);
+        }
+        std::vector<double>& rows = vc.rows[(size_t)dep];
+        if (rows.size() < (size_t)nc * na * 3) rows.resize((size_t)nc * na * 3);
+        double* sg = rows.data();
+        double* ss = sg + (size_t)nc * na;
+        v_sigma(t, f, na, sg);
+        std::fill(ss, ss + (size_t)nc * na, 0.0);
+        std::vector<int>& cnt = vc.ints[(size_t)dep];
+        cnt.assign((size_t)nc, 0);
+        for (int c = 0; c < N_COMBOS; c++) {
+            const int cp = cpv[c];
+            if (cp < 0 || cp >= nc || c == forced || rp[c] == 0.0) continue;
+            cnt[(size_t)cp]++;
+            for (int a = 0; a < na; a++) ss[(size_t)cp * na + a] += rp[c] * sg[(size_t)cp * na + a];
+        }
+        v_add(t, f, na, cnt, nullptr, ss, weight);
+        double* rp2 = vc.get();
+        for (int a = 0; a < na; a++) {
+            for (int c = 0; c < N_COMBOS; c++) {
+                const int cp = cpv[c];
+                const double sgm = c == forced ? (a == t->path_index ? 1.0 : 0.0) : (cp < 0 || cp >= nc) ? 0.0 : sg[(size_t)cp * na + a];
+                rp2[c] = rp[c] * sgm;
+            }
+            child(a, rp2);
+        }
+        vc.release(1);
+        vc.depth--;
+    }
+
+    // the child of t through action a, crossing to the river card r when the action ends the turn
+    void v_child(TNode* t, int a, int p, int o, const double* rp, const double* ro, int r, double weight, Ctx& ctx, VCtx& vc,
+                 double* v) {
+        TNode* c = tchild(t, a);
+        if (r >= 0 && t->n_board == 4 && c->n_board == 5) {
+            const ComboTable& ct = combo_table();
+            double* rp2 = vc.get();
+            double* ro2 = vc.get();
+            for (int d = 0; d < N_COMBOS; d++) {
+                const bool hit = ct.c0[d] == r || ct.c1[d] == r;
+                rp2[d] = hit ? 0.0 : rp[d];
+                ro2[d] = hit ? 0.0 : ro[d];
+            }
+            v_walk(c, p, o, rp2, ro2, r, weight, ctx, vc, v);
+            const double scale = (double)vriver_.size() / 44.0;  // one card of the 48 sampled: x 48/44 over a pair's 44 cards
+            for (int d = 0; d < N_COMBOS; d++) v[d] = (ct.c0[d] == r || ct.c1[d] == r) ? 0.0 : v[d] * scale;
+            vc.release(2);
+            return;
+        }
+        v_walk(c, p, o, rp, ro, r, weight, ctx, vc, v);
+    }
+
+    void v_walk(TNode* t, int p, int o, const double* rp, const double* ro, int r, double weight, Ctx& ctx, VCtx& vc, double* v) {
+        if (t->terminal) {
+            v_terminal(t, p, o, ro, t->n_board == 5 ? (root_.n_board == 5 ? 52 : r) : 52, v);
+            return;
+        }
+        if (t->leaf) throw std::runtime_error("vector CFR: a leaf in the subgame");
+        {
+            bool any = false;
+            for (int d = 0; d < N_COMBOS && !any; d++) any = ro[d] != 0.0;
+            if (!any) {
+                std::fill(v, v + N_COMBOS, 0.0);
+                v_avg(t, p, rp, r, weight, vc);
+                return;
+            }
+        }
+        ctx.nodes++;
+        const int q = t->seat;
+        const int na = t->na.n;
+        const VRef f = v_ref(t, r);
+        const int nc = f.nc;
+        const int* cpv = f.cpv;
+        const int forced = t->path_node && q == hand_.our_seat ? our_combo_ : -1;  // our actual hole plays the real action
+        const int dep = vc.depth++;
+        if ((int)vc.rows.size() <= dep) {
+            vc.rows.resize((size_t)dep + 1);
+            vc.ints.resize((size_t)dep + 1);
+        }
+        // sigma of every card part (a snapshot of the node's regrets), then per combo and action
+        std::vector<double>& rows = vc.rows[(size_t)dep];
+        if (rows.size() < (size_t)nc * na * 3) rows.resize((size_t)nc * na * 3);
+        double* sg = rows.data();
+        v_sigma(t, f, na, sg);
+        // S[a][c]: sigma of combo c (0 for combos not in the round: on the board, or holding the river card)
+        const size_t base = vc.top;
+        for (int a = 0; a < na; a++) vc.get();
+        double* S[MAX_ACTIONS];
+        for (int a = 0; a < na; a++) S[a] = vc.buf[base + (size_t)a].data();
+        for (int a = 0; a < na; a++) {
+            double* __restrict Sa = S[a];
+            for (int c = 0; c < N_COMBOS; c++) {
+                const int cp = cpv[c];
+                Sa[c] = (cp >= 0 && cp < nc) ? sg[(size_t)cp * na + a] : 0.0;
+            }
+        }
+        if (forced >= 0)
+            for (int a = 0; a < na; a++) S[a][forced] = a == t->path_index ? 1.0 : 0.0;
+        std::fill(v, v + N_COMBOS, 0.0);
+        if (q == o) {
+            double* ro2 = vc.get();
+            double* va = vc.get();
+            for (int a = 0; a < na; a++) {
+                const double* __restrict Sa = S[a];
+                double mass = 0.0;
+                for (int d = 0; d < N_COMBOS; d++) {
+                    ro2[d] = ro[d] * Sa[d];
+                    mass += ro2[d];
+                }
+                if (!(mass > 0.0)) {
+                    TNode* c = tchild(t, a);
+                    if (r >= 0 && t->n_board == 4 && c->n_board == 5) {
+                        const ComboTable& ct = combo_table();
+                        double* rp2 = vc.get();
+                        for (int d = 0; d < N_COMBOS; d++) rp2[d] = (ct.c0[d] == r || ct.c1[d] == r) ? 0.0 : rp[d];
+                        v_avg(c, p, rp2, r, weight, vc);
+                        vc.release(1);
+                    } else {
+                        v_avg(c, p, rp, r, weight, vc);
+                    }
+                    continue;
+                }
+                v_child(t, a, p, o, rp, ro2, r, weight, ctx, vc, va);
+                for (int c = 0; c < N_COMBOS; c++) v[c] += va[c];
+            }
+            vc.release((size_t)na + 2);
+            vc.depth--;
+            return;
+        }
+        // the traverser: values per action, then regrets and the average strategy per card part
+        double* rp2 = vc.get();
+        const size_t vbase = vc.top;
+        for (int a = 0; a < na; a++) vc.get();
+        double* vs[MAX_ACTIONS];
+        for (int a = 0; a < na; a++) vs[a] = vc.buf[vbase + (size_t)a].data();
+        for (int a = 0; a < na; a++) {
+            for (int d = 0; d < N_COMBOS; d++) rp2[d] = rp[d] * S[a][d];
+            v_child(t, a, p, o, rp2, ro, r, weight, ctx, vc, vs[a]);
+        }
+        for (int a = 0; a < na; a++)
+            for (int c = 0; c < N_COMBOS; c++) v[c] += S[a][c] * vs[a][c];
+        double* reg = sg + (size_t)nc * na;
+        double* ss = reg + (size_t)nc * na;
+        std::fill(reg, reg + (size_t)nc * na * 2, 0.0);
+        std::vector<int>& cnt = vc.ints[(size_t)dep];
+        cnt.assign((size_t)nc, 0);
+        for (int c = 0; c < N_COMBOS; c++) {
+            const int cp = cpv[c];
+            if (cp < 0 || cp >= nc || c == forced) continue;
+            cnt[(size_t)cp]++;
+            double* rg = &reg[(size_t)cp * na];
+            double* sm = &ss[(size_t)cp * na];
+            const double vc_ = v[c], rpc = rp[c];
+            for (int a = 0; a < na; a++) {
+                rg[a] += vs[a][c] - vc_;
+                sm[a] += rpc * S[a][c];
+            }
+        }
+        v_add(t, f, na, cnt, reg, ss, weight);
+        vc.release((size_t)na * 2 + 1);
+        vc.depth--;
+    }
+
+    // after the vector solve: every node's rows into the search's table (the keys the MCCFR uses), so the
+    // outputs, likelihood(), path_strategies() and the exact evaluator read them
+    void vector_write_back() {
+        for (const auto& up : tnodes_) {
+            TNode* t = up.get();
+            if (vexact_ && !t->terminal && !t->leaf && t->street == RIVER) vriver_nodes_[t->ph.a] = t;
+            if (t->terminal || t->leaf || t->vvis.empty()) continue;
+            const int na = t->na.n;
+            for (int cp = 0; cp < (int)t->vvis.size(); cp++) {
+                if (t->vvis[(size_t)cp] == 0) continue;
+                Node* node = table_->get_or_create(search_key(t->street, t->seat, cp, t->ph), 0, na, [&](Node& nd, NodeArena&) {
+                    nd.init(t->na.id, na);
+                    return "";
+                }).node;
+                for (int a = 0; a < na; a++) {
+                    node->regret()[a] = t->vreg[(size_t)cp * na + a];
+                    node->strategy_sum()[a] = t->vss[(size_t)cp * na + a];
+                }
+                node->visits = t->vvis[(size_t)cp];
+            }
+        }
+    }
+
+    void vector_loop(Ctx& ctx, std::atomic<long long>& next_t, std::atomic<bool>& stop,
+                     std::chrono::steady_clock::time_point deadline, const NodeKey& our_key, int our_n) {
+        // a river root has no chance to sample: concurrent full-width iterations would only read each other's
+        // stale regrets (measured: 4 threads converge 5x slower per second), so it runs on one thread
+        if (vriver_.empty() && ctx.tid > 0) return;
+        const auto t_start = deadline - std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                            std::chrono::duration<double>(params_.time_budget > 0 ? params_.time_budget : 0.0));
+        VCtx vc;
+        std::vector<double> v((size_t)N_COMBOS);
+        while (!stop.load(std::memory_order_relaxed)) {
+            const long long t = next_t.fetch_add(1);
+            if (params_.iterations > 0 && t > params_.iterations) break;
+            const double weight = params_.linear ? (double)t : 1.0;
+            if (vwarm_ && !vswitched_.load(std::memory_order_acquire)) {
+                const bool done = params_.iterations > 0
+                                      ? (double)t > params_.river_warm * (double)params_.iterations
+                                      : std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count() >=
+                                            params_.river_warm * params_.time_budget;
+                if (done) {
+                    long long expected = 0;
+                    if (vwarm_t_.compare_exchange_strong(expected, t - 1)) vswitched_.store(true, std::memory_order_release);
+                }
+            }
+            const int r = vriver_.empty() ? -1 : vriver_[(size_t)ctx.rng.below((int)vriver_.size())];
+            for (int i = 0; i < 2; i++) {
+                const int p = vseat_[i], o = vseat_[1 - i];
+                if (!root_.players[p].can_act()) continue;
+                v_walk(troot_, p, o, reach_[(size_t)p].data(), reach_[(size_t)o].data(), r, weight, ctx, vc, v.data());
+                ctx.traversals++;
+            }
+            (void)our_key;
+            (void)our_n;
+            ctx.iterations++;
+            if (params_.time_budget > 0 && std::chrono::steady_clock::now() >= deadline) stop.store(true, std::memory_order_relaxed);
+        }
     }
 };
 

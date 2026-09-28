@@ -748,6 +748,10 @@ PYBIND11_MODULE(_fastcore, m) {
     m.def("raise_name", &raise_name);
 
     // ---- files (persist.h): formats, conversions, test hooks of the Python-identical spellings
+    m.def("_debug_fail_table_growth", [](long long n) { FlatNodeTable::debug_fail_grow().store(n); }, py::arg("n"),
+          "tests: the n-th node-table growth from now fails with std::bad_alloc (0: never)");
+    m.def("_debug_fail_prepare", [](long long n) { FlatTrainer::debug_fail_prepare().store(n); }, py::arg("n"),
+          "tests: the n-th preparation of a flat / GPU iteration from now fails with std::bad_alloc (0: never; < 0: every one)");
     m.def("file_kind", &file_kind, "'checkpoint' / 'blueprint' (binary, by magic), 'json', 'unknown' or 'unreadable'");
     m.def("checkpoint_bin_to_json", [](const std::string& src, const std::string& dst) {
         py::gil_scoped_release nogil;
@@ -1222,6 +1226,8 @@ PYBIND11_MODULE(_fastcore, m) {
             t.train(iterations);
         }, py::arg("iterations"))
         .def_property_readonly("iteration", &FlatTrainer::iteration)
+        .def_property_readonly("tables_consistent", &FlatTrainer::tables_consistent,
+                               "after train() raised: True if the tables are those of iteration (a checkpoint resumes exactly)")
         .def_readwrite("batch_size", &FlatTrainer::batch_size)
         .def_readwrite("linear_until", &FlatTrainer::linear_until)
         .def_readwrite("pass_iterations", &FlatTrainer::pass_iterations)
@@ -1350,6 +1356,8 @@ PYBIND11_MODULE(_fastcore, m) {
            "regret-based pruning (Pluribus): skip actions with regret < -below (stored units), or with relative=True below "
            "-below bb per unit of the node's own traverser weight; below = 0 turns it off")
         .def_property_readonly("pruned_actions", &Trainer::pruned_actions)
+        .def_property_readonly("tables_consistent", &Trainer::tables_consistent,
+                               "after train() raised: True if the tables are those of iteration (a checkpoint resumes exactly)")
         .def_property("batch_size", [](const Trainer& t) { return t.batch_size; },
                       [](Trainer& t, long long v) {
                           ApiLock lk(t.api_mu);
@@ -1573,12 +1581,18 @@ PYBIND11_MODULE(_fastcore, m) {
        "tests: a continuation on probabilities (kinds 0 fold / 1 call / 2 raise; choice 0 blueprint / 1 fold / 2 call / 3 raise)");
     m.def("canonical_boards", [](int n) { return canonical_boards(n).size(); }, "number of suit-canonical boards of n cards");
     py::class_<SearchGame, std::shared_ptr<SearchGame>>(m, "SearchGame")
-        .def(py::init([](const py::dict& spec, std::shared_ptr<Bucketer> bk, const py::object& blueprint) {
+        .def(py::init([](const py::dict& spec, std::shared_ptr<Bucketer> bk, const py::object& blueprint, const py::object& search_bucketer) {
             std::shared_ptr<const BlueprintTable> bp;
             if (!blueprint.is_none()) bp = blueprint.cast<std::shared_ptr<BlueprintTable>>();
-            return std::make_shared<SearchGame>(spec_from_dict(spec), std::move(bk), bp);
-        }), py::arg("spec"), py::arg("bucketer"), py::arg("blueprint") = py::none(),
-            "game + bucketer + blueprint lookup (BlueprintTable, or None: uniform ranges) shared by the searches of a match")
+            std::shared_ptr<Bucketer> sbk;
+            if (!search_bucketer.is_none()) sbk = search_bucketer.cast<std::shared_ptr<Bucketer>>();
+            return std::make_shared<SearchGame>(spec_from_dict(spec), std::move(bk), bp, std::move(sbk));
+        }), py::arg("spec"), py::arg("bucketer"), py::arg("blueprint") = py::none(), py::arg("search_bucketer") = py::none(),
+            "game + bucketer + blueprint lookup (BlueprintTable, or None: uniform ranges) shared by the searches of a match; "
+            "search_bucketer: the subgame's own card abstraction for the rounds after the root's (None: `bucketer`); the "
+            "ranges, the rollouts and every blueprint lookup keep `bucketer`")
+        .def_property_readonly("separate_buckets", &SearchGame::separate_buckets,
+                               "the subgame keys its rounds after the root's on a bucketer of its own")
         .def_property_readonly("action_names", [](const SearchGame& g) { return g.grid.names; })
         .def("presample", [](SearchGame& g, uint64_t seed, double bias) {
             py::gil_scoped_release nogil;
@@ -1588,7 +1602,7 @@ PYBIND11_MODULE(_fastcore, m) {
         .def("clear_presampled", [](SearchGame& g) { g.presampled.clear(); g.presampled.shrink_to_fit(); })
         .def_property_readonly("presampled_bytes", [](const SearchGame& g) { return g.presampled.capacity(); })
         .def_readwrite("tables_keep", &SearchGame::tables_keep,
-                       "bucket tables (river, turn) of this many recent root boards are kept and shared by the searches")
+                       "bucket tables (river, turn) of this many recent root boards are kept (per abstraction) and shared by the searches")
         .def("clear_board_tables", [](const SearchGame& g) { g.clear_board_tables(); });
 
     py::class_<SubgameSearch>(m, "SubgameSearch")
@@ -1596,7 +1610,8 @@ PYBIND11_MODULE(_fastcore, m) {
                          const std::vector<std::pair<int, int>>& actions, const std::vector<int>& board, int seat,
                          const std::vector<int>& hole, long long iterations, double time_budget, int threads, uint64_t seed,
                          double focus, double min_prob, bool linear, const py::object& overrides, const py::object& depth,
-                         int rollouts, double bias, int debug_leaves, bool legacy_traverse) {
+                         int rollouts, double bias, int debug_leaves, bool legacy_traverse, bool vector_cfr, bool river_exact,
+                         int river_buckets, int vector_discount, double river_warm) {
             HandInput h;
             h.stacks = stacks;
             h.button = button;
@@ -1629,15 +1644,30 @@ PYBIND11_MODULE(_fastcore, m) {
             p.bias = bias;
             p.debug_leaves = debug_leaves;
             p.legacy_traverse = legacy_traverse;
+            p.vector_cfr = vector_cfr;
+            p.river_exact = river_exact;
+            p.river_buckets = river_buckets;
+            p.vector_discount = vector_discount;
+            p.river_warm = river_warm;
             py::gil_scoped_release nogil;
             return new SubgameSearch(std::shared_ptr<const SearchGame>(game), h, p);
         }), py::arg("game"), py::arg("stacks"), py::arg("button"), py::arg("actions"), py::arg("board"), py::arg("seat"),
             py::arg("hole"), py::arg("iterations") = 0, py::arg("time_budget") = 2.0, py::arg("threads") = 15, py::arg("seed") = 0,
             py::arg("focus") = 0.5, py::arg("min_prob") = 1e-3, py::arg("linear") = true, py::arg("overrides") = py::none(),
             py::arg("depth") = "end", py::arg("rollouts") = 3, py::arg("bias") = 5.0, py::arg("debug_leaves") = 0,
-            py::arg("legacy_traverse") = false,
+            py::arg("legacy_traverse") = false, py::arg("vector_cfr") = false, py::arg("river_exact") = false,
+            py::arg("river_buckets") = 0, py::arg("vector_discount") = 0, py::arg("river_warm") = 0.0,
             "the subgame of the hand so far: root at the start of the current round, ranges by Bayes over the blueprint; "
             "depth 'end' / 'pluribus' / 'hu_flop_limit' / 'next_street' (leaves: four continuations, `rollouts` rollouts each)")
+        .def("set_budget", &SubgameSearch::set_budget, py::arg("iterations"), py::arg("time_budget"),
+             "the budget of the next solve(): iterations (0: none) and seconds (0: none)")
+        .def("river_classes", &SubgameSearch::river_classes,
+             "river_exact, after a solve on a turn root: classes (distinct strengths) per river card, 52 entries")
+        .def("river_class", &SubgameSearch::river_class, py::arg("card"), py::arg("combo"),
+             "river_exact: a combo's class on the river card (its strength rank there; -1 on the board)")
+        .def_property_readonly("river_bytes", &SubgameSearch::river_bytes, "river_exact: bytes of the river rows of the last solve")
+        .def_property_readonly("vector_eligible", &SubgameSearch::vector_eligible,
+                               "vector_cfr would run here (2 live players, turn / river root, no leaves, not frozen)")
         .def("solve", [](SubgameSearch& s) {
             SearchResult r;
             {
@@ -1703,6 +1733,7 @@ PYBIND11_MODULE(_fastcore, m) {
             d["raise_limit"] = s.raise_limit();
             d["river_table_boards"] = s.river_table_boards();
             d["river_table_seconds"] = s.river_table_seconds();
+            d["blueprint_river_table_boards"] = s.blueprint_river_table_boards();
             return d;
         }, "the root: the public state at the start of the current betting round")
         .def("path", [](const SubgameSearch& s) {
@@ -1824,7 +1855,16 @@ PYBIND11_MODULE(_fastcore, m) {
             return py::make_tuple(names, p);
         }, "tests: (names, probabilities) of the rollout policy after `actions` from the root, its actor holding (h0, h1), "
            "continuation 0 blueprint / 1 fold / 2 call / 3 raise")
-        .def("_later_bucket", &SubgameSearch::later_bucket_of, "tests: the bucket the search uses for a hole on a later board")
+        .def("_later_bucket", &SubgameSearch::later_bucket_of, py::arg("h0"), py::arg("h1"), py::arg("board"), py::arg("blueprint") = false,
+             "tests: the bucket the search uses for a hole on a later board: the subgame's own (its infosets), or with "
+             "blueprint=True the blueprint's (rollouts)")
+        .def("_later_infosets", [](const SubgameSearch& s) {
+            const std::vector<std::pair<long long, int>> v = s.later_infosets();
+            py::dict d;
+            for (int street = FLOP; street <= RIVER; street++)
+                if (v[(size_t)street].first > 0) d[py::int_(street)] = py::make_tuple(v[(size_t)street].first, v[(size_t)street].second);
+            return d;
+        }, "tests: {street: (infosets, largest bucket)} of the subgame after the root's round, as keyed in its table")
         .def("freeze_round", [](SubgameSearch& s, const py::object& src, int kind) {
             s.freeze_round(src.is_none() ? nullptr : src.cast<const SubgameSearch*>(), kind);
         }, py::arg("src"), py::arg("kind") = 0, py::keep_alive<1, 2>(),

@@ -50,8 +50,10 @@ def test_cpp_evaluator_identical_on_100k_hands():
         core.evaluate([0, 1, 2, 3])
 
 
-@pytest.mark.skipif(pytest.importorskip("phevaluator", reason="phevaluator not installed") is None, reason="")
 def test_phevaluator_tier_identical_on_100k_hands():
+    # importorskip inside the test: in a decorator it ran at collection and, without phevaluator, skipped the
+    # whole module (all 33 tests of this file as one "skipped")
+    pytest.importorskip("phevaluator", reason="phevaluator not installed")
     from phevaluator._pheval import evaluate_5cards, evaluate_6cards, evaluate_7cards
 
     from negpluribus.fast.evaluator import _phe_table

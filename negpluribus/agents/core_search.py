@@ -14,6 +14,11 @@ stays the reference and is unchanged.
   real actions as the path (ours fixed for our hand, off-grid sizes inserted), depth ``depth``
   ("pluribus": heads-up to the end of the hand; three or more players at the flop: leaves at the
   turn or right after the second raise).
+* **Cards**: lossless on the round of the search's root; the later rounds of the subgame on the
+  blueprint's buckets, or on an abstraction of the subgame's own (``SearchResources`` with a
+  ``search_bucketer``, e.g. 64 exact potential-aware buckets while the blueprint has 16; Pluribus used
+  500 buckets per round there).  The ranges, the rollouts and every blueprint lookup keep the
+  blueprint's buckets.
 * **Ranges**: Bayes over the blueprint for rounds played without a search; for a searched round,
   the last search's average strategy over the round's real actions (``SubgameSearch.likelihood``,
   each factor at least ``range_floor``), passed as overrides to the later rounds' searches.
@@ -78,6 +83,18 @@ class SearchConfig:
     bias: float = 5.0
     min_prob: float = 1e-3
     focus: float = 0.5
+    # vector Linear CFR where it applies (2 live players, turn / river root, no leaves; SubgameSearch vector_cfr),
+    # with its own iterations per street (a vector iteration walks every hole pair); a street without an entry
+    # there uses its time budget
+    vector_cfr: bool = False
+    vector_street_iterations: Dict[int, int] = field(default_factory=dict)
+    # with vector_cfr on a turn root: river infosets by exact hand strength instead of the subgame's buckets
+    river_exact: bool = False
+    # with vector_cfr on a turn root (river_exact off): > 0, the river by this many strength buckets shared by the
+    # river cards (Pluribus: 500); 0: the subgame's buckets (--search-buckets, else the blueprint's)
+    river_buckets: int = 0
+    # vector CFR's weighting: 0 Linear CFR, 1 CFR+, 2 DCFR(1.5, 0, 2)
+    vector_discount: int = 0
 
     def __post_init__(self) -> None:
         if self.play not in ("average", "final"):
@@ -100,7 +117,10 @@ class SearchConfig:
 class SearchResources:
     """What every search agent of one game shares (load once per process): the game spec, the
     Python bucketer (the inner blueprint agent's keys), its C++ twin with the saved bucket cache,
-    the C++ blueprint lookup and the ``SearchGame``."""
+    the C++ blueprint lookup and the ``SearchGame``.  Optionally the subgame's own card abstraction
+    for the rounds after the root's (``search_bucketer`` and its C++ twin, answered from its bucket
+    tables or cache): the searches key their later rounds on it, while the ranges, the rollouts and
+    every blueprint lookup keep the blueprint's buckets."""
 
     spec: GameSpec
     bucketer: object
@@ -109,29 +129,54 @@ class SearchResources:
     game: object
     cache_loaded: Optional[list] = None
     load_seconds: float = 0.0
+    search_bucketer: object = None        # None: the subgame's later rounds on the blueprint's buckets
+    search_core_bucketer: object = None
+    search_cache_loaded: Optional[list] = None
 
     @classmethod
     def load(cls, spec: GameSpec, blueprint_path: str, buckets_path: Optional[str] = None, bucketer=None,
              cache_path: Optional[str] = None, cache_caps: Sequence[int] = DEFAULT_CACHE_CAPS,
-             presample_seed: Optional[int] = None) -> "SearchResources":
+             presample_seed: Optional[int] = None, search_buckets_path: Optional[str] = None, search_bucketer=None,
+             search_tables: Optional[str] = None, search_cache_path: Optional[str] = None,
+             core_bucketer=None, search_core_bucketer=None) -> "SearchResources":
         """From files: the blueprint (binary or JSON; binary loads in about 0.1 s), the buckets JSON (or
-        an already loaded ``bucketer``) and the saved bucket cache (scripts/precompute_buckets.py)."""
+        an already loaded ``bucketer``) and the saved bucket cache (scripts/precompute_buckets.py).
+        ``search_buckets_path`` (or a loaded ``search_bucketer``): the subgame's own abstraction for the
+        rounds after the root's, answered from its bucket table in ``search_tables`` (a directory; default
+        $NEGPLURIBUS_BUCKET_TABLES) and / or its saved cache ``search_cache_path``.
+        ``core_bucketer`` / ``search_core_bucketer``: already built C++ bucketers to share (see ``build``)."""
         from ..fast.blueprint import load_blueprint
 
         t0 = time.perf_counter()
         bk = bucketer if bucketer is not None else load_bucketer(buckets_path)
+        sbk = search_bucketer if search_bucketer is not None else (load_bucketer(search_buckets_path) if search_buckets_path else None)
         bp = load_blueprint(blueprint_path, backend="cpp", n_players=spec.n_players)
-        res = cls.build(spec, bk, bp, cache_path=cache_path, cache_caps=cache_caps, presample_seed=presample_seed)
+        res = cls.build(spec, bk, bp, cache_path=cache_path, cache_caps=cache_caps, presample_seed=presample_seed,
+                        search_bucketer=sbk, search_tables=search_tables, search_cache_path=search_cache_path,
+                        core_bucketer=core_bucketer, search_core_bucketer=search_core_bucketer)
         res.load_seconds = time.perf_counter() - t0
         return res
 
     @classmethod
     def build(cls, spec: GameSpec, bucketer, blueprint, cache_path: Optional[str] = None,
-              cache_caps: Sequence[int] = DEFAULT_CACHE_CAPS, presample_seed: Optional[int] = None) -> "SearchResources":
+              cache_caps: Sequence[int] = DEFAULT_CACHE_CAPS, presample_seed: Optional[int] = None,
+              search_bucketer=None, search_tables: Optional[str] = None,
+              search_cache_path: Optional[str] = None, core_bucketer=None,
+              search_core_bucketer=None) -> "SearchResources":
         """From loaded objects: a Python bucketer and a ``CppBlueprint`` (``load_blueprint``, or a C++
-        trainer's ``blueprint()``)."""
+        trainer's ``blueprint()``); ``search_bucketer``: a fitted Python bucketer for the subgame's rounds
+        after the root's (one with the blueprint bucketer's identity is the blueprint's: nothing changes).
+
+        Sharing between the resources of several blueprints on one card abstraction (a depth grid:
+        negpluribus/agents/stack_grid.py): ``core_bucketer``, an already built C++ twin of ``bucketer``
+        with its cache already loaded (e.g. another ``SearchResources.core_bucketer``), is used instead of
+        building a new one and loading ``cache_path`` again (which must then be None); likewise
+        ``search_core_bucketer``, the built twin of ``search_bucketer`` with its tables / cache (then
+        without ``search_tables`` and ``search_cache_path``).  Buckets are pure functions of the cards, so
+        a shared bucketer changes only the time, not a search (tests/test_core_search_agent.py)."""
         from ..fast import core
-        from ..fast.trainer import core_bucketer, spec_to_dict
+        from ..fast.trainer import core_bucketer as make_core_bucketer
+        from ..fast.trainer import spec_to_dict
 
         c = core()
         if c is None or not hasattr(c, "SubgameSearch"):
@@ -139,12 +184,53 @@ class SearchResources:
         if not hasattr(blueprint, "lookup"):
             raise TypeError("the search needs the C++ blueprint lookup (load_blueprint(path, backend='cpp'))")
         t0 = time.perf_counter()
-        cbk = core_bucketer(bucketer, tuple(cache_caps))
-        loaded = cbk.load_cache(cache_path) if cache_path else None
-        game = c.SearchGame(spec_to_dict(spec), cbk, blueprint.lookup)
+        if core_bucketer is not None:
+            if cache_path:
+                raise ValueError("cache_path with a shared core_bucketer: load the cache into that bucketer once")
+            _check_twin(bucketer, core_bucketer, "core_bucketer")
+            cbk, loaded = core_bucketer, None
+        else:
+            cbk = make_core_bucketer(bucketer, tuple(cache_caps))
+            loaded = cbk.load_cache(cache_path) if cache_path else None
+        scbk = sloaded = None
+        if search_bucketer is not None:
+            if search_core_bucketer is not None:
+                if search_tables or search_cache_path:
+                    raise ValueError("search_tables / search_cache_path with a shared search_core_bucketer: they are its own")
+                _check_twin(search_bucketer, search_core_bucketer, "search_core_bucketer")
+                scbk = search_core_bucketer
+            else:
+                scbk = make_core_bucketer(search_bucketer, tuple(cache_caps), tables=search_tables)
+            if scbk.identity == cbk.identity:  # the blueprint's own buckets: one abstraction
+                search_bucketer = scbk = None
+            elif search_cache_path:  # into the bucketer itself (a table wrapper answers from its table first)
+                sloaded = getattr(scbk, "inner", scbk).load_cache(search_cache_path)
+        elif search_core_bucketer is not None:
+            raise ValueError("search_core_bucketer without the Python search_bucketer it is the twin of")
+        game = c.SearchGame(spec_to_dict(spec), cbk, blueprint.lookup, search_bucketer=scbk)
         if presample_seed is not None:
             game.presample(presample_seed)
-        return cls(spec, bucketer, cbk, blueprint, game, loaded, time.perf_counter() - t0)
+        return cls(spec, bucketer, cbk, blueprint, game, loaded, time.perf_counter() - t0, search_bucketer, scbk, sloaded)
+
+    def describe_buckets(self) -> str:
+        """One line on the card abstractions: the blueprint's, and the subgame's after the root's round."""
+        def one(py_bk, core_bk) -> str:
+            exact = " exact" if getattr(py_bk, "exact", False) else ""
+            tables = ", bucket tables" if type(core_bk).__name__ == "TabulatedBucketer" else ""
+            return f"{py_bk.n_buckets}{exact} {getattr(py_bk, 'kind', 'ehs')}{tables}"
+
+        later = "the blueprint's" if self.search_core_bucketer is None else one(self.search_bucketer, self.search_core_bucketer)
+        return f"buckets: blueprint {one(self.bucketer, self.core_bucketer)}; the subgame's rounds after its root: {later}"
+
+
+def _check_twin(py_bucketer, cpp_bucketer, what: str) -> None:
+    """A shared C++ bucketer must be the twin of the Python one (same kind and fitted numbers): the
+    identity of a fresh twin (no cache, no tables: cheap) against the given one's."""
+    from ..fast.trainer import core_bucketer
+
+    want = core_bucketer(py_bucketer, (0, 0, 0), tables="").identity
+    if cpp_bucketer.identity != want:
+        raise ValueError(f"{what} is not the C++ twin of the Python bucketer ({cpp_bucketer.identity} != {want})")
 
 
 @dataclass
@@ -157,7 +243,7 @@ class SearchStats:
     preflop_reasons: Counter = field(default_factory=Counter)  # why a preflop decision was searched
     inserted: int = 0                                          # searches whose path held an off-grid size
     off_map: int = 0                                           # decisions played by a default without a strategy
-    errors: Counter = field(default_factory=Counter)
+    errors: Counter = field(default_factory=Counter)           # searches that failed (by message): the blueprint played
 
     @property
     def n_decisions(self) -> int:
@@ -166,6 +252,11 @@ class SearchStats:
     @property
     def n_searches(self) -> int:
         return sum(self.searches.values())
+
+    @property
+    def n_errors(self) -> int:
+        """Searches that failed (e.g. out of memory growing the node table) and fell back to the blueprint."""
+        return sum(self.errors.values())
 
     def off_map_rate(self) -> float:
         return self.off_map / self.n_decisions if self.n_decisions else 0.0
@@ -178,7 +269,8 @@ class SearchStats:
             parts.append(f"{names.get(s, s)} {n:,} x {self.seconds[s] / n:.2f}s, {self.iterations[s] / n:,.0f} it")
         if self.preflop_reasons:
             parts.append("preflop searched: " + ", ".join(f"{k} {v}" for k, v in sorted(self.preflop_reasons.items())))
-        parts.append(f"inserted sizes {self.inserted:,}; off the map {self.off_map:,} ({100 * self.off_map_rate():.2f}%)")
+        parts.append(f"inserted sizes {self.inserted:,}; off the map {self.off_map:,} ({100 * self.off_map_rate():.2f}%); "
+                     f"search errors {self.n_errors:,} (fallback to the blueprint)")
         if self.errors:
             parts.append("errors: " + "; ".join(f"{k} x{v}" for k, v in self.errors.most_common(3)))
         return "; ".join(parts)
@@ -188,6 +280,15 @@ def add_search_args(ap) -> None:
     """The search agent's command-line flags (scripts/play_slumbot.py, scripts/eval_archetypes.py)."""
     ap.add_argument("--cache", default=None, help="saved bucket cache (scripts/precompute_buckets.py); without it the "
                     "first searches on a board compute their flop / turn buckets (slow)")
+    ap.add_argument("--search-buckets", default=None,
+                    help="the subgame's own card abstraction for the rounds after the root's (a buckets JSON, e.g. 64 exact "
+                         "potential-aware buckets; default: the blueprint's --buckets); ranges, rollouts and blueprint "
+                         "lookups keep --buckets")
+    ap.add_argument("--search-tables", default=None,
+                    help="bucket-table directory with the table of --search-buckets (scripts/build_bucket_table.py; default "
+                         "$NEGPLURIBUS_BUCKET_TABLES); without a table or --search-cache an exact bucketer computes every "
+                         "new turn bucket")
+    ap.add_argument("--search-cache", default=None, help="saved bucket cache of --search-buckets (scripts/precompute_buckets.py)")
     ap.add_argument("--search-budget", type=float, default=2.0, help="seconds per searched decision")
     ap.add_argument("--search-street-budgets", default="", help='per street, e.g. "flop=3,turn=2,river=1" (others: --search-budget)')
     ap.add_argument("--search-iterations", type=int, default=0, help="a fixed number of iterations per search instead of the clock")
@@ -206,6 +307,17 @@ def add_search_args(ap) -> None:
     ap.add_argument("--no-preflop-search", action="store_true",
                     help="never search preflop: the blueprint translates every size (unknown keys: its check/call)")
     ap.add_argument("--presample", action="store_true", help="rollouts play pre-sampled blueprint actions (leaves only)")
+    ap.add_argument("--search-vector", action="store_true",
+                    help="vector Linear CFR where it applies (2 live players, turn / river root, no leaves); elsewhere the MCCFR")
+    ap.add_argument("--search-vector-iterations", default="",
+                    help='vector-CFR iterations per street, e.g. "turn=300,river=600" (others: the street\'s time budget)')
+    ap.add_argument("--search-river-exact", action="store_true",
+                    help="with --search-vector on a turn root: river infosets by exact hand strength, not the subgame's buckets")
+    ap.add_argument("--search-river-buckets", type=int, default=0,
+                    help="with --search-vector on a turn root: the river by K strength buckets shared by the river cards "
+                         "(0: the subgame's buckets, --search-buckets or the blueprint's)")
+    ap.add_argument("--search-vector-discount", choices=("linear", "cfr+", "dcfr"), default="linear",
+                    help="the vector CFR's weighting (the MCCFR is always Linear)")
 
 
 def search_config_from_args(args) -> "SearchConfig":
@@ -217,7 +329,12 @@ def search_config_from_args(args) -> "SearchConfig":
                         search_to_street={"flop": 1, "turn": 2, "river": 3}[args.search_to_street],
                         threads=args.search_threads, play=args.search_play,
                         depth=args.search_depth, preflop_offgrid=float("inf") if no_pre else args.preflop_offgrid,
-                        preflop_unknown=not no_pre)
+                        preflop_unknown=not no_pre, vector_cfr=getattr(args, "search_vector", False),
+                        vector_street_iterations={k: int(v) for k, v in
+                                                  parse_street_budgets(getattr(args, "search_vector_iterations", "")).items()},
+                        river_exact=getattr(args, "search_river_exact", False),
+                        river_buckets=getattr(args, "search_river_buckets", 0),
+                        vector_discount={"linear": 0, "cfr+": 1, "dcfr": 2}[getattr(args, "search_vector_discount", "linear")])
 
 
 def raise_offgrid_distance(obs: Observation, amount: int, grid) -> float:
@@ -417,7 +534,12 @@ class CoreSearchAgent(Agent):
             self.res.game, self._starting_stacks(obs), obs.button, actions, list(obs.board), obs.seat, list(obs.hole),
             iterations=iters, time_budget=0.0 if iters > 0 else budget,
             threads=self.cfg.threads, seed=self.rng.getrandbits(32), focus=self.cfg.focus, min_prob=self.cfg.min_prob,
-            linear=True, overrides=overrides or None, depth=self.cfg.depth, rollouts=self.cfg.rollouts, bias=self.cfg.bias)
+            linear=True, overrides=overrides or None, depth=self.cfg.depth, rollouts=self.cfg.rollouts, bias=self.cfg.bias,
+            vector_cfr=self.cfg.vector_cfr, river_exact=self.cfg.river_exact, river_buckets=self.cfg.river_buckets,
+            vector_discount=self.cfg.vector_discount)
+        if self.cfg.vector_cfr and s.vector_eligible:
+            vi = int(self.cfg.vector_street_iterations.get(street, 0))
+            s.set_budget(vi, 0.0 if vi > 0 else budget)
         r = s.solve()
         probs = r["average"] if self.cfg.play == "average" else r["final"]
         # the uniform draw comes from the inner blueprint agent's stream, where a BlueprintAgent reset

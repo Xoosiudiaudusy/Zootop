@@ -219,7 +219,8 @@ def hand_from_slumbot(rec: dict, hand_id: Optional[int] = None) -> Optional[Aiva
 def hand_from_duel(rec: dict, stack: int = 20000, sb: int = 50, bb: int = 100, hand_id: int = 0,
                    known: str = "hero") -> AivatHand:
     """A hand line of scripts/eval_archetypes.py --log-hands (heads-up): holes, board, events
-    [street, seat, type, amount], hero_seat, button, net_bb.  The board is cut to what was dealt.
+    [street, seat, type, amount], hero_seat, button, net_bb, and the starting stacks in chips ("stacks";
+    lines written before it had them: ``stack`` for both seats).  The board is cut to what was dealt.
     ``known``: "hero" (the logged hero is the known player) or "villain" (the other seat: in a duel
     search agent vs blueprint agent, the blueprint; its AIVAT value estimates minus the hero's result)."""
     hero = int(rec["hero_seat"])
@@ -229,7 +230,8 @@ def hand_from_duel(rec: dict, stack: int = 20000, sb: int = 50, bb: int = 100, h
     net_hero = int(round(float(rec["net_bb"]) * bb))
     holes = tuple(tuple(int(c) for c in h) for h in rec["holes"])
     acts = tuple((int(e[2]), int(e[3])) for e in rec["events"])
-    h = AivatHand(hand_id=hand_id, stacks=(stack, stack), button=int(rec["button"]), sb=sb, bb=bb,
+    stacks = tuple(int(s) for s in rec["stacks"]) if rec.get("stacks") else (stack, stack)
+    h = AivatHand(hand_id=hand_id, stacks=stacks, button=int(rec["button"]), sb=sb, bb=bb,
                   known_seat=seat, holes=holes, board=tuple(int(c) for c in rec["board"]), actions=acts,
                   net=net_hero if seat == hero else -net_hero, pair=int(rec["deal"]))
     st = h.new_state()

@@ -9,6 +9,14 @@
         --buckets data/buckets_hunl200w3_pot16_s0.json --cache data/bucketcache_hunl200w3_pot16_s0.bin \
         --agent search --search-budget 0.5 --opponents blueprint --deals 1000 --log data/duel.jsonl
 
+    # the same, the subgame's turn and river on 64 exact buckets of its own (the blueprint keeps its 16)
+    ... --agent search --search-buckets data/buckets_hunl200w3_pot64x_s0.json --search-tables data/bucket_tables
+
+    # the depth grid (one blueprint per stack depth, picked per hand) at 50bb against the single 200bb blueprint
+    python scripts/eval_archetypes.py --spec 2p_50bb_river --preflop-fracs 0.5,1.0,3.0 --postflop-fracs 0.5,1.0,2.0,4.0 \
+        --agent grid --grid-manifest data/stack_grid_pot16_s0.json --tables data/bucket_tables --opponents blueprint \
+        --blueprint data/blueprint_hunl200w3_pot16_s0.bin --buckets data/buckets_hunl200w3_pot16_s0.json --log-hands h.jsonl
+
 Opponents: the archetypes, "random" (arbitrary chip amounts: tests action translation too),
 "gridrandom" (uniform over the blueprint's own grid: no translation, tests the abstraction alone),
 "blueprint" (the blueprint agent on --blueprint: a duel against the hero's own blueprint) and
@@ -21,7 +29,16 @@ a C++ subgame search at every decision from the flop; --search-* flags).  Heads-
 (or any hero with --luck) is also scored with the card-luck correction (chance nodes, exact equities;
 negpluribus/eval/duel.py: the same decks and seeds as duplicate_match), and the hero's seconds per
 hand are timed.  --log writes one JSON line per deal (raw and corrected results, seconds), so a long
-match can be read while it runs; --progress prints every N deals.
+match can be read while it runs; --progress prints every N deals.  A search that fails (e.g. out of memory
+growing its node table) is played by the blueprint: the summary line counts them ("search errors N (fallback to
+the blueprint)", next to "off the map"), and --log-hands marks such a decision played "blueprint after a search
+error" with its error.
+"grid" (negpluribus/agents/stack_grid.py): a StackGridAgent over the blueprint agents of the points of
+--grid-manifest (one bucketer for all, on --tables; at most --grid-max-loaded points in memory), the point
+picked per hand by the effective stack; --blueprint / --buckets are then only the opponents' (blueprint,
+overbettor).  --log-hands writes the point and its blueprint with every hero decision, and with the first
+one the effective stack and the review's alternatives (docs/stack_grid_design.md 6.4); every hand line has
+the starting stacks ("stacks", chips).
 The Python evaluation is the reference; the blueprint answers through its own abstraction,
 exactly as at the table.  --blueprint takes either format (binary .bin or JSON); with the C++
 core built the strategy is looked up in C++ (the same probabilities, a tenth of the memory;
@@ -43,6 +60,7 @@ from negpluribus.agents.blueprint import BlueprintAgent  # noqa: E402
 from negpluribus.agents.core_search import CoreSearchAgent, SearchResources, add_search_args, search_config_from_args  # noqa: E402
 from negpluribus.agents.gridrandom import GridRandomAgent  # noqa: E402
 from negpluribus.agents.overbettor import ValueOverbettor  # noqa: E402
+from negpluribus.agents.stack_grid import StackGrid  # noqa: E402
 from negpluribus.cfr import GameSpec  # noqa: E402
 from negpluribus.engine import Street  # noqa: E402
 from negpluribus.eval import duplicate_match  # noqa: E402
@@ -51,6 +69,40 @@ from negpluribus.fast.blueprint import load_blueprint  # noqa: E402
 from negpluribus.fast.power import disable_power_throttling  # noqa: E402
 
 STREETS = {"preflop": Street.PREFLOP, "flop": Street.FLOP, "turn": Street.TURN, "river": Street.RIVER}
+# what --log-hands keeps of each hero decision (decision_info() of the agent plus the duel's street, seconds, action)
+HERO_KEYS = ("street", "s", "action", "played", "reason", "iterations", "inserted", "off_map", "error",
+             "point", "blueprint", "eff_bb", "eff_min_bb", "eff_median_bb", "point_min", "point_median")
+
+
+def memory_line() -> str:
+    """This process's memory (Windows: working set, its peak and private bytes; elsewhere the peak RSS)."""
+    try:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            class Counters(ctypes.Structure):
+                _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                            ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                            ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t)]
+
+            c = Counters()
+            c.cb = ctypes.sizeof(c)
+            psapi, kernel32 = ctypes.WinDLL("psapi"), ctypes.WinDLL("kernel32")
+            kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+            psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+            if not psapi.GetProcessMemoryInfo(kernel32.GetCurrentProcess(), ctypes.byref(c), c.cb):
+                return "memory: unknown"
+            mb = 1 << 20
+            return (f"memory: working set {c.WorkingSetSize / mb:,.0f} MB (peak {c.PeakWorkingSetSize / mb:,.0f}), "
+                    f"private {c.PagefileUsage / mb:,.0f} MB (peak {c.PeakPagefileUsage / mb:,.0f})")
+        import resource
+
+        return f"memory: peak RSS {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024:,.0f} MB"
+    except Exception as e:  # a report line only
+        return f"memory: unknown ({type(e).__name__})"
 
 
 def main() -> None:
@@ -71,7 +123,9 @@ def main() -> None:
     ap.add_argument("--deals", type=int, default=100000, help="duplicate deals per opponent (100k = 200k hands, +/- 4..10 bb/100 in HUNL 100bb)")
     ap.add_argument("--first-deal", type=int, default=0, help="start at this deal (continue a match on the same decks)")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--agent", choices=("blueprint", "search"), default="blueprint", help="the hero")
+    ap.add_argument("--agent", choices=("blueprint", "search", "grid"), default="blueprint", help="the hero")
+    ap.add_argument("--grid-manifest", default=None, help="--agent grid: the depth grid's manifest (data/stack_grid_*.json)")
+    ap.add_argument("--grid-max-loaded", type=int, default=4, help="--agent grid: points kept in memory at once (LRU)")
     ap.add_argument("--overbet-mult", type=float, default=2.5, help="the overbettor's size: this x the largest grid size")
     ap.add_argument("--log", default=None, help="append one JSON line per deal (per opponent) to this file")
     ap.add_argument("--log-hands", default=None, help="append one JSON line per hand: cards, actions, the hero's net and "
@@ -96,15 +150,20 @@ def main() -> None:
     res = None
     if args.agent == "search":
         res = SearchResources.load(spec, args.blueprint, bucketer=bk, cache_path=args.cache,
-                                   presample_seed=args.seed if args.presample else None)
+                                   presample_seed=args.seed if args.presample else None,
+                                   search_buckets_path=args.search_buckets, search_tables=args.search_tables,
+                                   search_cache_path=args.search_cache)
         bp = res.blueprint
         cfg = search_config_from_args(args)
         print(f"search agent: {cfg}")
         print(f"resources loaded in {res.load_seconds:.1f}s (bucket cache: {res.cache_loaded})")
+        if args.search_buckets:
+            print(f"{res.describe_buckets()} ({args.search_buckets}; its cache: {res.search_cache_loaded})")
     else:
         bp = load_blueprint(args.blueprint)
     print(f"game: {spec.describe()}")
-    print(f"blueprint: {len(bp):,} infosets ({args.blueprint})")
+    what = "blueprint of the opponents" if args.agent == "grid" else "blueprint"
+    print(f"{what}: {len(bp):,} infosets ({args.blueprint})")
 
     def for_play(bucketer):  # the bucketer a Python agent uses at the table
         if not args.tables:
@@ -114,6 +173,21 @@ def main() -> None:
         return tabulated(core_bucketer(bucketer), args.tables)
 
     bk_play = for_play(bk)
+    grid_def = grid_make = None
+    if args.agent == "grid":
+        from negpluribus.fast.trainer import core_bucketer
+
+        if not args.grid_manifest:
+            ap.error("--agent grid needs --grid-manifest")
+        grid_def = StackGrid.load(args.grid_manifest)
+        if (grid_def.preflop_fracs, grid_def.postflop_fracs, grid_def.max_raises) != (spec.preflop_fracs, spec.postflop_fracs,
+                                                                                      spec.max_raises_per_street):
+            ap.error(f"the grid's bets {grid_def.preflop_fracs} / {grid_def.postflop_fracs} / {grid_def.max_raises} raises "
+                     f"differ from this game's {spec.preflop_fracs} / {spec.postflop_fracs} / {spec.max_raises_per_street}")
+        grid_bk = load_bucketer(grid_def.resolve(grid_def.bucketer))
+        grid_make = grid_def.blueprint_factory(for_play(grid_bk), spec.grid, name="hero",
+                                               bucketer_identity=core_bucketer(grid_bk, (0, 0, 0), tables="").identity)
+        print(grid_def.describe())
     obp, obk = bp, bk_play
     if args.opponent_blueprint:
         obp = load_blueprint(args.opponent_blueprint)
@@ -124,6 +198,9 @@ def main() -> None:
         t = time.perf_counter()
         if args.agent == "search":
             hero = CoreSearchAgent(res, cfg, seed=1, name="hero")
+        elif args.agent == "grid":
+            hero = grid_def.agent(grid_make, max_loaded=args.grid_max_loaded, fallback_stack_bb=spec.stack_bb, seed=1,
+                                  name="hero")
         else:
             hero = BlueprintAgent(bp, bk_play, spec.grid, seed=1, name="hero")
         if opp == "gridrandom":
@@ -156,17 +233,17 @@ def main() -> None:
                 log.flush()
             if args.progress and r.n_deals % args.progress == 0:
                 extra = f"; searches {hero.stats.summary()}" if args.agent == "search" else ""
+                extra += f"; {hero.summary()}" if args.agent == "grid" else ""
                 print(f"    {opp} deal {r.n_deals}: {r.line()}, {time.perf_counter() - t0:.0f}s{extra}", flush=True)
 
         hand_log = open(args.log_hands, "a", encoding="utf-8") if args.log_hands else None
 
         def on_hand(d, seat, rec, luck_bb, infos, opp=opp):
             row = {"opponent": opp, "agent": args.agent, "deal": d, "hero_seat": seat, "button": rec.button,
-                   "holes": rec.hole_cards, "board": rec.board,
+                   "stacks": list(rec.starting_stacks), "holes": rec.hole_cards, "board": rec.board,
                    "events": [[int(e.street), e.seat, int(e.action.type), int(e.action.amount)] for e in rec.events],
                    "net_bb": rec.net[seat] / spec.bb, "luck_bb": None if luck_bb is None else round(luck_bb, 4),
-                   "hero": [{k: v for k, v in i.items() if k in ("street", "s", "action", "played", "reason", "iterations",
-                                                                   "inserted", "off_map")} for i in infos]}
+                   "hero": [{k: v for k, v in i.items() if k in HERO_KEYS} for i in infos]}
             hand_log.write(json.dumps(row) + "\n")
             hand_log.flush()
 
@@ -180,6 +257,8 @@ def main() -> None:
         print(f"  vs {opp:>8}: {r.line()}, off-map {hero.fallback_rate:.1%}, {time.perf_counter() - t:.0f}s", flush=True)
         if args.agent == "search":
             print(f"             {hero.stats.summary()}", flush=True)
+        if args.agent == "grid":
+            print(f"             {hero.summary()}; {memory_line()}", flush=True)
         if opp == "overbettor":
             print(f"             overbets made: {sum(v.n_overbets for v in vils):,}", flush=True)
 

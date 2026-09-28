@@ -821,3 +821,149 @@ def test_bucket_caches_save_load_and_river_batch(bucketer, tmp_path):
             else:
                 assert allb[core.combo_index(a, b)] == pot.bucket([a, b], board)
     assert cbk.river_buckets_all(rng.sample(range(52), 5)) is None
+
+
+# ============================================================ the subgame's own abstraction after the root's round
+@pytest.fixture(scope="module")
+def fine_bucketer():
+    """Potential-aware buckets three times as fine as the fixture blueprint's 8 E[HS] ones: the subgame's own
+    abstraction for the rounds after its root's."""
+    from negpluribus.abstraction import PotentialAwareBucketer
+
+    return PotentialAwareBucketer(n_buckets=24, samples=6, bins=10).fit(n_situations=200, seed=5)
+
+
+def _solve_one(game, st, acts, **kw):
+    """(search, the solve's numbers, every seat's likelihood) on one thread, seed 3: deterministic."""
+    s = make_search(game, st, acts, time_budget=0.0, threads=1, seed=3, **kw)
+    r = s.solve()
+    keep = ("final", "average", "average_table", "iterations", "table_size", "nodes_touched", "forced", "leaves", "leaf_evals",
+            "rollouts", "rollout_steps")
+    return s, {k: r[k] for k in keep}, [s.likelihood(p) for p in range(st.n)]
+
+
+def test_a_search_bucketer_with_the_blueprint_buckets_is_the_same_search(trained, bucketer):
+    """A second C++ bucketer with the blueprint's buckets as the subgame's own (so the separate code path: tables of its
+    own, the blueprint's river table only for rollouts) gives the same search bit for bit on one thread: flop, turn and
+    river roots, every depth rule, the ranges and likelihoods, the exact evaluator; also on potential-aware buckets,
+    whose river tables are built per abstraction."""
+    from negpluribus.abstraction import PotentialAwareBucketer
+    from negpluribus.fast.trainer import core_bucketer, spec_to_dict
+
+    spec, t, game, cbk = trained[2]
+    same = core.SearchGame(spec_to_dict(spec), cbk, t.blueprint().lookup, search_bucketer=core_bucketer(bucketer))
+    assert same.separate_buckets and not game.separate_buckets
+    cases = ((["r1", "c"], "end", 2000), (["r1", "c"], "hu_flop_limit", 1000), (["r1", "c", "c", "c"], "end", 5000),
+             (["r1", "c", "c", "c"], "next_street", 3000), (["r1", "c", "c", "c", "c", "c"], "end", 5000))
+    for line, depth, iters in cases:
+        st, acts = line_hand(spec, line)
+        a, ra, la = _solve_one(game, st, acts, iterations=iters, depth=depth)
+        b, rb, lb = _solve_one(same, st, acts, iterations=iters, depth=depth)
+        assert ra == rb and la == lb and a.ranges() == b.ranges(), (line, depth)
+        if st.street == Street.TURN:
+            br = 2 if depth == "end" else 7
+            assert a.subgame_exploitability(0, br) == b.subgame_exploitability(0, br), (line, depth)
+    # potential-aware buckets (river tables from the batch), flop roots with and without leaves
+    pot = PotentialAwareBucketer(n_buckets=8, samples=6, bins=10).fit(n_situations=120, seed=3)
+    pspec = GameSpec(n_players=2, stack_bb=30, max_street=Street.RIVER, n_buckets=8, max_raises_per_street=2,
+                     preflop_fracs=(1.0,), postflop_fracs=(0.5, 1.0), bucket_kind="potential")
+    pbk = core_bucketer(pot)
+    lookup = MCCFRTrainer(pspec, pot, seed=1, backend="cpp", threads=1).train(2000).blueprint().lookup
+    pgame = core.SearchGame(spec_to_dict(pspec), pbk, lookup)
+    psame = core.SearchGame(spec_to_dict(pspec), pbk, lookup, search_bucketer=core_bucketer(pot))
+    st, acts = line_hand(pspec, ["r1", "c"])
+    for depth, iters in (("end", 2000), ("hu_flop_limit", 1000)):
+        a, ra, la = _solve_one(pgame, st, acts, iterations=iters, depth=depth)
+        b, rb, lb = _solve_one(psame, st, acts, iterations=iters, depth=depth)
+        assert ra == rb and la == lb, depth
+        info = b.root_info()
+        assert info["river_table_boards"] == 1176 and info["blueprint_river_table_boards"] == (1176 if depth != "end" else 0)
+    with pytest.raises(ValueError, match="not fitted"):
+        core.SearchGame(spec_to_dict(spec), cbk, t.blueprint().lookup, search_bucketer=core.PotentialBucketer(8, 6, 10, {}, {}, None, False))
+
+
+def test_the_subgame_keys_its_later_rounds_on_its_own_bucketer(trained, fine_bucketer):
+    """With a finer bucketer of its own (24 potential-aware buckets against the blueprint's 8 E[HS]): the subgame's turn
+    and river infosets are keyed by it (about three times as many, buckets up to 23), while the ranges, the rollouts from
+    leaves and the blueprint's rows in the evaluator stay on the blueprint's buckets (bit for bit the search without it);
+    the exact evaluator runs on it."""
+    from negpluribus.fast.trainer import core_bucketer, spec_to_dict
+
+    spec, t, game, cbk = trained[2]
+    fcbk = core_bucketer(fine_bucketer)
+    fine = core.SearchGame(spec_to_dict(spec), cbk, t.blueprint().lookup, search_bucketer=fcbk)
+    # a flop root searched to the end of the hand: its turn and river infosets on the fine buckets
+    st, acts = line_hand(spec, ["r1", "c"])
+    a, ra, _ = _solve_one(game, st, acts, iterations=5000, depth="end")
+    b, rb, _ = _solve_one(fine, st, acts, iterations=5000, depth="end")
+    assert a.ranges() == b.ranges()
+    ca, cb = a._later_infosets(), b._later_infosets()
+    assert set(ca) == set(cb) == {int(Street.TURN), int(Street.RIVER)}
+    for street in (Street.TURN, Street.RIVER):
+        assert ca[street][1] <= 7 and 8 <= cb[street][1] <= 23, (ca, cb)  # keys past the blueprint's 8 buckets
+        assert cb[street][0] > 2 * ca[street][0], (ca, cb)                 # about 24 / 8 as many infosets
+    assert rb["table_size"] > ra["table_size"]
+    # the buckets the search reads: its own for its infosets, the blueprint's for rollouts
+    rng = random.Random(6)
+    free = [c for c in range(52) if c not in st.board]
+    for _ in range(200):
+        cards = rng.sample(free, 4)
+        hole, extra = cards[:2], cards[2:]
+        for n in (1, 2):
+            board = list(st.board) + extra[:n]
+            assert b._later_bucket(hole[0], hole[1], board) == fcbk.bucket(hole, board)
+            assert b._later_bucket(hole[0], hole[1], board, blueprint=True) == cbk.bucket(hole, board)
+            assert a._later_bucket(hole[0], hole[1], board) == a._later_bucket(hole[0], hole[1], board, True) == cbk.bucket(hole, board)
+    # leaves at the next round's start (rollouts on the blueprint's buckets, no later round of its own): the same search
+    for line, depth in ((["r1", "c"], "hu_flop_limit"), (["r1", "c", "c", "c"], "next_street")):
+        st, acts = line_hand(spec, line)
+        a, ra, la = _solve_one(game, st, acts, iterations=2000, depth=depth)
+        b, rb, lb = _solve_one(fine, st, acts, iterations=2000, depth=depth)
+        assert ra == rb and la == lb and rb["rollouts"] > 0 and b._later_infosets() == {}, depth
+        if st.street == Street.TURN:  # the continuations in the evaluator: the blueprint's buckets
+            assert a.subgame_exploitability(0, 7) == b.subgame_exploitability(0, 7)
+    # the exact evaluator at a turn root: the blueprint's rows identical, the search's own river on the fine buckets
+    st, acts = line_hand(spec, ["r1", "c", "c", "c"])
+    a, ra, _ = _solve_one(game, st, acts, iterations=20000, depth="end")
+    b, rb, _ = _solve_one(fine, st, acts, iterations=20000, depth="end")
+    assert b._later_infosets()[int(Street.RIVER)][1] > 7
+    assert a.subgame_exploitability(2, 2) == b.subgame_exploitability(2, 2)  # the blueprint as the agent plays it
+    full, river = b.subgame_exploitability(0, 2), b.subgame_exploitability(0, 3)
+    assert abs(full[3] + full[4]) < 1e-9 and full[3] == river[3]
+    assert min(full[1], full[2], river[1], river[2]) > -1e-9 and river[1] <= full[1] + 1e-9 and river[2] <= full[2] + 1e-9
+    # a river root has no later round: the same search
+    st, acts = line_hand(spec, ["r1", "c", "c", "c", "c", "c"])
+    a, ra, la = _solve_one(game, st, acts, iterations=3000, depth="end")
+    b, rb, lb = _solve_one(fine, st, acts, iterations=3000, depth="end")
+    assert ra == rb and la == lb and a.river_exploitability(0) == b.river_exploitability(0)
+
+
+def test_the_vector_cfr_keys_the_river_on_the_subgame_bucketer(trained, bucketer, fine_bucketer):
+    """The vector CFR at a turn root keys its river rows on the subgame's own bucketer, as the MCCFR's card parts and
+    the exact evaluator's own rows do: a second C++ bucketer with the blueprint's buckets gives the same search bit for
+    bit (one thread); a finer one (24 potential-aware buckets against the blueprint's 8) keys river infosets past bucket
+    7, about three times as many, which the evaluator reads; with river_buckets K the K strength buckets key the river
+    instead, and river_exact keeps its river rows out of the table."""
+    from negpluribus.fast.trainer import core_bucketer, spec_to_dict
+
+    spec, t, game, cbk = trained[2]
+    same = core.SearchGame(spec_to_dict(spec), cbk, t.blueprint().lookup, search_bucketer=core_bucketer(bucketer))
+    fine = core.SearchGame(spec_to_dict(spec), cbk, t.blueprint().lookup, search_bucketer=core_bucketer(fine_bucketer))
+    st, acts = line_hand(spec, ["r1", "c", "c", "c"])
+    assert st.street == Street.TURN
+    a, ra, la = _solve_one(game, st, acts, iterations=300, depth="end", vector_cfr=True)
+    assert a.vector_eligible
+    b, rb, lb = _solve_one(same, st, acts, iterations=300, depth="end", vector_cfr=True)
+    assert ra == rb and la == lb and a.ranges() == b.ranges()
+    assert a.subgame_exploitability(0, 2) == b.subgame_exploitability(0, 2)
+    f, rf, _ = _solve_one(fine, st, acts, iterations=300, depth="end", vector_cfr=True)
+    ca, cf = a._later_infosets(), f._later_infosets()
+    assert ca[int(Street.RIVER)][1] <= 7 and 8 <= cf[int(Street.RIVER)][1] <= 23, (ca, cf)
+    assert cf[int(Street.RIVER)][0] > 2 * ca[int(Street.RIVER)][0], (ca, cf)
+    full, river = f.subgame_exploitability(0, 2), f.subgame_exploitability(0, 3)
+    assert abs(full[3] + full[4]) < 1e-9 and full[3] == river[3]
+    assert min(full[1], full[2], river[1], river[2]) > -1e-9 and river[1] <= full[1] + 1e-9 and river[2] <= full[2] + 1e-9
+    k, _, _ = _solve_one(fine, st, acts, iterations=300, depth="end", vector_cfr=True, river_buckets=12)
+    assert k._later_infosets()[int(Street.RIVER)][1] == 11
+    x, _, _ = _solve_one(fine, st, acts, iterations=30, depth="end", vector_cfr=True, river_exact=True)
+    assert int(Street.RIVER) not in x._later_infosets() and x.river_bytes > 0

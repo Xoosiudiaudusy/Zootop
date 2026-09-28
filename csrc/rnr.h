@@ -16,6 +16,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "workers.h"
 #include "mccfr.h"
 
 namespace negp {
@@ -121,33 +122,35 @@ public:
         // hyperthread) do more of them instead of waiting for the slowest thread at the end;
         // each thread still draws its deals from its own RNG stream.
         std::atomic<long long> next{base + 1};
+        WorkerErrors errs;
         auto work = [&](int tid) {
             ThreadCtx& ctx = ctxs_[tid];
             if (T == 1) {
                 for (long long t = base + 1; t <= target; t++) run_iteration(t, ctx);
             } else {
                 for (;;) {
+                    if (errs.failed.load(std::memory_order_relaxed)) break;  // another worker failed: stop
                     const long long lo = next.fetch_add(ITER_CHUNK, std::memory_order_relaxed);
                     if (lo > target) break;
                     const long long hi = lo + ITER_CHUNK - 1 < target ? lo + ITER_CHUNK - 1 : target;
                     for (long long t = lo; t <= hi; t++) run_iteration(t, ctx);
                 }
             }
-            group_.leave();
         };
-        if (T == 1) {
-            work(0);
-        } else {
-            std::vector<std::thread> pool;
-            for (int t = 1; t < T; t++) pool.emplace_back(work, t);
-            work(0);
-            for (auto& th : pool) th.join();
-        }
+        run_workers(T, errs, work, [&](int) { group_.leave(); });
         group_.end();
+        if (errs.failed.load())  // updates are applied as the iterations run: the tables hold part of them
+            throw std::runtime_error("RNR training failed: " + errs.message() + ". The tables hold part of the iterations after " +
+                                     std::to_string(iteration_) + " (the last completed train() call): do not save them; "
+                                     "resume from the last checkpoint on disk");
         iteration_ = target;
         long long touched = 0;
         for (auto& c : ctxs_) { touched += c.nodes_touched; c.nodes_touched = 0; }
         nodes_touched_ += touched;
+        if (group_.failed())  // a growth that failed after the last lookup (in the last leave() or in end()): every iteration ran
+            throw std::runtime_error("RNR training ran the iterations to " + std::to_string(iteration_) + ", then " + group_.failure() +
+                                     ". The tables are those of iteration " + std::to_string(iteration_) +
+                                     " (whole); the next train() tries the growth again");
         checker_.rethrow();
     }
 

@@ -48,7 +48,7 @@ call, 2 raise), `board` the real board so far, `seat` / `hole` ours; it must be 
 * **Fixed**: our actions already taken in this round are forced for our actual hole only (exact
   cards); our other holes and every opponent decide freely.
 * **Cards**: the current round is lossless: one infoset per canonical form of hole + board (the
-  169 classes preflop); later rounds use the blueprint's buckets.
+  169 classes preflop); later rounds use the blueprint's buckets (or, since part 4, an abstraction of the subgame's own).
 * **Solver**: Linear external-sampling MCCFR on `threads` threads to the end of the hand, stopping
   at `iterations` or `time_budget` seconds.  A deal draws every live hole independently from its
   range and redraws on a shared card (exactly the joint distribution); the rest of the board is
@@ -847,3 +847,216 @@ new search runs with a time budget while other jobs load the machine: they would
    variant of `ValueOverbettor` (about 20 lines and a test, half an hour), and the runs cost about 4 min
    for the blueprint agent (2,500 deals), 28 min for the search agent at 0.5 s (1,000 deals) and
    1.8-2.7 h at 2 s (1,000-1,500 deals).
+
+# Part 4: the subgame's own card abstraction for its later rounds (2026-09-28)
+
+User decision 28.09 («ставьте больше корзин если надо»), for E9 of `docs/search_vs_blueprint.md`: the search keys
+the rounds after its root on an abstraction of its own, independent of the blueprint's.  Pluribus: lossless on the
+current round, 500 buckets per later round inside the subgame (`docs/search_design.md`, supplement).
+
+## Which abstraction does what
+
+| part of a search | abstraction |
+|---|---|
+| infosets on the root's round | lossless, canonical form of hole + board (unchanged) |
+| the subgame's infosets on later rounds (turn and river of a flop root, river of a turn root) and their per-board bucket tables | the subgame's own: `SearchGame.search_bucketer`, the blueprint's `bucketer` when none is given |
+| ranges at the root (Bayes over the blueprint for the rounds before) | the blueprint's |
+| leaves: the continuation choice (keyed by the root-round class) and the rollouts (blueprint lookups) | lossless / the blueprint's |
+| the exact evaluator: the search's own rows / the blueprint's rows (kind 2) and the continuations | the subgame's / the blueprint's |
+| preflop play (the inner `BlueprintAgent`), the preflop classes | the blueprint's |
+
+Heads-up from the flop with `depth="pluribus"` (to the end of the hand) the blueprint enters only through the
+ranges.  A search with leaves (`hu_flop_limit`, preflop roots, three or more players on the flop) plays the rounds
+after its limit by rollouts on the blueprint's buckets, so a subgame bucketer changes nothing there (below: bit for
+bit).  A river root has no later round: the same search whatever the subgame bucketer.
+
+## Using it
+
+```python
+res = SearchResources.load(spec, "data/blueprint_hunl200w3_pot16_s0.bin", "data/buckets_hunl200w3_pot16_s0.json",
+                           cache_path="data/bucketcache_hunl200w3_pot16_s0.bin",
+                           search_buckets_path="data/buckets_hunl200w3_pot64x_s0.json", search_tables="data/bucket_tables")
+# or by hand: core.SearchGame(spec_dict, core_bucketer(bk16), bp.lookup,
+#                             search_bucketer=core_bucketer(bk64, tables="data/bucket_tables"))
+```
+
+Flags (`eval_archetypes.py`, `play_slumbot.py`; `search_bench.py` also takes `--cache` and `--infosets`):
+`--search-buckets <buckets JSON>`, `--search-tables <dir>` (default `$NEGPLURIBUS_BUCKET_TABLES`), `--search-cache
+<file>` (a saved cache of that bucketer, `scripts/precompute_buckets.py`).  A search bucketer with the blueprint's
+identity is the blueprint's (nothing separate).  The exact 64 buckets need their bucket table
+(`data/bucket_tables/buckets_potential_64_98ace2ddfb53c3c0.npbt`, 138,403,197 bytes, made 25.09 with the exact-64
+preparation; it loads in 0.2-0.4 s): without a table or a cache every new turn bucket of a flop root is an exact
+feature (46 exact river equities over 990 opponent holes each), computed inside the searches: measured 3.0 s on one
+thread for one turn card's 1,326 combos (0.000 s from the table), so up to 49 x 3 s of CPU per new flop board.
+
+In C++ (`csrc/search.h`): `SearchGame(spec, bucketer, blueprint, search_bucketer = nullptr)`; the per-board bucket
+tables are kept per abstraction; `SubgameSearch::later_bucket` (the blueprint's: rollouts, the evaluator's blueprint
+rows) and `search_bucket` (the subgame's: `card_part`, `tree_card_part`, the evaluator's own rows);
+`tree_buckets_` (the per-node cache of card parts) is the subgame bucketer's count.  With a separate bucketer the
+blueprint's river table is built only when rollouts need it (a search with leaves) or by the evaluator on demand,
+and the subgame's own river table only when it searches the river.  Test accessors: `_later_bucket(h0, h1, board,
+blueprint=False)`, `_later_infosets()` ({street: (infosets, largest bucket)}); `root_info()` has
+`blueprint_river_table_boards` next to `river_table_boards` (the subgame's own).
+
+## Checks (2026-09-28)
+
+Identical to master without a search bucketer (deterministic, one thread):
+- the node dumps of the main session's `dbg_search_bits.py` (400 iterations, depth `end` / `hu_flop_limit`):
+  identical, 1,174 / 1,227 nodes (after the C++ change and again on the final commit);
+- its `bits_search_runs.sh` (10 duplicate deals, three agent configurations: default, from the turn, to the flop;
+  flop / turn / river 20k / 50k / 100k iterations): the deal and hand logs identical after dropping the timing fields;
+- `tests/test_search_core.py`, `test_search_tree.py`, `test_core_search_agent.py`: 35 passed (the time-budget test
+  `test_solve_respects_budgets_and_returns_distributions` deselected: no time-budgeted searches on the shared machine).
+
+New tests (`test_search_core.py`, `test_core_search_agent.py`):
+- a second C++ bucketer with the blueprint's buckets as the subgame's own (so the separate code path, tables of its
+  own) gives the same search bit for bit: flop, turn and river roots, every depth rule, ranges, likelihoods, the exact
+  evaluator; E[HS] and potential-aware buckets;
+- a bucketer three times as fine (24 potential-aware against the blueprint's 8 E[HS]) keys about three times as many
+  turn and river infosets (2.9-3.0 in the calibration run; the test asks for more than 2; buckets up to 23, the
+  blueprint's never above 7), while the ranges, the
+  searches with leaves (`hu_flop_limit`, `next_street`: rollouts), the blueprint's rows of the evaluator and river roots
+  stay bit for bit the search without it; the evaluator's own rows run on the fine buckets;
+- the agent with a 24-bucket search bucketer plays 12 duplicate deals against the random agent, every postflop
+  decision searched, no errors; a saved cache of the search bucketer loads.
+
+On the production game (the pot16 blueprint of part 3, 3,042,766 infosets; the 64 exact buckets from their table;
+one thread, fixed iterations and seeds; `SP\sbsep\verify64.py`):
+- flop roots with leaves at the turn (`hu_flop_limit`, 20k iterations, 2 boards): the same search bit for bit as
+  with 16 (2.07M and 2.09M rollouts), ranges identical, no infoset after the flop;
+- flop roots to the end (`pluribus`, 20k iterations): ranges identical; turn infosets 32,842 / 32,879 → 103,353 /
+  98,688, river infosets 140,172 / 139,248 → 400,123 / 409,762, largest bucket 15 → 63;
+- turn roots (1M iterations, 3 hands): the exact evaluator runs; the blueprint's rows (kind 2) and the ranges are
+  identical to the 16-bucket search's (table below);
+- river roots (200k iterations, 2 hands): the same search, the same exact exploitability (2.1917, 3.5601).
+
+## 16 against 64 subgame buckets: speed, size, exploitability
+
+Prediction (written 13:19 before measuring, `SP\sbsep\PREDICTION.txt`): at flop roots 10-30% fewer iterations per
+second with 64, tables 1.5-3 times as large; at turn roots 5-20% fewer iterations per second, tables 2-3.5 times;
+river roots bit for bit the same; the first search on a flop board cheaper with the tabulated 64 (no 1,176-board
+river batch).
+
+Measured with `scripts/search_bench.py` (one thread: the machine was loaded by the main session's runs, so the
+per-search speeds scatter by up to 2x; pooled over all searches of a row; the table sizes are deterministic):
+
+| root | iterations per search | searches (runs) | it/s, 16 | it/s, 64 | 64 / 16 | table nodes, 16 → 64 | turn infosets | river infosets |
+|---|---:|---:|---:|---:|---:|---|---|---|
+| flop (both spots, 3 hands each) | 70,000 | 12 (2) | 17,443 | 14,300 | 0.82 (runs 0.89, 0.76) | 241,587-351,442 → 733,616-836,055 (x2.33-3.04) | 33.2k-33.5k → 109.5k-123.0k (x3.28-3.67) | 149.9k-151.8k → 540.1k-558.2k (x3.59-3.68) |
+| flop, E9's budget, cold (1 hand per spot) | 1,400,000 | 2 | 17,924 | 14,735 | 0.82 | 315,728 / 390,970 → 873,965 / 938,841 (x2.77 / x2.40) | 33,536 → 129,742 / 119,068 | 154,108 → 616,230 (x4.00: every public river node x bucket) |
+| turn (both spots, 3 hands each) | 100,000 | 24 (4) | 96,115 | 59,158 | 0.62 | 71,209-104,735 → 112,364-146,569 (x1.39-1.58) | | 14.4k-14.7k → 55.0k-56.8k (x3.79-3.89) |
+| turn, the three interleaved runs: 64 from the table / computed (river batch) | 100,000 | 18 (3) each | 91,654 | 55,492 / 65,648 | 0.61 / 0.72 | the same | | the same |
+| river | 70,000 | 6 | 200,286 | 192,220 | 0.96 (noise) | identical | | |
+
+* Flop roots: 18% fewer iterations per second (inside the prediction), tables 2.3-3.0 times as large (inside it).
+  The flop's lossless infosets stay; the turn and river infosets grow 3.3-4.0 times.
+* Turn roots: 38% fewer iterations per second (prediction 5-20%: missed, the cost is larger) with tables only 1.4-1.6
+  times as large (prediction 2-3.5: missed, the root's lossless turn infosets dominate the table).  28% of the loss
+  is the tabulated bucketer: it has no river batch (`TabulatedBucketer` does not override `river_buckets_all`), so each
+  river bucket is a hand-index lookup instead of a row of the search's river table; in three interleaved runs the 64
+  computed directly (its river batch; the same fingerprints, 6 of 6 in each run) ran 0.72 of the 16's speed, from the
+  table 0.61.  At flop roots the same lookups are at most 4 per iteration of about 60 us (a hypothesis: a few percent).
+* River roots: bit for bit the same (6 of 6 fingerprints), as predicted.
+* Build: with 16 the first search on a flop board computes the 1,176-board river table (400 ms on one thread); with
+  the tabulated 64 there is none to build (1.5-2.6 ms); later searches on a board share their tables either way
+  (0.6-1.1 ms).
+* Memory (computed from the layout, not measured): a node is 40 bytes plus 16 per action (`csrc/nodetable.h`) plus its
+  16-byte hash slots (2-4 per node), about 160 bytes at 4-5 actions, so a flop search at E9's 1.4M iterations holds
+  roughly 140-150 MB of table with 64 against 50-65 MB with 16 (the agent keeps the last search of each round of a
+  hand).
+
+**Exact exploitability at turn roots** (the only roots the exact evaluator covers besides the river): the average
+profile of a search to the end of the hand, best responses over all hole pairs with exact river showdowns, in bb per
+deal of the subgame; three hands of `search_bench.py`'s turn spots (after SB opens pot, BB calls, BB checks, SB bets
+half pot, BB calls), one thread, the same seed for 16 and 64 (`SP\sbsep\verify64.py`, `verify64_turn.py`):
+
+| turn hand | iterations | 16 | 64 | 64 - 16 | blueprint, as the agent plays it | seconds 16 / 64 |
+|---|---:|---:|---:|---:|---:|---:|
+| BB first to act, pot 12 bb, board 8 5 39 25 | 1M | 3.195 | 3.319 | +0.124 | 4.059 | 10.6 / 21.1 |
+| | 4M | 2.826 | 2.506 | **-0.320** | | 45.7 / 63.3 |
+| BB first to act, pot 12 bb, board 45 0 26 29 | 1M | 3.269 | 3.371 | +0.102 | 4.985 | 12.4 / 17.3 |
+| | 4M | 2.647 | 2.366 | **-0.282** | | 43.7 / 64.5 |
+| BB faces a pot bet, pot 24 bb, board 25 3 15 2 | 1M | 3.567 | 3.612 | +0.044 | 7.633 | 9.2 / 8.6 |
+| | 4M | 3.013 | 2.566 | **-0.448** | | 33.8 / 56.7 |
+
+At 1M iterations the 64 river buckets are slightly worse in all three hands (+0.04 to +0.12 bb per deal: four times
+as many river infosets share the same iterations); at 4M, E7t's and E9's turn budget, they are better in all three
+(-0.28 to -0.45 bb per deal, 9-15% of the 16-bucket profile's exploitability), for 1.4-1.7 times the seconds on one
+thread.  Three hands, one seed: a direction, not a size.  Flop roots cannot be measured this way (two chance
+cards); whether the flop search gains from 64 at 1.4M iterations is what E9's duel measures.
+
+## For E9 (the command; the main session runs it)
+
+As E7t (same deals, seed, agent, blueprint, fixed iterations), plus the subgame's 64 exact buckets for the turn and
+river of every flop and turn search.  From the main checkout after merging this branch and rebuilding the module
+(`python scripts/build_fast.py`; without the new flags the module is bit for bit master's):
+
+```
+python -X faulthandler -B scripts/eval_archetypes.py --spec 2p_200bb_river --preflop-fracs 0.5,1.0,3.0 \
+    --postflop-fracs 0.5,1.0,2.0,4.0 --blueprint $P3/blueprint_hunl200w3_pot16_s0.bin \
+    --buckets $P3/buckets_hunl200w3_pot16_s0.json --cache $P3/bucketcache_hunl200w3_pot16_s0.bin \
+    --agent search --search-threads 14 --opponents blueprint --luck --seed 0 --progress 100 \
+    --search-street-iterations "flop=1400000,turn=4000000,river=3500000" \
+    --search-buckets data/buckets_hunl200w3_pot64x_s0.json --search-tables data/bucket_tables \
+    --first-deal 0 --deals 2000 --log $SP/p3/log_e9_sub64x.jsonl --log-hands $SP/p3/hands_e9_sub64x.jsonl
+```
+
+(`$P3` = the part-3 worktree's `data`, as in `search_queue4.sh`; in that script: `run e9_sub64x
+--search-street-iterations "flop=1400000,turn=4000000,river=3500000" --search-buckets
+"$R/data/buckets_hunl200w3_pot64x_s0.json" --search-tables "$R/data/bucket_tables"`.)  One-time cost: none to
+precompute (the table exists); each process loads it in 0.2-0.4 s with the file in the OS cache (+138 MB).  The console line `buckets: blueprint 16
+potential; the subgame's rounds after its root: 64 exact potential, bucket tables` confirms the setup.  Time: from
+the one-thread measurements above, flop searches about 1.2 times and turn searches 1.4-1.7 times as long as E7t's at
+the same iterations (river unchanged): a hypothesis for 14 threads, where the larger tables may cost differently.
+
+# Part 5: river abstraction inside the turn search (optimizer branches merged 2026-09-28, 22:24, master bf11b11)
+
+Optimizer commits (opt/river-exact, opt/search-oom) merged through an agent worktree after the gates below; the
+main-checkout module rebuilt 22:25 with CUDA (47 s; the previous module kept as `.old_2226` while E8 runs on it).
+
+## What was added (all off by default)
+
+| flag (`CoreSearchAgent` / `SubgameSearch`) | meaning |
+|---|---|
+| `--search-river-exact` / `river_exact=True` | turn roots: river infosets by hand strength on the river board instead of buckets (float rows per river card) |
+| `--search-river-buckets K` / `river_buckets=K` | river by K strength buckets shared by the river cards (Pluribus-style) |
+| `--search-vector-discount linear\|cfr+\|dcfr` / `vector_discount=0\|1\|2` | discounting of the vector CFR (DCFR = (1.5, 0, 2), lazy) |
+| `river_warm` (bench config `warm<K>_<pct>`) | exact river warm-started from the K-bucket rows after a bucket phase of `<pct>` % of the budget |
+| OOM in the search | `RuntimeError("search failed: out of memory growing the node table")` instead of the Windows abort 0xC0000409; the agent falls back to the blueprint and the summary line always shows `search errors N (fallback to the blueprint)`; `--log-hands` keeps the error next to `played: "blueprint after a search error"` |
+| `scripts/river_abstraction_bench.py` | `--iterations` (fixed vector iterations) or `--seconds`, `--cache`, `--street turn\|river`, `--configs mccfr,vec,vecd,k16,k200,k500,k200d,...`, seconds per search and the search's own memory |
+
+Bug found in master and fixed (1bcfdb8, with a test): `prepare_vector` built the vector solve's river rows from
+`later_bucket` (the blueprint's buckets) instead of `search_bucket` (the subgame's). With `--search-buckets` the
+vector solve silently ignored the subgame bucketer on the river and the evaluator read the wrong rows: on the test
+fixture with a 24-bucket subgame bucketer against the blueprint's 8, 992 river infosets and ε 4.4631 bb/deal before,
+2,976 infosets and ε 0.4244 after (0.4013 without a separate bucketer, unchanged). Runs without a separate subgame
+bucketer are unaffected (E9 does not use the vector solve; the queued E10 does not use `--search-buckets`).
+
+## Gates (agent worktree, then the main checkout)
+
+- Tests: 63 passed, 1 deselected (time budget) in the worktree; 48/48 of `test_search_oom`, `test_vector_cfr`,
+  `test_core_search_agent`, `test_search_core` on the rebuilt main-checkout module.
+- Bit-identity: `dbg_search_bits` node dumps at 400 iterations, depth end / hu_flop_limit: identical, 1,175 / 1,228
+  nodes (main checkout vs the pre-merge dumps and vs the agent's build); 10 deals × 3 configurations without flags
+  and with `--search-vector --search-vector-iterations "turn=50,river=100"`: 0 differing lines.
+
+## Bench (4 threads next to a 14-thread run, 800 fixed vector iterations, the optimizer's 4 turn roots, 3 rounds; ε of the average strategy, bb per deal; prediction written before the run)
+
+| config | predicted ε | measured ε | paired vs vec (12 roots) | s per search | search memory |
+|---|---|---|---|---:|---:|
+| vec (Linear, 16 buckets) | 3.0 | 2.748 | — | 9.0 | +40 MB |
+| vecd (DCFR) | 2.1 | 2.076 | −0.673, lower 12/12 | 14.1 | +41 MB |
+| k16 | 3.1 | 2.955 | +0.206, lower 3/12 | 9.2 | +41 MB |
+| k16d | 2.2 | 2.134 | −0.615, lower 10/12 | 14.7 | +41 MB |
+| k200 | 2.4 | 2.200 | −0.548, lower 9/12 | 12.0 | +70 MB |
+| k200d | 2.1 | 1.363 | −1.386, lower 12/12 | 17.1 | +71 MB |
+
+Run-to-run spread of one root's ε: 0.059 mean, 0.130 max. Eight roots, one round: vec 2.943, vecd 2.096, k200 2.111,
+k200d 1.327, k500d 1.201 (better than k200d on 7/8 roots; 19.8 s vs 16.1 s, +102 MB). Equal time: Linear vec at
+1,150 iterations 2.900 (11.7 s), k200 at 1,150 2.085 (15.1 s) — both worse than DCFR at 800. River roots at 500
+iterations: vec 0.018 (4.6 s), vecd 0.016 (8.0 s): no gain from DCFR there, ×1.74 in time. Process peak 822 MB
+working set / 816 MB commit for every configuration (705 / 698 MB is the blueprint plus cache).
+
+Next: the 14-thread bench at the combat budget (10 s and 20 s per decision) runs in `search_queue8.sh` right after
+E8; E10/E11 take their fixed vector iterations from it (`docs/search_vs_blueprint.md`, E11). Open: a per-street
+discount (DCFR on the turn, Linear on the river) is not built; trainers still abort on out-of-memory.
