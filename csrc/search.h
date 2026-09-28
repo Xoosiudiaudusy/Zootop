@@ -562,16 +562,26 @@ public:
         auto work = [&](int tid) {
             Ctx& ctx = ctxs[(size_t)tid];
             ctx.tid = tid;
+            ctx.mt = T > 1;
             ctx.rng.reseed(params_.seed * 0x9E3779B97F4A7C15ULL + (uint64_t)tid * 0xD1B54A32D192ED03ULL + 1);
             std::memcpy(ctx.deck, deck_, sizeof deck_);
             try {
+                // (MCCFR) iteration numbers are taken CHUNK at a time with more than one thread (one shared counter
+                // bumped per iteration costs a contended cache line at river speeds); one thread keeps 1, 2, 3, ...
+                const long long CHUNK = T > 1 ? 16 : 1;
+                long long t = 0, t_end = 0;
+                Node* our_node = nullptr;
                 if (use_vector) {
                     vector_loop(ctx, next_t, stop, deadline, our_key, our_na.n);
                 } else
                 while (!stop.load(std::memory_order_relaxed)) {
-                    const long long t = next_t.fetch_add(1);
+                    if (t == t_end) {
+                        t = next_t.fetch_add(CHUNK);
+                        t_end = t + CHUNK;
+                    }
                     if (params_.iterations > 0 && t > params_.iterations) break;
-                    const double weight = params_.linear ? (double)t : 1.0;
+                    const long long t_cur = t++;
+                    const double weight = params_.linear ? (double)t_cur : 1.0;
                     for (int trav : traversers) {
                         const bool focused = trav == hand_.our_seat && ctx.rng.uniform() < params_.focus;
                         deal(ctx, focused);
@@ -590,15 +600,20 @@ public:
                         if (focused) ctx.focused++;
                     }
                     if (!frozen_) {
-                        Node* node = table_->get_or_create(our_key, ctx.tid, our_na.n, [&](Node& nd, NodeArena&) {
-                            nd.init(our_na.id, our_na.n);
-                            return "";
-                        }).node;
+                        // the table's nodes do not move: looked up once per thread; the lookup's check for a growth
+                        // in progress stays once per iteration (cached tree paths may not reach the table otherwise)
+                        if (group_->pending()) group_->arrive();
+                        if (!our_node)
+                            our_node = table_->get_or_create(our_key, ctx.tid, our_na.n, [&](Node& nd, NodeArena&) {
+                                nd.init(our_na.id, our_na.n);
+                                return "";
+                            }).node;
+                        Node* node = our_node;
                         if (node->n == our_na.n) {
                             double sg[MAX_ACTIONS];
-                            node->lock.lock();
+                            nlock(node, ctx);
                             node->current_strategy(sg);
-                            node->lock.unlock();
+                            nunlock(node, ctx);
                             for (int i = 0; i < our_na.n; i++) ctx.ours[i] += weight * sg[i];
                         }
                     }
@@ -1408,7 +1423,7 @@ private:
         return v;
     }
 
-    struct Ctx {
+    struct alignas(64) Ctx {  // one cache line boundary per thread: no false sharing between neighbours in ctxs
         FastRng rng;
         int tid = 0;
         int deck[52];
@@ -1417,6 +1432,7 @@ private:
         int combo[MAX_PLAYERS];
         int bucket_memo[MAX_PLAYERS][6];
         bool actual = false;
+        bool mt = true;  // other threads share the table (false: a one-thread solve skips the node locks)
         std::string tok;
         long long iterations = 0, traversals = 0, focused = 0, nodes = 0, forced = 0, redeals = 0;
         long long leaves = 0, leaf_evals = 0, rollouts = 0, rollout_steps = 0;
@@ -1427,6 +1443,10 @@ private:
         int str_board = -1;  // board size the strengths are for (-1: not computed for this deal)
         int64_t str[MAX_PLAYERS];
     };
+
+    // a node's lock, taken only when other threads of the solve can touch it
+    static void nlock(Node* n, const Ctx& ctx) { if (ctx.mt) n->lock.lock(); }
+    static void nunlock(Node* n, const Ctx& ctx) { if (ctx.mt) n->lock.unlock(); }
 
     // a leaf: who chooses a continuation, what of the board they saw, the blueprint history there
     struct LeafCtx {
@@ -1820,9 +1840,9 @@ private:
         ctx.nodes++;
         if (params_.debug_leaves > 0) log_leaf(st, ph, p, key, ctx);
         double sigma[MAX_ACTIONS];
-        node->lock.lock();
+        nlock(node, ctx);
         node->current_strategy(sigma);
-        node->lock.unlock();
+        nunlock(node, ctx);
         if (p == traverser) {
             double u[N_CONTINUATIONS];
             const FastRng saved = ctx.rng;
@@ -1837,16 +1857,16 @@ private:
             double v = 0.0;
             for (int k = 0; k < N_CONTINUATIONS; k++) v += sigma[k] * u[k];
             const double w = weight * w_imp;
-            node->lock.lock();
+            nlock(node, ctx);
             for (int k = 0; k < N_CONTINUATIONS; k++) node->regret()[k] += w * (u[k] - v);
-            node->lock.unlock();
+            nunlock(node, ctx);
             return v;
         }
         if (!focused) {
-            node->lock.lock();
+            nlock(node, ctx);
             for (int k = 0; k < N_CONTINUATIONS; k++) node->strategy_sum()[k] += weight * sigma[k];
             node->visits += 1;
-            node->lock.unlock();
+            nunlock(node, ctx);
         }
         choice[p] = sample(sigma, N_CONTINUATIONS, ctx.rng);
         return choose(st, ph, L, i + 1, choice, traverser, weight, w_imp, focused, ctx);
@@ -2201,9 +2221,9 @@ private:
         if (frozen) {
             frozen_->strategy_row(key, na.n, frozen_kind_, sigma);
         } else {
-            node->lock.lock();
+            nlock(node, ctx);
             node->current_strategy(sigma);
-            node->lock.unlock();
+            nunlock(node, ctx);
         }
         if (path_node && focused && seat != traverser) {  // an opponent's real action, weighted by its probability
             const int a = path_[(size_t)k].index;
@@ -2226,16 +2246,16 @@ private:
             for (int i = 0; i < na.n; i++) u += sigma[i] * utils[i];
             if (frozen) return u;
             const double w = weight * w_imp;
-            node->lock.lock();
+            nlock(node, ctx);
             for (int i = 0; i < na.n; i++) node->regret()[i] += w * (utils[i] - u);
-            node->lock.unlock();
+            nunlock(node, ctx);
             return u;
         }
         if (!focused && !frozen) {
-            node->lock.lock();
+            nlock(node, ctx);
             for (int i = 0; i < na.n; i++) node->strategy_sum()[i] += weight * sigma[i];
             node->visits += 1;
-            node->lock.unlock();
+            nunlock(node, ctx);
         }
         const int a = sample(sigma, na.n, ctx.rng);
         st.apply(na.type[a], na.amount[a]);
@@ -2412,7 +2432,7 @@ private:
     }
 
     // HandState::finish + net for `seat`, from the prepared terminal and the deal's cards
-    double tree_net(const TNode* t, int seat, Ctx& ctx) const {
+    NEGP_NOINLINE double tree_net(const TNode* t, int seat, Ctx& ctx) const {
         if (t->n_act <= 1) return t->fixed_value[seat];
         const int n = root_.n;
         if (ctx.str_board != t->n_board) {
@@ -2461,10 +2481,14 @@ private:
         return leaf_value(st, t->ph, traverser, weight, w_imp, focused, ctx);
     }
 
-    // traverse() on the public tree (no frozen round)
+    // traverse() on the public tree (no frozen round).  Terminals and leaves are answered here, inlined in the
+    // callers: the decision nodes' frame (saved registers, the strategy and value arrays) is set up only for them
     double traverse_tree(TNode* t, int traverser, double weight, double w_imp, bool focused, Ctx& ctx) {
-        if (t->terminal) return tree_net(t, traverser, ctx);
+        if (t->terminal) return t->n_act <= 1 ? t->fixed_value[traverser] : tree_net(t, traverser, ctx);
         if (t->leaf) return tree_leaf_value(t, traverser, weight, w_imp, focused, ctx);
+        return traverse_decision(t, traverser, weight, w_imp, focused, ctx);
+    }
+    NEGP_NOINLINE double traverse_decision(TNode* t, int traverser, double weight, double w_imp, bool focused, Ctx& ctx) {
         const int seat = t->seat;
         const NodeActions& na = t->na;
         const int card = tree_card_part(t, seat, ctx);
@@ -2482,9 +2506,15 @@ private:
             return traverse_tree(tchild(t, t->path_index), traverser, weight, w_imp, focused, ctx);
         }
         double sigma[MAX_ACTIONS];
-        node->lock.lock();
+        // an opponent's node off the focused path adds its strategy in the same critical section as it reads it
+        const bool add_sum = seat != traverser && !focused;
+        nlock(node, ctx);
         node->current_strategy(sigma);
-        node->lock.unlock();
+        if (add_sum) {
+            for (int i = 0; i < na.n; i++) node->strategy_sum()[i] += weight * sigma[i];
+            node->visits += 1;
+        }
+        nunlock(node, ctx);
         if (t->path_node && focused && seat != traverser) {  // an opponent's real action, weighted by its probability
             const int a = t->path_index;
             const double w2 = w_imp * sigma[a];
@@ -2497,16 +2527,10 @@ private:
             double u = 0.0;
             for (int i = 0; i < na.n; i++) u += sigma[i] * utils[i];
             const double w = weight * w_imp;
-            node->lock.lock();
+            nlock(node, ctx);
             for (int i = 0; i < na.n; i++) node->regret()[i] += w * (utils[i] - u);
-            node->lock.unlock();
+            nunlock(node, ctx);
             return u;
-        }
-        if (!focused) {
-            node->lock.lock();
-            for (int i = 0; i < na.n; i++) node->strategy_sum()[i] += weight * sigma[i];
-            node->visits += 1;
-            node->lock.unlock();
         }
         const int a = sample(sigma, na.n, ctx.rng);
         return traverse_tree(tchild(t, a), traverser, weight, w_imp, focused, ctx);

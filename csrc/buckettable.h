@@ -395,6 +395,25 @@ public:
         if (on_[s]) return tab_->at(s, tab_->indexer(s).index(hole, board));
         return inner_->bucket(hole, board, n_board);
     }
+    // from the river table when there is one (one index per hole; the search's river table at a flop or turn
+    // root is built from this), else the wrapped bucketer's batch; 255 stays the on-board mark
+    bool river_buckets_all(const int* board, const int (*idx)[52], uint8_t* out) const override {
+        if (!on_[RIVER]) return inner_->river_buckets_all(board, idx, out);
+        if (tab_->identity().n_buckets > 255) return false;  // bucket 255 would read as on the board
+        bool on[52] = {false};
+        for (int i = 0; i < 5; i++) on[board[i]] = true;
+        const HandIndexer& ix = tab_->indexer(RIVER);
+        for (int c = 0; c < 52; c++)
+            for (int d = c + 1; d < 52; d++) {
+                if (on[c] || on[d]) {
+                    out[idx[c][d]] = 255;
+                    continue;
+                }
+                const int h[2] = {c, d};
+                out[idx[c][d]] = tab_->at(RIVER, ix.index(h, board));
+            }
+        return true;
+    }
     const std::shared_ptr<Bucketer>& inner() const { return inner_; }
     const std::shared_ptr<const BucketTables>& tables() const { return tab_; }
 
