@@ -376,10 +376,23 @@ public:
 
     void begin(int workers) {
         std::lock_guard<std::mutex> lk(mu_);
+        failure_.clear();
         if (pending_.load(std::memory_order_relaxed)) grow_and_release();  // left over from an aborted run
+        if (!failure_.empty()) throw std::runtime_error(failure_);
         running_ = true;
         active_ = workers;
         waiting_ = 0;
+    }
+    // A growth that failed (memory exhausted) does not throw where it ran, which may be leave() or end()
+    // outside any handler: it releases the parked workers and is recorded here; every later arrive() (the
+    // table stays full) throws it in its worker, and the owner reads it after the join.
+    bool failed() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return !failure_.empty();
+    }
+    std::string failure() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return failure_;
     }
     void leave() {
         std::lock_guard<std::mutex> lk(mu_);
@@ -394,11 +407,16 @@ public:
     inline void request();
     void arrive() {
         std::unique_lock<std::mutex> lk(mu_);
-        if (!pending_.load(std::memory_order_relaxed)) return;
-        if (!running_) { grow_and_release(); return; }
-        const uint64_t g = gen_;
-        if (++waiting_ >= active_) { grow_and_release(); return; }
-        cv_.wait(lk, [&] { return gen_ != g; });
+        if (failure_.empty() && pending_.load(std::memory_order_relaxed)) {
+            if (!running_) {
+                grow_and_release();
+            } else {
+                const uint64_t g = gen_;
+                if (++waiting_ >= active_) grow_and_release();
+                else cv_.wait(lk, [&] { return gen_ != g; });
+            }
+        }
+        if (!failure_.empty()) throw std::runtime_error(failure_);
     }
     long long resizes() const { return resizes_; }
 
@@ -407,7 +425,8 @@ private:
 
     std::vector<FlatNodeTable*> tables_;
     std::atomic<bool> pending_{false};
-    std::mutex mu_;
+    std::string failure_;  // a growth that failed in this run (empty: none)
+    mutable std::mutex mu_;
     std::condition_variable cv_;
     bool running_ = false;
     int active_ = 0, waiting_ = 0;
@@ -591,8 +610,18 @@ public:
         grow_requested_.store(false, std::memory_order_relaxed);
     }
 
+    // tests: fail the n-th table growth from now with std::bad_alloc (0: never; < 0: every one), as an
+    // exhausted commit would
+    static std::atomic<long long>& debug_fail_grow() {
+        static std::atomic<long long> n{0};
+        return n;
+    }
     // double until the load is below 1/2; exclusive access (TableGroup)
     void grow() {
+        {
+            const long long f = debug_fail_grow().load(std::memory_order_relaxed);
+            if (f < 0 || (f > 0 && debug_fail_grow().fetch_sub(1) == 1)) throw std::bad_alloc();
+        }
         size_t cap = capacity();
         const size_t n = size();
         while (n >= grow_point(cap)) cap <<= 1;
@@ -707,7 +736,13 @@ inline void TableGroup::request() {
 }
 
 inline void TableGroup::grow_and_release() {
-    for (FlatNodeTable* t : tables_) if (t->grow_requested()) { t->grow(); resizes_++; }
+    try {
+        for (FlatNodeTable* t : tables_) if (t->grow_requested()) { t->grow(); resizes_++; }
+    } catch (const std::bad_alloc&) {
+        if (failure_.empty()) failure_ = "out of memory growing the node table";
+    } catch (const std::exception& e) {
+        if (failure_.empty()) failure_ = std::string("node table growth failed: ") + e.what();
+    }
     waiting_ = 0;
     pending_.store(false, std::memory_order_release);
     ++gen_;
