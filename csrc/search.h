@@ -2586,27 +2586,27 @@ private:
         for (int a = 0; a < na; a++) vc.get();
         double* S[MAX_ACTIONS];
         for (int a = 0; a < na; a++) S[a] = vc.buf[base + (size_t)a].data();
-        for (int c = 0; c < N_COMBOS; c++) {
-            const int cp = cpv[c];
-            if (c == forced) {
-                for (int a = 0; a < na; a++) S[a][c] = a == t->path_index ? 1.0 : 0.0;
-            } else if (cp < 0 || cp >= nc) {
-                for (int a = 0; a < na; a++) S[a][c] = 0.0;
-            } else {
-                for (int a = 0; a < na; a++) S[a][c] = sg[(size_t)cp * na + a];
+        for (int a = 0; a < na; a++) {
+            double* __restrict Sa = S[a];
+            for (int c = 0; c < N_COMBOS; c++) {
+                const int cp = cpv[c];
+                Sa[c] = (cp >= 0 && cp < nc) ? sg[(size_t)cp * na + a] : 0.0;
             }
         }
+        if (forced >= 0)
+            for (int a = 0; a < na; a++) S[a][forced] = a == t->path_index ? 1.0 : 0.0;
         std::fill(v, v + N_COMBOS, 0.0);
         if (q == o) {
             double* ro2 = vc.get();
             double* va = vc.get();
             for (int a = 0; a < na; a++) {
-                bool any = false;
+                const double* __restrict Sa = S[a];
+                double mass = 0.0;
                 for (int d = 0; d < N_COMBOS; d++) {
-                    ro2[d] = ro[d] * S[a][d];
-                    any = any || ro2[d] != 0.0;
+                    ro2[d] = ro[d] * Sa[d];
+                    mass += ro2[d];
                 }
-                if (!any) continue;
+                if (!(mass > 0.0)) continue;
                 v_child(t, a, p, o, rp, ro2, r, weight, ctx, vc, va);
                 for (int c = 0; c < N_COMBOS; c++) v[c] += va[c];
             }
@@ -2628,30 +2628,31 @@ private:
             for (int c = 0; c < N_COMBOS; c++) v[c] += S[a][c] * vs[a][c];
         double* reg = sg + (size_t)nc * na;
         double* ss = reg + (size_t)nc * na;
-        std::vector<int>& touched = vc.ints[(size_t)dep];
-        touched.clear();
-        std::vector<uint8_t>& seen = vc.seen[(size_t)dep];
-        seen.assign((size_t)nc, 0);
+        std::fill(reg, reg + (size_t)nc * na * 2, 0.0);
+        std::vector<int>& cnt = vc.ints[(size_t)dep];
+        cnt.assign((size_t)nc, 0);
         for (int c = 0; c < N_COMBOS; c++) {
             const int cp = cpv[c];
             if (cp < 0 || cp >= nc || c == forced) continue;
+            cnt[(size_t)cp]++;
             double* rg = &reg[(size_t)cp * na];
             double* sm = &ss[(size_t)cp * na];
-            if (!seen[(size_t)cp]) {
-                seen[(size_t)cp] = 1;
-                touched.push_back(cp);
-                for (int a = 0; a < na; a++) rg[a] = sm[a] = 0.0;
-            }
+            const double vc_ = v[c], rpc = rp[c];
             for (int a = 0; a < na; a++) {
-                rg[a] += vs[a][c] - v[c];
-                sm[a] += rp[c] * S[a][c];
+                rg[a] += vs[a][c] - vc_;
+                sm[a] += rpc * S[a][c];
             }
         }
         t->vlock.lock();
-        for (int cp : touched) {
+        for (int cp = 0; cp < nc; cp++) {
+            if (!cnt[(size_t)cp]) continue;
+            double* R = &t->vreg[(size_t)cp * na];
+            double* M = &t->vss[(size_t)cp * na];
+            const double* rg = &reg[(size_t)cp * na];
+            const double* sm = &ss[(size_t)cp * na];
             for (int a = 0; a < na; a++) {
-                t->vreg[(size_t)cp * na + a] += weight * reg[(size_t)cp * na + a];
-                t->vss[(size_t)cp * na + a] += weight * ss[(size_t)cp * na + a];
+                R[a] += weight * rg[a];
+                M[a] += weight * sm[a];
             }
             t->vvis[(size_t)cp] += 1;
         }
