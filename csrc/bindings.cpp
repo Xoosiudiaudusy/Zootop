@@ -314,15 +314,13 @@ static py::dict table_stress(int threads, int n_keys, int rounds, size_t initial
                 if (!owner[idx].compare_exchange_strong(expected, f.node) && expected != f.node) other_node.fetch_add(1, std::memory_order_relaxed);
             }
         }
-        group.leave();
     };
     {
         py::gil_scoped_release nogil;
-        std::vector<std::thread> pool;
-        for (int t = 1; t < threads; t++) pool.emplace_back(work, t);
-        work(0);
-        for (auto& th : pool) th.join();
+        WorkerErrors errs;
+        run_workers(threads, errs, work, [&](int) { group.leave(); });
         group.end();
+        if (errs.failed.load()) throw std::runtime_error("table stress: " + errs.message());
     }
     long long missing = 0, for_each_count = 0;
     for (int i = 0; i < n_keys; i++) {
@@ -673,10 +671,7 @@ PYBIND11_MODULE(_fastcore, m) {
             for (int f = 0; f < n; f++) work(f);
         } else {
             std::atomic<int> next{0};
-            std::vector<std::thread> pool;
-            for (int t = 0; t < T; t++)
-                pool.emplace_back([&]() { for (int f = next.fetch_add(1); f < n; f = next.fetch_add(1)) work(f); });
-            for (auto& th : pool) th.join();
+            run_pool(T, "exact equity", [&]() { for (int f = next.fetch_add(1); f < n; f = next.fetch_add(1)) work(f); });
         }
         long long w2 = 0, r = 0;
         for (int f = 0; f < n; f++) { w2 += twice_won[(size_t)f]; r += runs[(size_t)f]; }
@@ -752,6 +747,10 @@ PYBIND11_MODULE(_fastcore, m) {
           "tests: the n-th node-table growth from now fails with std::bad_alloc (0: never)");
     m.def("_debug_fail_prepare", [](long long n) { FlatTrainer::debug_fail_prepare().store(n); }, py::arg("n"),
           "tests: the n-th preparation of a flat / GPU iteration from now fails with std::bad_alloc (0: never; < 0: every one)");
+    m.def("_debug_fail_worker", [](long long n) { debug_fail_worker().store(n); }, py::arg("n"),
+          "tests: the n-th worker of a thread pool (workers.h) from now fails before its work with std::bad_alloc (0: never; < 0: every one)");
+    m.def("_debug_fail_thread_start", [](long long n) { debug_fail_thread_start().store(n); }, py::arg("n"),
+          "tests: the n-th thread start of a pool (workers.h) from now fails (std::system_error; 0: never; < 0: every one)");
     m.def("file_kind", &file_kind, "'checkpoint' / 'blueprint' (binary, by magic), 'json', 'unknown' or 'unreadable'");
     m.def("checkpoint_bin_to_json", [](const std::string& src, const std::string& dst) {
         py::gil_scoped_release nogil;
@@ -833,10 +832,7 @@ PYBIND11_MODULE(_fastcore, m) {
                 for (size_t i = next.fetch_add(1); i < hands.size(); i = next.fetch_add(1))
                     exact_feature(hands[i].data(), hands[i].data() + 2, n_board, bins, counts[i].data(), means[i]);
             };
-            std::vector<std::thread> pool;
-            for (int t = 1; t < std::max(1, threads); t++) pool.emplace_back(work);
-            work();
-            for (auto& th : pool) th.join();
+            run_pool(threads, "exact features", work);
         }
         py::list out;
         for (size_t i = 0; i < hands.size(); i++) out.append(py::make_tuple(counts[i], means[i]));

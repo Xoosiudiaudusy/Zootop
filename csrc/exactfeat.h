@@ -16,6 +16,7 @@
 //                             won = holes below + half the ties, minus those sharing a card), so a flop
 //                             board costs C(49,2) = 1,176 such passes and a turn board 48.
 #pragma once
+#include "workers.h"
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
@@ -220,10 +221,7 @@ inline void build_exact_features(int n_board, int bins, int threads, ExactFeatur
         }
     };
     const int T = threads < 1 ? 1 : threads;
-    std::vector<std::thread> pool;
-    for (int t = 1; t < T; t++) pool.emplace_back(work);
-    work();
-    for (auto& th : pool) th.join();
+    run_pool(T, "exact features", work);
     for (uint64_t id = 0; id < n; id++)
         if (out.mean[id] < 0.0) throw std::logic_error("exact features: a class was not covered by the canonical boards");
 }
