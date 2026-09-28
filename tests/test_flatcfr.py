@@ -80,6 +80,25 @@ def test_three_player_flop_is_the_reference(flop_bucketer, mode):
     assert _flat(spec, flop_bucketer, 11, 32, 400, threads=2, pass_iterations=7, mode=mode) == ref
 
 
+def test_the_preparation_pool_changes_nothing(flop_bucketer):
+    """The GPU path's host preparation: the persistent pool with a ring of batches (any depth, any thread count)
+    gives the tables of the old path (threads per batch) bit for bit; the device emulated."""
+    spec = GameSpec(n_players=3, stack_bb=15, max_street=Street.FLOP, n_buckets=8)
+    out = []
+    for pool, depth, threads in ((False, 1, 2), (True, 1, 1), (True, 3, 4), (True, 2, 3)):
+        ft = core.FlatTrainer(spec_to_dict(spec), core_bucketer(flop_bucketer), 11, True, threads)
+        ft.batch_size = 32
+        ft.gpu_pass = 7
+        ft.emulate_gpu = True
+        ft.prep_pool = pool
+        ft.prep_depth = depth
+        ft.train(300)  # 10 batches: the ring wraps several times (300 is not a multiple of 32: a short last batch)
+        ft.train(100)
+        assert ft.iteration == 400
+        out.append({k: (list(r), list(s), v) for k, (r, s, v) in ft.export_nodes().items()})
+    assert all(o == out[0] for o in out[1:])
+
+
 @pytest.mark.parametrize("mode", MODES)
 def test_river_potential_is_the_reference(tiny_potential, mode):
     spec = GameSpec(n_players=2, stack_bb=20, max_street=Street.RIVER, n_buckets=8, max_raises_per_street=2, bucket_kind="potential")
