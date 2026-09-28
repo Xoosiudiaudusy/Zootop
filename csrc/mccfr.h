@@ -283,6 +283,12 @@ public:
         long long touched = 0;
         for (auto& c : ctxs_) { touched += c.nodes_touched; c.nodes_touched = 0; pruned_ += c.pruned; c.pruned = 0; }
         nodes_touched_ += touched;
+        if (group_.failed()) {  // a growth that failed after the last lookup (in the last leave() or in end()): every iteration ran
+            tables_consistent_ = true;
+            throw std::runtime_error("training ran the iterations to " + std::to_string(iteration_) + ", then " + group_.failure() +
+                                     ". The tables are those of iteration " + std::to_string(iteration_) +
+                                     " (whole: a checkpoint of them is valid); the next train() tries the growth again");
+        }
         checker_.rethrow();
     }
     long long pruned_actions() const { return pruned_; }
@@ -312,6 +318,7 @@ public:
             };
             run_workers(T, errs, work, [&](int) { group_.leave(); });
             group_.end();
+            if (!errs.failed.load() && group_.failed()) errs.record(group_.failure());  // (a growth that failed in leave() / end())
             // phase 2: apply the updates in a fixed order (gathering them may run out of memory: nothing applied yet)
             all.clear();
             if (!errs.failed.load()) {

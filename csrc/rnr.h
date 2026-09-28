@@ -147,6 +147,10 @@ public:
         long long touched = 0;
         for (auto& c : ctxs_) { touched += c.nodes_touched; c.nodes_touched = 0; }
         nodes_touched_ += touched;
+        if (group_.failed())  // a growth that failed after the last lookup (in the last leave() or in end()): every iteration ran
+            throw std::runtime_error("RNR training ran the iterations to " + std::to_string(iteration_) + ", then " + group_.failure() +
+                                     ". The tables are those of iteration " + std::to_string(iteration_) +
+                                     " (whole); the next train() tries the growth again");
         checker_.rethrow();
     }
 

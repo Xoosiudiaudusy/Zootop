@@ -76,8 +76,10 @@ public:
     }
 
     long long iteration() const { return iteration_; }
-    // after train() raised: whether the tables are those of iteration() (a checkpoint of them resumes exactly)
-    bool tables_consistent() const { return tables_consistent_; }
+    // after train() raised: whether the tables are those of iteration() (a checkpoint of them resumes exactly).
+    // False until the first train(): before it the tables are not a run's (an error while setting up, e.g. no
+    // device, must not have them saved over a checkpoint)
+    bool tables_consistent() const { return trained_ && tables_consistent_; }
     // tests: the n-th prepare_iter from now fails with std::bad_alloc (0: never; < 0: every one), as an exhausted
     // commit would in the host's preparation of a batch
     static std::atomic<long long>& debug_fail_prepare() {
@@ -151,6 +153,7 @@ public:
 
     void train(long long iterations) {
         if (batch_size < 1) throw std::invalid_argument("flat trainer: batch_size >= 1");
+        trained_ = true;
         const long long target = iteration_ + iterations;
         if (gpu_ || emulate_gpu) { train_gpu(target); return; }
         const int T = threads;
@@ -294,6 +297,7 @@ private:
     HistTree tree_;
     long long iteration_ = 0;
     bool tables_consistent_ = true;
+    bool trained_ = false;  // train() was called (tables_consistent)
     std::unordered_map<std::string, int32_t> key_index_;  // key without its bucket -> decision (begin_load)
 
     // "street|position|n_active|b<bucket>|history" without "|b<bucket>"; *bucket = the bucket (-1: not found)

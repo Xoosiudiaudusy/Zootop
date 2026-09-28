@@ -241,6 +241,15 @@ def main() -> None:
     what = f"{args.iters:,} iterations" if args.seconds <= 0 else f"{args.seconds:g} seconds"
     print(f"training {what} (each iteration = {spec.n_players} traversals){' on GPU ' + str(args.gpu) if args.gpu >= 0 else ''}…")
     t0 = time.perf_counter()
+    gpu_started = False  # the flat trainer holds this run's tables (set just before its training loop)
+
+    def write_gpu_info(path: str, info: dict) -> None:
+        # (the text first, then a temporary file renamed over the old one: a failure leaves the old file whole)
+        text = json.dumps(info)
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(path + ".tmp", path)
+
     try:
         if args.gpu >= 0:
             # the flat trainer on the device (gpucfr.h); its tables are then handed to the ordinary trainer,
@@ -285,13 +294,13 @@ def main() -> None:
                 t_save = time.perf_counter()
                 ft.copy_to(trainer._core)
                 save_outputs(snapshot=True)
-                with open(info_path, "w", encoding="utf-8") as f:
-                    json.dump(dict(run_info, iteration=int(ft.iteration)), f)
+                write_gpu_info(info_path, dict(run_info, iteration=int(ft.iteration)))
                 n_inf = trainer.n_nodes
                 trainer._core.import_nodes({}, True)  # free the copy until the next checkpoint
                 print(f"  checkpoint {ft.iteration:,}: {n_inf:,} infosets, {time.perf_counter() - t0:.0f}s, "
                       f"saved in {time.perf_counter() - t_save:.1f}s", flush=True)
 
+            gpu_started = True
             start_it = ft.iteration
             target = start_it + args.iters
             next_ck = (ft.iteration // ck_every + 1) * ck_every if ck_every else None
@@ -373,13 +382,15 @@ def main() -> None:
         # applied), write the checkpoint so that --resume continues exactly; otherwise keep the last one on disk.
         text = str(err)
         flat = locals().get("ft")
+        if flat is not None and not gpu_started:  # setting up the GPU run failed (no device, the resumed tables' copy)
+            raise SystemExit(f"training stopped: {text}; the error came before the GPU run started: nothing written, "
+                             "the last checkpoint on disk is untouched")
         try:
             saved = None
             if flat is not None and flat.tables_consistent:
                 flat.copy_to(trainer._core)
                 trainer.save_checkpoint(ck_path)
-                with open(ck_path + ".gpu.json", "w", encoding="utf-8") as f:
-                    json.dump(dict(run_info, iteration=int(flat.iteration)), f)
+                write_gpu_info(ck_path + ".gpu.json", dict(run_info, iteration=int(flat.iteration)))
                 saved = flat.iteration
             elif flat is None and cpp and args.batch > 0 and trainer._core.tables_consistent:
                 trainer.save_checkpoint(ck_path)

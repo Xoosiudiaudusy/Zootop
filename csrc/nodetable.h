@@ -385,7 +385,10 @@ public:
     }
     // A growth that failed (memory exhausted) does not throw where it ran, which may be leave() or end()
     // outside any handler: it releases the parked workers and is recorded here; every later arrive() (the
-    // table stays full) throws it in its worker, and the owner reads it after the join.
+    // table stays full) throws it in its worker, and the owner reads it after the join.  The growth stays
+    // pending (the tables keep their request): the next begin(), or a lookup with no workers running, tries it
+    // again and throws if it fails again, so a table never stays full with its request forgotten (inserts
+    // would spin at the hard limit).
     bool failed() const {
         std::lock_guard<std::mutex> lk(mu_);
         return !failure_.empty();
@@ -397,20 +400,21 @@ public:
     void leave() {
         std::lock_guard<std::mutex> lk(mu_);
         --active_;
-        if (pending_.load(std::memory_order_relaxed) && waiting_ >= active_) grow_and_release();
+        if (failure_.empty() && pending_.load(std::memory_order_relaxed) && waiting_ >= active_) grow_and_release();
     }
     void end() {
         std::lock_guard<std::mutex> lk(mu_);
         running_ = false;
-        if (pending_.load(std::memory_order_relaxed)) grow_and_release();
+        if (failure_.empty() && pending_.load(std::memory_order_relaxed)) grow_and_release();
     }
     inline void request();
     void arrive() {
         std::unique_lock<std::mutex> lk(mu_);
-        if (failure_.empty() && pending_.load(std::memory_order_relaxed)) {
-            if (!running_) {
+        if (pending_.load(std::memory_order_relaxed)) {
+            if (!running_) {  // no workers: grow now (again, after a run whose growth failed)
+                failure_.clear();
                 grow_and_release();
-            } else {
+            } else if (failure_.empty()) {
                 const uint64_t g = gen_;
                 if (++waiting_ >= active_) grow_and_release();
                 else cv_.wait(lk, [&] { return gen_ != g; });
@@ -688,8 +692,13 @@ private:
     }
     void request_growth() {
         if (grow_requested_.exchange(true, std::memory_order_acq_rel)) return;
-        if (group_) group_->request();
-        else grow();
+        try {
+            if (group_) group_->request();
+            else grow();
+        } catch (...) {  // (no workers running: grown here, and failed) the next request tries again
+            grow_requested_.store(false, std::memory_order_relaxed);
+            throw;
+        }
     }
 
     std::unique_ptr<Slot[]> slots_;
@@ -744,7 +753,7 @@ inline void TableGroup::grow_and_release() {
         if (failure_.empty()) failure_ = std::string("node table growth failed: ") + e.what();
     }
     waiting_ = 0;
-    pending_.store(false, std::memory_order_release);
+    if (failure_.empty()) pending_.store(false, std::memory_order_release);  // failed: stays pending (see failed())
     ++gen_;
     cv_.notify_all();
 }
