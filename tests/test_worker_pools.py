@@ -102,3 +102,42 @@ def test_trainer_thread_that_cannot_start_raises():
         print("after ok")
     ''')
     assert "raised True" in out and "after ok" in out, out
+
+
+def test_search_pools_raise():
+    """The subgame search's own pools: the ranges and the river table (built when the search is made, on a flop
+    root), the exploitability's river cards; each raises and the process goes on."""
+    out = run('''
+        import random
+        from negpluribus.cfr.game import GameSpec
+        from negpluribus.cfr.mccfr import MCCFRTrainer
+        from negpluribus.engine import Street
+        from negpluribus.fast.trainer import spec_to_dict
+        p = os.path.join(sys.path[0], "data", "buckets_3p_15bb_flop.json")
+        bk = EquityBucketer.load(p) if os.path.exists(p) else EquityBucketer(n_buckets=8, samples=150).fit(n_situations=300, seed=0)
+        spec = GameSpec(n_players=2, stack_bb=30, max_street=Street.RIVER, n_buckets=8, max_raises_per_street=2,
+                        preflop_fracs=(1.0,), postflop_fracs=(0.5, 1.0))
+        t = MCCFRTrainer(spec, bk, seed=2, backend="cpp", threads=1).train(2000)
+        game = core.SearchGame(spec_to_dict(spec), core_bucketer(bk), t.blueprint().lookup)
+        rng = random.Random(3); order = list(range(52)); rng.shuffle(order)
+        def root(line):
+            st = spec.new_hand(order, button=0); acts = []
+            for name in line:
+                a = spec.grid.to_concrete(st.observe(st.current_player), name)
+                acts.append((int(a.type), int(a.amount))); st.apply(a)
+            return st, acts
+        def search(line):
+            st, acts = root(line)
+            obs = st.observe(st.current_player)
+            return core.SubgameSearch(game, list(st.starting_stacks), 0, acts, list(obs.board), obs.seat, list(obs.hole),
+                                      iterations=300, time_budget=0.0, threads=4, seed=1, depth="end")
+        check("search_setup", lambda: search(["r1", "c"]))  # the ranges, the river table of the flop's boards
+        s = search(["r1", "c", "c", "c"])  # a turn root
+        s.solve()
+        check("exploitability", lambda: s.subgame_exploitability(0, 2))
+        s = search(["r1", "c", "c", "c"])
+        s.solve()
+        search(["r1", "c"])  # the flop root's setup works again
+        print("after ok", s.subgame_exploitability(0, 2)[0] >= 0)
+    ''')
+    assert "search_setup raised True" in out and "exploitability raised True" in out and "after ok True" in out, out
