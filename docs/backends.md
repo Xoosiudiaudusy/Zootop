@@ -1164,8 +1164,8 @@ merge, bit for bit (checks below).
   flat arrays, a dense table of every (history, bucket) row), equal to `--batch B` on the CPU bit for bit.
   It writes the ordinary checkpoints and blueprints.
   - `--checkpoint-every N` (rounded up to a multiple of B), `--resume` (a GPU checkpoint of the same batch
-    continues bit for bit; `checkpoint_<tag>.bin.gpu.json` holds seed, batch and linear settings, and a
-    resume with other values is refused), `--seconds S`.
+    continues bit for bit; the passport `checkpoint_<tag>.bin.run.json` holds seed, batch, linear and pruning
+    settings, and a resume with other values is refused; see `docs/gpu_training.md`), `--seconds S`.
   - `--gpu-emulate` runs the kernels' code on the CPU: tests only.
   - Bucket tables (`NEGPLURIBUS_BUCKET_TABLES`) are needed in practice: the CPU computes the buckets of
     every deal for the GPU.

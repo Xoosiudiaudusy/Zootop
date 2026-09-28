@@ -39,10 +39,18 @@ def newest_file(paths) -> Optional[str]:
 
 
 def tagged_path(data_dir: str, kind: str, tag: str) -> str:
-    """``<data_dir>/<kind>_<tag>.bin`` or ``.json``, whichever was written last (the C++ trainer
+    """``<data_dir>/<kind>_<tag>.bin`` or ``.json``: the one of the larger iteration when both files say theirs (an
+    old JSON next to a later binary is not taken for being newer), else whichever was written last (the C++ trainer
     writes binary by default, the Python one JSON); the ``.json`` name when neither exists."""
+    from .runinfo import file_iteration
+
     stem = os.path.join(data_dir, f"{kind}_{tag}")
-    return newest_file([stem + ".bin", stem + ".json"]) or stem + ".json"
+    b, j = stem + ".bin", stem + ".json"
+    if os.path.exists(b) and os.path.exists(j):
+        ib, ij = file_iteration(b), file_iteration(j)
+        if ib is not None and ij is not None and ib != ij:
+            return b if ib > ij else j
+    return newest_file([b, j]) or j
 
 
 def file_kind(path: str) -> str:

@@ -73,11 +73,16 @@ python scripts/train_blueprint.py <game flags> --backend cpp --gpu 0 --batch 163
   - Larger batches gain little speed.  They also carry a quality risk on short runs: 65536 on HU at 20M
     iterations lost 11 bb/100.
 - **`--checkpoint-every N`**: a checkpoint and a blueprint (plus the `.it<N>` copy) every N iterations.
-  - N is rounded up to a multiple of B.
+  - N is rounded up to a multiple of B, so the `.it<N>` names of a GPU run are multiples of B.
+  - The final iteration always gets its `.it<N>` copy too (a later `--resume` writes over the plain files).
   - Each checkpoint copies the device tables into the ordinary trainer and frees that copy after writing.
-- **`--resume`**: continues from `checkpoint_<tag>.bin`.
-  - A GPU checkpoint also writes `checkpoint_<tag>.bin.gpu.json` (seed, batch, linear, linear_until), and
-    resuming with other values is refused.
+- **`--resume`**: continues from `checkpoint_<tag>.bin` (or `.json`: the one of the larger iteration).
+  - No checkpoint is an error (not a new run over the tag's files).
+  - Every checkpoint and blueprint has a passport `<file>.run.json`: seed, batch, Linear CFR and `--linear-until`,
+    pruning, backend, threads, device, code commit, dates, and the run's segments across `--resume`
+    (`scripts/blueprint_info.py FILE` prints it).  Resuming with other seed / batch / linear / pruning values is
+    refused (`--resume-override` continues anyway, and the passport records the change).  Checkpoints of before
+    29.09.2026 may have the older `checkpoint_<tag>.bin.gpu.json` instead, which is still checked.
   - A run resumed from a GPU checkpoint of the same batch continues **bit for bit** as if it never stopped
     (test `test_checkpoint_and_resume_continue_bit_for_bit`).
   - A CPU checkpoint can be continued on the GPU, and a GPU checkpoint on the CPU.  The formats are the same;
