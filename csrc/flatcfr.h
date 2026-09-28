@@ -455,15 +455,25 @@ private:
             std::vector<FlatIter> iters;
         };
         PrepPool(FlatTrainer& ft, int workers, int depth) : ft_(ft), slots_((size_t)std::max(1, depth)) {
-            for (int i = 0; i < std::max(1, workers); i++) th_.emplace_back([this]() { run(); });
+            // (a thread that cannot start: the started ones are stopped and joined before the error leaves, never
+            // destroyed joinable)
+            try {
+                th_.reserve((size_t)std::max(1, workers));
+                for (int i = 0; i < std::max(1, workers); i++) th_.emplace_back([this]() { run(); });
+            } catch (...) {
+                stop();
+                throw;
+            }
         }
-        ~PrepPool() {
+        ~PrepPool() { stop(); }
+        void stop() {
             {
                 std::lock_guard<std::mutex> lk(mu_);
                 quit_ = true;
             }
             cv_.notify_all();
-            for (auto& t : th_) t.join();
+            for (auto& t : th_)
+                if (t.joinable()) t.join();
         }
         // batch b = iterations lo .. lo + k - 1 into slot b % depth (the slot must be free)
         void assign(long long b, long long lo, int k) {
