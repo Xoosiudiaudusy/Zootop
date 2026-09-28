@@ -12,6 +12,7 @@
 // (0 = street not tabulated), size bytes, u64 FNV-1a of those bytes.  A table is only valid
 // for the bucketer whose identity it carries; load() checks it.
 #pragma once
+#include "workers.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -94,10 +95,7 @@ public:
             }
         };
         const int T = threads < 1 ? 1 : threads;
-        std::vector<std::thread> pool;
-        for (int t = 1; t < T; t++) pool.emplace_back(work);
-        work();
-        for (auto& th : pool) th.join();
+        run_pool(T, "bucket table build", work);
         if (failed.load()) throw std::runtime_error("bucket table build failed: " + error);
         t_[street].swap(out);
     }
@@ -221,10 +219,7 @@ public:
             }
         };
         const int T = threads < 1 ? 1 : threads;
-        std::vector<std::thread> pool;
-        for (int t = 1; t < T; t++) pool.emplace_back(work);
-        work();
-        for (auto& th : pool) th.join();
+        run_pool(T, "bucket table from features", work);
         t_[street].swap(out);
     }
 
@@ -299,10 +294,7 @@ private:
             }
         };
         const int T = threads < 1 ? 1 : threads;
-        std::vector<std::thread> pool;
-        for (int t = 1; t < T; t++) pool.emplace_back(work);
-        work();
-        for (auto& th : pool) th.join();
+        run_pool(T, "bucket table (river batches)", work);
         if (failed.load()) throw std::runtime_error("bucket table build failed: river batch refused a board");
         for (uint64_t id = 0; id < n; id++)
             if (!(seen[id >> 3] >> (id & 7) & 1)) throw std::logic_error("bucket table: a river class was not covered by the canonical boards");
@@ -342,10 +334,7 @@ private:
             }
         };
         const int T = threads < 1 ? 1 : threads;
-        std::vector<std::thread> pool;
-        for (int t = 1; t < T; t++) pool.emplace_back(work);
-        work();
-        for (auto& th : pool) th.join();
+        run_pool(T, "bucket table (exact features)", work);
         t_[street].swap(out);
     }
 

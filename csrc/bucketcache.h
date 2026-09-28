@@ -9,6 +9,7 @@
 //       parameters, fingerprint of the fitted numbers: a cache of other buckets is refused) |
 //       per street: u8 street, u64 n, n x u64 words (key << 20 | value) | u64 checksum
 #pragma once
+#include "workers.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -93,10 +94,7 @@ inline long long precompute_buckets(Bucketer& bk, int street, int threads) {
         }
     };
     const int T = std::max(1, threads);
-    std::vector<std::thread> pool;
-    for (int t = 1; t < T; t++) pool.emplace_back(work);
-    work();
-    for (auto& th : pool) th.join();
+    run_pool(T, "bucket cache precompute", work);
     if (!err.empty()) throw std::runtime_error("precompute: " + err);
     return visited.load();
 }
