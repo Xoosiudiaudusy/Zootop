@@ -6,14 +6,18 @@ bit-identical and what is only statistically equivalent, and the measured number
 
 ```
 csrc/                  C++17 sources of negpluribus._fastcore (pybind11, CMake, MSVC/GCC/Clang)
-  pyrandom.h           random.Random-compatible MT19937, CPython tuple hash, CPython 3.12+ sum()
+  pyrandom.h           random.Random-compatible MT19937, CPython tuple hash
+  cfrmath.h            arithmetic shared with the GPU: CPython 3.12+ sum(), regret matching, terminal payoff
   evaluator.h          port of evaluator.py (identical integers)
   equity.h             port of equity.py::equity_vs_random (identical draws)
   engine.h             port of engine.py::HandState (flat struct, memcpy clone)
   abstraction.h        BetGrid + pseudo-harmonic, canonical form, FormCache (bounded, lock-free per-street
                        cache), E[HS] and potential-aware bucketers, infoset key
   nodetable.h          numeric infoset keys, flat lock-free node table
-  mccfr.h              external-sampling MCCFR / Linear CFR, N threads, per-node spinlocks
+  mccfr.h              external-sampling MCCFR / Linear CFR, N threads, per-node spinlocks; batched mode
+  philox.h             Philox4x32-10 draws of the batched mode (deals, opponent samples)
+  flatgame.h, flatcfr.h  the betting tree as flat arrays, dense tables; FlatTrainer (batched MCCFR by levels)
+  gpukernels.h, gpucfr.h, gpucfr.cu  the CUDA trainer (docs/gpu_training.md)
   rnr.h                Restricted Nash Response trainer (two tables, tabular opponent model)
   binio.h, persist.h   binary checkpoints / blueprints, blueprint lookup, JSON read and written in C++
   bindings.cpp         the Python module
@@ -22,7 +26,9 @@ negpluribus/fast/      Python side: dispatch, phevaluator tier, CppMCCFRTrainer,
 negpluribus/cfr/parallel.py   multiprocess driver (any backend, spawn-safe)
 scripts/build_fast.py  build the extension in place
 scripts/bench_backends.py     the benchmark below
+scripts/gpu_bench.py          GPU trainer: identity check against the CPU reference, speed
 tests/test_backends.py        acceptance tests (skipped automatically when the core is not built)
+tests/test_batched.py, tests/test_flatcfr.py   batched mode; flat trainer on the CPU, emulated, on the GPU
 ```
 
 ## Build (Windows / MSVC)
@@ -49,6 +55,9 @@ cmake --build build\fast --config Release --parallel
 
 Linux/macOS: the same script (`-O3 -ffp-contract=off`, system compiler).  The extension is
 git-ignored (`*.pyd`, `*.so`); rebuild after pulling changes to `csrc/`.
+
+The GPU trainer (CUDA) is built too when CMake finds nvcc; RelWithDebInfo with a PDB is
+`--config RelWithDebInfo`.  Both in "GPU trainer: batched MCCFR on CUDA" below.
 
 ## Selecting a backend
 
@@ -1133,3 +1142,186 @@ Checks here:
 (slots per infoset also fall because the trainer table now grows at load 3/4: 1,048,576 slots
 instead of 2,097,152 for the same infosets.)  Throughput of these three commits was not measured
 here: the machine was shared with the search duel.
+
+## GPU trainer: batched MCCFR on CUDA (merged 28.09.2026)
+
+The cloud optimizer's branch `opt/gpu` (repository Zootop, head 7e15f48) was cherry-picked with its
+authorship: 20 commits, each message ending with `(cherry picked from commit ...)`.  The merge commit
+0425998 and the eight commits already on master (count_betting_tree, pruning, linear_until, river tables,
+exact features) were skipped; `CoreBuckets` of fed5e93 was already here verbatim.  Two conflicts, both in
+`csrc/bindings.cpp` (Philox bindings next to the exact-feature bindings, `flatcfr.h` next to `exactfeat.h`),
+resolved by keeping both.  Design, flags and the optimizer's measurements: `docs/gpu_training.md`.  The
+helper's round-by-round run instructions on this PC: `GPU_RUN.md` (historical).
+
+Everything is opt-in.  Without `--batch` / `--gpu` the trainers and the search are the ones before the
+merge, bit for bit (checks below).
+
+- `train_blueprint.py --batch B` (C++ backend): batched synchronous MCCFR on the CPU, the reference of the
+  GPU trainer.  The B iterations of a batch read one strategy snapshot; their updates are applied after the
+  batch in a fixed order.  Deals and opponent samples come from Philox4x32-10 addressed by (seed, iteration,
+  ...), so the tables do not depend on the thread count.  It is another algorithm than the default trainer.
+- `train_blueprint.py --gpu 0 --batch B`: the same algorithm on the GPU (`FlatTrainer`: the betting tree as
+  flat arrays, a dense table of every (history, bucket) row), equal to `--batch B` on the CPU bit for bit.
+  It writes the ordinary checkpoints and blueprints.
+  - `--checkpoint-every N` (rounded up to a multiple of B), `--resume` (a GPU checkpoint of the same batch
+    continues bit for bit; `checkpoint_<tag>.bin.gpu.json` holds seed, batch and linear settings, and a
+    resume with other values is refused), `--seconds S`.
+  - `--gpu-emulate` runs the kernels' code on the CPU: tests only.
+  - Bucket tables (`NEGPLURIBUS_BUCKET_TABLES`) are needed in practice: the CPU computes the buckets of
+    every deal for the GPU.
+- The arithmetic shared by the CPU trainers and the device (CPython `sum()`, regret matching, terminal
+  payoff) moved to `csrc/cfrmath.h`, written without the standard library so nvcc compiles it for the device.
+
+**Rules (the user's, 28.09.2026).**
+- Batches are for blueprint training only, never in real-time search.
+- Batch <= 16384.
+- At least ~1000 batches per run: >= 4.1M iterations at 4096, >= 16.4M at 16384.
+
+**What a batched iteration is worth (the optimizer's measurement, findings 21).**  By exact exploitability
+on a preflop game (HU 20bb, raises of 0.5/1/3 pots, 11.5k infosets, 3 seeds), one batched iteration is
+worth about 0.8 of an ordinary one at batch 4096 and about 0.75 at 16384, once a run has ~1000 batches;
+65536 is not usable.  Net of that, on 3-max 100bb wide with exact potential-aware 64 buckets, the GPU
+(RTX 5070) against the CPU trainer (i5-14400F, 16 threads) gains x5.5-6 at batch 4096 and x7.5-8 at 16384
+(raw x6.8 and x10.3).
+
+### Build
+
+- Release with the GPU trainer: `python scripts/build_fast.py --clean`.  CMake enables CUDA when it finds
+  nvcc together with the CUDA integration of the Visual Studio generator in use.  The configure output
+  must contain `negpluribus: GPU trainer ON (...nvcc.exe, archs 89-real;120)`, and
+  `python -c "import negpluribus._fastcore as f; print(f.cuda_available())"` must print `(True, '')`.
+  - On this PC: CUDA 13.4 with its integration in the VS 2022 Build Tools; CMake's default generator is
+    "Visual Studio 17 2022".  The "Visual Studio 18 2026" Build Tools here have no CUDA integration: with
+    that generator the GPU trainer would be OFF.
+  - Build time 51 s (clean, the CUDA file included).
+  - The module links cudart statically and imports no CUDA DLL (checked with `dumpbin /dependents`): it
+    loads on machines without CUDA, and `cuda_available()` then gives the reason.
+- Without the GPU part: without a CUDA compiler the module builds as before (`GPU trainer OFF`; `--batch`
+  on the CPU and the flat trainer still work).  To skip it on purpose, configure by hand with
+  `-DNEGP_CUDA=OFF` (the command of "Build" above plus that flag), then `cmake --build build\fast --config
+  Release --parallel`.
+  - Checked here: 37 s.  `cuda_available()` returns `(False, 'the C++ core was built without CUDA ...')`.
+    `test_batched.py` and `test_flatcfr.py` pass (13, `[cpu]` and `[emu]`), and checks 1 and 2 below are
+    identical.
+- RelWithDebInfo with a PDB (crash hunting): `python scripts/build_fast.py --config RelWithDebInfo` writes
+  `negpluribus\_fastcore.cp3XX-win_amd64.pyd` and `negpluribus\_fastcore.pdb` (41 MB, git-ignored) at
+  the same place as the Release module; `python scripts/build_fast.py` switches back.
+  - CMake's RelWithDebInfo compiles with `/O2 /Ob1` (explicit inlining only) and without `/GL` / LTCG,
+    plus `/Zi` and `/DEBUG`.  In `gpucfr.cu` the device code keeps its flags (`-O3 --fmad=false`, no device
+    debug info); its host code gets `/Zi /Ob1`.  Build time 1 min 47 s (under load).
+  - The numbers are the same as Release (checks 1, 2 and 2b below).  Speed: see below.
+  - The PDB is read together with a crash dump.  At a fail-fast (0xC0000409) no Python handler runs, so
+    the dump must come from Windows: Error Reporting "LocalDumps" (a registry setting on the machine that
+    crashes).
+
+### Checks after the merge (this PC, 28.09.2026)
+
+MSVC 19.44.35228, CUDA 13.4.59, RTX 5070 (driver 610.62).  The main session's 12-thread CPU training ran
+on the machine throughout.  Reference files: the main session's (`bits_train_master.json` and the search
+dumps); a build of master 0fa72a7 made here from a clean tree reproduced all of them byte for byte first.
+
+| # | check | Release (CUDA) | RelWithDebInfo |
+|---|---|---|---|
+| 1 | default trainer: HU 200bb wide, production potential-16, 1 thread, 20k iterations, every node exported, plus a Monte-Carlo potential fit | 1,487,141 nodes, file identical to the reference; fit identical | identical |
+| 2 | search, 1 thread, 400 iterations, depth `end` / `hu_flop_limit` | identical (1,174 nodes / 1,227 nodes, 1,386 leaves) | identical |
+| 2b | search on the production game (`search_bench.py`, production blueprint, depth `pluribus`, 6 spots x 2 hands, 1 thread, scale 0.1) | 12 identical, 0 different | 12 identical, 0 different |
+| 3 | full suite | 307 collected: 298 passed, 9 failed | `test_batched.py`, `test_flatcfr.py`: 17 passed |
+| 4a | `gpu_bench.py --emulate`: push/fold 10bb (3000 it, batch 256), HU 100bb (100k it, batch 4096) | IDENTICAL, IDENTICAL (1,987 and 63,455 infosets) | - |
+| 4b | `gpu_bench.py` on the GPU, the same cases | IDENTICAL, IDENTICAL (the same counts) | - |
+| 4c | HU 200bb wide, production potential-16 + table, 409,600 it, batch 4096: `--gpu 0` against `--batch` on the CPU | checkpoint (327,872,561 B) and blueprint identical; 2,893,603 infosets | - |
+| 4d | the same game: 4,096,000 it in one run (checkpoint at 2,048,000) against 2,048,000 + `--resume` 2,048,000 | identical at 2,048,000 (blueprint) and at 4,096,000 (checkpoint 345,326,693 B, blueprint) | - |
+
+The 9 failures are all `tests/test_mozg_seat.py`, and the same 9 fail on master 0fa72a7 in a clean tree.
+They use attributes and modes of `friends/mozg` (`hero_pfr`, `early_profile`, `cap20`, `early`, `nonash`)
+that exist only in the main checkout's uncommitted working copy of `friends/mozg`.  The 17 new tests
+(`test_batched.py`, `test_flatcfr.py` with `[cpu]`, `[emu]`, `[gpu]`) pass.
+
+### Speed (same machine and load)
+
+Default CPU trainer, HU 200bb wide, potential-16 + table, 3 interleaved rounds (warm-up, then a window):
+
+| build | 1 thread, it/s | 4 threads, it/s |
+|---|---|---|
+| master 0fa72a7 | 9,818-9,882 | 38,372-39,445 |
+| merged, Release | 9,804-10,076 | 38,398-40,316 |
+| merged, RelWithDebInfo | 9,179-9,503 | 38,610-38,996 |
+
+(One RelWithDebInfo round ran faster, 13,011 and 50,449, while the main session's job wrote a checkpoint;
+it is left out.)  Nodes per iteration are equal, so the work is the same: the merge does not slow the
+default trainer.
+
+Search, the production game (`search_bench.py`, flop and turn spots, 1 thread, scale 0.1, 2 hands), 3
+interleaved rounds:
+
+| build | flop, it/s | turn, it/s |
+|---|---|---|
+| master 0fa72a7 | 15,471-15,795 | 92,155-99,049 |
+| merged, Release | 15,169-15,730 | 97,479-100,553 |
+| merged, RelWithDebInfo | 14,502-15,300 | 85,909-88,581 |
+
+(The third RelWithDebInfo round, 17,572 and 148,067, ran while the main session's job wrote its checkpoint,
+and is left out.)  Release is as fast as master.  RelWithDebInfo is about 5 % slower on the flop and 9 % on
+the turn: slower, but usable for a crash hunt.
+
+GPU against CPU, HU 200bb wide, production potential-16 + table, `train_blueprint.py`, the same iteration
+counts from scratch.  These runs came after the 12-thread training had ended; only a 4-thread AIVAT scoring
+job ran besides:
+
+| trainer | iterations | it/s | vs CPU, 12 threads | vs CPU, 4 threads |
+|---|---|---|---|---|
+| CPU, ordinary, 12 threads | 4,096,000 | 95,059 | 1 | - |
+| CPU, ordinary, 4 threads | 4,096,000 | 47,290 | - | 1 |
+| GPU, batch 4096, 4 host threads | 4,096,000 | 711,467 | x7.5 | x15.0 |
+| GPU, batch 16384, 4 host threads | 16,384,000 (1000 batches) | 834,160 | x8.8 | x17.6 |
+| GPU, batch 16384, 12 host threads | 16,384,000 | 827,653 | x8.7 | - |
+
+With a batched iteration worth ~0.8 (4096) or ~0.75 (16384) of an ordinary one, the net gain against 12 CPU
+threads is about x6.0 and x6.6.  That is in line with the optimizer's 3-max figures (x5.5-6 and x7.5-8
+against 16 threads).
+- The same runs with the 12-thread training running besides: CPU 4 threads 23,910, GPU 611,739 (4096) and
+  734,119 (16384).  That load halved the CPU trainer and cost the GPU 12-14 %: compare at equal load.
+- More host threads do not help at 16384 (827,653 with 12 against 834,160 with 4): the device is the limit.
+- The GPU tables do not depend on the load or the host thread count.  The 4096 checkpoint equals, byte for
+  byte, that of the run under load; the 16384 blueprints with 4 and 12 host threads are identical.
+- The flat game of this spec has 3,042,876 infosets and 8,037,881 cells.
+- At batch 4096 on 4 host threads the device hardly waits: over 819,200 iterations the host took 1.0-1.1 s
+  and the device waited 0.1 s (with the 12-thread training running).
+
+`scripts/gpu_bench.py` (HU 100bb narrow, E[HS] 8 + table, 5M iterations, `--cpu-threads 4`, with the 12-thread
+training running): CPU trainer 128,828 it/s; GPU 756,999 (x5.88) at 4096, 987,506 (x7.67) at 16384 and
+1,021,073 (x7.93) at 32768.  The host limits it there: the device waited 1.9-2.7 s for 4 host threads.
+Device-only: 1.30M, 2.64M and 2.55M it/s.
+
+**Windows power throttling.**  `train_blueprint.py` opts its process out of power throttling (EcoQoS,
+`negpluribus.fast.power`); `gpu_bench.py` does not.  Without the opt-out Windows ran the host part slowly on
+a lightly loaded machine.  HU 100bb narrow, batch 4096, 4 host threads: 242,749-244,563 it/s throttled
+against 968,913-1,000,304 opted out.
+- [proposal, not applied] call `disable_power_throttling()` in `gpu_bench.py`, as `train_blueprint.py`
+  does.
+- In the meantime, measure with `train_blueprint.py --gpu`.
+
+**Host threads (`--threads`).**  In GPU mode they prepare the deals and buckets; the default is all cores.
+Opted out, batch 4096:
+
+| game | 1 | 2 | 4 | 8 | 12 host threads |
+|---|---|---|---|---|---|
+| HU 100bb narrow, it/s | 436,115 | 679,825 | 968,913-1,291,367 (3 runs) | 554,331 | 389,185 |
+| HU 200bb wide, it/s | - | 709,537 | 732,392-745,752 | 709,228 | 729,664 |
+
+At batch 16384 on HU 200bb wide: 942,454 with 4 host threads, 935,613 with 12.  On the wide game the device
+is the limit whatever the thread count.  On the small game more than 4 threads is slower.  Pass
+`--threads 4` with `--gpu`.
+
+**Keep the CPU free while the GPU trains.**  With the CPU oversubscribed, the host part collapses, also with
+every process opted out of power throttling.
+- Next to a 12-thread CPU trainer and a 4-thread job (16 logical CPUs), batch 4096, 4 host threads:
+  - HU 200bb wide fell from 734,352 to 84,608 it/s (host preparation 2.90 -> 30.39 ms per batch);
+  - HU 100bb narrow fell from 1,291,367 to 93,684;
+  - alone again: 741,729.
+- The first test, without the opt-out (an 8-thread CPU job next to the 12-thread training): 620,244-663,684
+  -> 35,363-36,656.
+- Two GPU trainers at once share the device fairly: 330,560 + 332,763 it/s.
+- [hypothesis] The host part starts new threads for every batch (the preparation thread in `train_gpu`, its
+  workers in `prepare_batch`), and under full load each start waits for a time slice.  A persistent pool,
+  as in the CPU trainer, should remove it.  How to check: time `prepare_batch` alone under the same load.
+- Rule until then: while the GPU trains, keep the busy threads of all jobs at or below the logical CPUs.

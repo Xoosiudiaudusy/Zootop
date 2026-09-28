@@ -18,9 +18,11 @@
 #include "equity.h"
 #include "evaluator.h"
 #include "exactfeat.h"
+#include "flatcfr.h"
 #include "handindex.h"
 #include "mccfr.h"
 #include "persist.h"
+#include "philox.h"
 #include "pyrandom.h"
 #include "bucketcache.h"
 #include "rnr.h"
@@ -790,6 +792,19 @@ PYBIND11_MODULE(_fastcore, m) {
         return py::make_tuple(std::vector<int>(counts, counts + bins), mean);
     }, "next-street E[HS] histogram (counts over `bins`, mean equity) as abstraction/potential.py computes it");
 
+    m.def("philox4x32_10", [](std::vector<uint32_t> ctr, std::vector<uint32_t> key) {
+        if (ctr.size() != 4 || key.size() != 2) throw std::invalid_argument("counter of 4 words, key of 2");
+        Philox4x32 c;
+        for (int i = 0; i < 4; i++) c.v[i] = ctr[i];
+        const Philox4x32 r = philox4x32_10(c, key[0], key[1]);
+        return std::vector<uint32_t>(r.v, r.v + 4);
+    }, "one Philox4x32-10 block (known-answer tests)");
+    m.def("philox_deal", [](uint64_t seed, uint64_t t) {
+        int order[52];
+        philox_deal(seed, t, order);
+        return std::vector<int>(order, order + 52);
+    });
+
     // ---- exact potential-aware features (exactfeat.h)
     m.def("exact_feature", [](const py::sequence& hole, const py::sequence& board, int bins) {
         std::vector<int> h = to_cards(hole), bd = to_cards(board);
@@ -1189,6 +1204,110 @@ PYBIND11_MODULE(_fastcore, m) {
     // of racing a table resize.
     using ApiLock = std::lock_guard<std::mutex>;
 
+    m.def("cuda_available", []() {
+        // (usable, reason): a CUDA build of the core and a device
+        std::string why;
+        const bool ok = GpuFlatTrainer::available(why);
+        return py::make_tuple(ok, why);
+    });
+    // ---- the GPU algorithm on the CPU (flatcfr.h): level-synchronous batched MCCFR on the flat game
+    py::class_<FlatTrainer>(m, "FlatTrainer")
+        .def(py::init([](const py::dict& spec, std::shared_ptr<Bucketer> bk, uint64_t seed, bool linear, int threads) {
+            const Spec sp = spec_from_dict(spec);
+            py::gil_scoped_release nogil;
+            return new FlatTrainer(sp, std::move(bk), seed, linear, threads);
+        }), py::arg("spec"), py::arg("bucketer"), py::arg("seed") = 0, py::arg("linear") = true, py::arg("threads") = 1)
+        .def("train", [](FlatTrainer& t, long long iterations) {
+            py::gil_scoped_release nogil;
+            t.train(iterations);
+        }, py::arg("iterations"))
+        .def_property_readonly("iteration", &FlatTrainer::iteration)
+        .def_readwrite("batch_size", &FlatTrainer::batch_size)
+        .def_readwrite("linear_until", &FlatTrainer::linear_until)
+        .def_readwrite("pass_iterations", &FlatTrainer::pass_iterations)
+        .def("game_stats", [](const FlatTrainer& t) {
+            py::dict d;
+            d["decisions"] = t.game.n_decisions();
+            d["terminals"] = t.game.n_terminals();
+            d["infosets"] = t.game.n_infosets;
+            d["cells"] = t.game.n_cells;
+            d["depth"] = t.game.depth;
+            return d;
+        })
+        .def_readwrite("gpu_pass", &FlatTrainer::gpu_pass)
+        .def_readwrite("emulate_gpu", &FlatTrainer::emulate_gpu)
+        .def("use_gpu", [](FlatTrainer& t, int device) { py::gil_scoped_release nogil; t.use_gpu(device); }, py::arg("device") = 0)
+        .def_property_readonly("on_gpu", &FlatTrainer::on_gpu)
+        .def_property_readonly("gpu_device", &FlatTrainer::gpu_device)
+        .def("gpu_stats", [](const FlatTrainer& t) {
+            const GpuStats s = t.gpu_stats();
+            py::dict d;
+            d["items"] = s.items;
+            d["records"] = s.records;
+            d["ms_traverse"] = s.ms_traverse;
+            d["ms_apply"] = s.ms_apply;
+            d["ms_forward"] = s.ms_forward;
+            d["ms_backward"] = s.ms_backward;
+            d["ms_sort"] = s.ms_sort;
+            d["ms_runs"] = s.ms_runs;
+            d["ms_prepare_total"] = t.ms_prepare_total;
+            d["ms_device_total"] = t.ms_device_total;
+            d["ms_wait_prepare"] = t.ms_wait_prepare;
+            return d;
+        })
+        .def("export_nodes", [](FlatTrainer& t) {
+            // {key: (regret, strategy_sum, visits)} of every infoset an update reached
+            py::dict out;
+            t.for_each_touched([&](const std::string& key, const uint8_t*, const double* r, const double* s, int na, int64_t v) {
+                out[py::str(key)] = py::make_tuple(std::vector<double>(r, r + na), std::vector<double>(s, s + na), v);
+            });
+            return out;
+        })
+        .def("copy_to", [](FlatTrainer& ft, Trainer& t) {
+            // the tables into an ordinary Trainer (replacing its nodes) and its iteration count, in C++: what
+            // export_checkpoint + Trainer.import_nodes do, without the Python dict (large games)
+            py::gil_scoped_release nogil;
+            ApiLock lk(t.api_mu);
+            if (ft.spec.n_players != t.spec.n_players) throw std::invalid_argument("copy_to: another game");
+            t.nodes.clear();
+            ft.for_each_touched([&](const std::string& key, const uint8_t* ids, const double* r, const double* s, int na, int64_t v) {
+                Node* n = get_or_create_by_string(t.nodes, t.codec, key, ids, na, t.main_arena()).node;
+                n->init(ids, na);
+                for (int i = 0; i < na; i++) { n->regret()[i] = r[i]; n->strategy_sum()[i] = s[i]; }
+                n->visits = v;
+            });
+            t.set_iteration(ft.iteration());
+        }, py::arg("trainer"))
+        .def("copy_from", [](FlatTrainer& ft, Trainer& t) {
+            // an ordinary Trainer's tables (a loaded checkpoint) into the flat tables and the device: resume.
+            // Returns the number of rows loaded; throws if a node is not a row of this game
+            py::gil_scoped_release nogil;
+            ApiLock lk(t.api_mu);
+            if (ft.spec.n_players != t.spec.n_players) throw std::invalid_argument("copy_from: another game");
+            ft.begin_load();
+            long long n = 0;
+            std::string bad;
+            t.nodes.for_each([&](const char* key, Node& node) {
+                if (!bad.empty()) return;
+                const std::string k(key);
+                if (ft.load_row(k, node.acts, node.n, node.regret(), node.strategy_sum(), node.visits)) n++;
+                else bad = k;
+            });
+            if (!bad.empty()) throw std::runtime_error("copy_from: node '" + bad + "' is not a row of the flat game (other game or actions)");
+            ft.end_load(t.iteration());
+            return n;
+        }, py::arg("trainer"))
+        .def("export_checkpoint", [](FlatTrainer& t) {
+            // {key: (action names, regret, strategy_sum, visits)}: the rows Trainer.import_nodes takes
+            py::dict out;
+            t.for_each_touched([&](const std::string& key, const uint8_t* ids, const double* r, const double* s, int na, int64_t v) {
+                py::list acts;
+                for (int i = 0; i < na; i++) acts.append(t.grid.names[ids[i]]);
+                out[py::str(key)] = py::make_tuple(acts, std::vector<double>(r, r + na), std::vector<double>(s, s + na), v);
+            });
+            return out;
+        });
+
     // ---- trainer
     py::class_<Trainer>(m, "Trainer")
         .def(py::init([](const py::dict& spec, std::shared_ptr<Bucketer> bk, uint64_t seed, bool linear, int threads, bool verify_keys) {
@@ -1231,6 +1350,12 @@ PYBIND11_MODULE(_fastcore, m) {
            "regret-based pruning (Pluribus): skip actions with regret < -below (stored units), or with relative=True below "
            "-below bb per unit of the node's own traverser weight; below = 0 turns it off")
         .def_property_readonly("pruned_actions", &Trainer::pruned_actions)
+        .def_property("batch_size", [](const Trainer& t) { return t.batch_size; },
+                      [](Trainer& t, long long v) {
+                          ApiLock lk(t.api_mu);
+                          if (v < 0) throw std::invalid_argument("batch_size >= 0");
+                          t.batch_size = v;
+                      }, "> 0: batched synchronous mode (CPU reference of the GPU trainer); 0: the sequential trainer")
         .def_property("linear_until", [](const Trainer& t) { return t.linear_until; },
                       [](Trainer& t, long long v) {
                           ApiLock lk(t.api_mu);
@@ -1461,14 +1586,17 @@ PYBIND11_MODULE(_fastcore, m) {
         }, py::arg("seed") = 0, py::arg("bias") = 5.0,
            "draw one action per blueprint infoset and continuation; rollouts then play it (Pluribus' compression)")
         .def("clear_presampled", [](SearchGame& g) { g.presampled.clear(); g.presampled.shrink_to_fit(); })
-        .def_property_readonly("presampled_bytes", [](const SearchGame& g) { return g.presampled.capacity(); });
+        .def_property_readonly("presampled_bytes", [](const SearchGame& g) { return g.presampled.capacity(); })
+        .def_readwrite("tables_keep", &SearchGame::tables_keep,
+                       "bucket tables (river, turn) of this many recent root boards are kept and shared by the searches")
+        .def("clear_board_tables", [](const SearchGame& g) { g.clear_board_tables(); });
 
     py::class_<SubgameSearch>(m, "SubgameSearch")
         .def(py::init([](std::shared_ptr<SearchGame> game, const std::vector<int>& stacks, int button,
                          const std::vector<std::pair<int, int>>& actions, const std::vector<int>& board, int seat,
                          const std::vector<int>& hole, long long iterations, double time_budget, int threads, uint64_t seed,
                          double focus, double min_prob, bool linear, const py::object& overrides, const py::object& depth,
-                         int rollouts, double bias, int debug_leaves) {
+                         int rollouts, double bias, int debug_leaves, bool legacy_traverse) {
             HandInput h;
             h.stacks = stacks;
             h.button = button;
@@ -1500,12 +1628,14 @@ PYBIND11_MODULE(_fastcore, m) {
             p.rollouts = rollouts;
             p.bias = bias;
             p.debug_leaves = debug_leaves;
+            p.legacy_traverse = legacy_traverse;
             py::gil_scoped_release nogil;
             return new SubgameSearch(std::shared_ptr<const SearchGame>(game), h, p);
         }), py::arg("game"), py::arg("stacks"), py::arg("button"), py::arg("actions"), py::arg("board"), py::arg("seat"),
             py::arg("hole"), py::arg("iterations") = 0, py::arg("time_budget") = 2.0, py::arg("threads") = 15, py::arg("seed") = 0,
             py::arg("focus") = 0.5, py::arg("min_prob") = 1e-3, py::arg("linear") = true, py::arg("overrides") = py::none(),
             py::arg("depth") = "end", py::arg("rollouts") = 3, py::arg("bias") = 5.0, py::arg("debug_leaves") = 0,
+            py::arg("legacy_traverse") = false,
             "the subgame of the hand so far: root at the start of the current round, ranges by Bayes over the blueprint; "
             "depth 'end' / 'pluribus' / 'hu_flop_limit' / 'next_street' (leaves: four continuations, `rollouts` rollouts each)")
         .def("solve", [](SubgameSearch& s) {

@@ -68,9 +68,21 @@ count_betting_tree; 4585208, f929d03, 8c9dd43 прунинг (по умолча�
 убьёт прогон): `$si = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ShowWindow=[uint16]0};
 Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine='"C:\Program Files\Git\bin\bash.exe" -lc "bash <скрипт> > <лог> 2>&1"'; CurrentDirectory='C:\Project Manchatten\NegativePluriibus'; ProcessStartupInformation=$si}`.
 Прогоны 27.09 23:07 запущены без ShowWindow=0: три окна bash.exe у пользователя — не закрывать до их конца.
-План и прогнозы: `docs/search_vs_blueprint.md`. Перенос data/ на диск D (`scripts/move_data_to_d.ps1` объяснялки; решено 27.09, 22:40): утром 28.09, когда очередь
-опытов закончилась и ни один python-процесс проекта не идёт (скрипт сам это проверяет), скрипт как есть, без
-`-DeleteOld`: сначала `powershell -ExecutionPolicy Bypass -File scripts\move_data_to_d.ps1` (проверка), затем с `-Go`.
+План и прогнозы: `docs/search_vs_blueprint.md`. Перенос data/ на диск D сделан 28.09 в 00:21–00:31 (`scripts/move_data_to_d.ps1 -Go`, прогоны на это время
+остановлены по PID и возобновлены): 354 файла, 51.5 ГБ, сверка по размеру и времени, junction `data` →
+`D:\NegativePluribus\data`, корзины загружаются через него. Заминка: переименование отказывало из-за осиротевшего
+`tail.exe -F` монитора на `data/duels64/status.txt` (убит по PID). Старая копия `data.old_move` удаляется
+`-DeleteOld` после первого нормального прогона через junction.
+
+**Состояние на 28.09, 03:35.** Готовы и посчитаны (AIVAT за поиск, сдачи 0..1999): duel2_bp −26.3 ± 17.8; E0 (blueprint
+против blueprint) −5.5 ± 9.3; E3 (поиск с тёрна) −9.2 ± 14.0, в паре с duel2_bp +17.1 ± 20.7; E5 (только ривер)
++1.0 ± 8.9, в паре +27.3 ± 17.4; проба сходимости 20/20 (половина отклонений — недосчёт при 350k, половина —
+устойчивое другое решение). Идут: ПК — E6 (с 149-й сдачи на новой сборке) → E2 (сдачи 0..999, остановить по PID
+после 999 и склеить с ноутбучными 1000..1999 `*_laptop`); ноут (объяснялка) — E1 → E1′ → половина E2; AIVAT дуэлей 64
+(обратные контроли, pot16); полный набор тестов на новом master (`SP\full_tests_master_3486edd.txt`). Ускоренный
+поиск Оптимизаторки влит в master (b34ade3…3486edd), проверен побайтно; заглушки в `SP\p3` (check_e1_final.txt,
+check_e1p_average.txt, строки «aivat (placeholder)» в статусе) заменяются копиями с ноута. Подробности и числа —
+`docs/search_vs_blueprint.md`.
 
 ## 3. Порядок слияния в master
 

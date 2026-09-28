@@ -12,6 +12,7 @@ data/
 negpluribus/buckets_ehs10.json
 negpluribus/buckets_pot10.json
 *.pyd
+*.pdb
 *.so
 tools/
 
@@ -19,3 +20,4 @@ tools/
 webapp/server.pid
 webapp/bots.local.json
 webapp/blueprints/
+data.old_move/

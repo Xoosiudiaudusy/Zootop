@@ -48,6 +48,12 @@
 #include "nodetable.h"
 #include "persist.h"
 
+#if defined(_MSC_VER)
+#define NEGP_NOINLINE __declspec(noinline)
+#else
+#define NEGP_NOINLINE __attribute__((noinline))
+#endif
+
 namespace negp {
 
 constexpr int N_COMBOS = 1326;
@@ -160,6 +166,24 @@ inline void apply_continuation(const int* kind, int n, int choice, double bias, 
 }
 
 // ------------------------------------------------------------------ inputs and outputs
+// The bucket tables of a search root's board: the river buckets of every board the subgame can reach
+// from a flop or turn root (Bucketer::river_buckets_all, built at once; base -1 when the abstraction has
+// no batch), and, for a flop root, the turn buckets of every combo per turn card (filled on first use
+// from the bucketer).  They depend only on the bucketer and the board, so SearchGame keeps those of its
+// last boards and every search on one of those boards shares them (a lookup instead of a rebuild: the
+// agent searches a board several times, and every flop search used to rebuild 1,176 river boards).
+struct SearchBoardTables {
+    std::vector<int> board;                       // the root board, in the order given
+    std::once_flag river_once;
+    int river_base = -1;                          // the root board's size (3 or 4); -1: no river table
+    std::vector<int32_t> river_slot;              // 52 x 52: base 4 the fifth card, base 3 the smaller x 52 + the larger extra card
+    std::vector<uint8_t> river_b;                 // boards x 1326
+    std::once_flag turn_init;
+    bool turn_on = false;
+    std::vector<uint8_t> turn_b;                  // 52 x 1326 (flop roots)
+    std::unique_ptr<std::once_flag[]> turn_once;  // per turn card
+};
+
 struct SearchGame {
     Spec spec;
     BetGrid grid;
@@ -168,6 +192,28 @@ struct SearchGame {
     // optional (Pluribus' compression of the continuations): per blueprint record and continuation,
     // the index among the record's actions of one action drawn in advance; empty: off
     std::vector<uint8_t> presampled;
+
+    // the bucket tables of the last boards searched (SearchBoardTables); tables_keep boards are kept
+    size_t tables_keep = 8;
+    std::shared_ptr<SearchBoardTables> board_tables(const std::vector<int>& board) const {
+        std::lock_guard<std::mutex> lk(tables_mu_);
+        for (size_t i = 0; i < tables_.size(); i++)
+            if (tables_[i]->board == board) {
+                std::shared_ptr<SearchBoardTables> t = tables_[i];
+                tables_.erase(tables_.begin() + (long)i);
+                tables_.push_back(t);  // most recent last
+                return t;
+            }
+        std::shared_ptr<SearchBoardTables> t = std::make_shared<SearchBoardTables>();
+        t->board = board;
+        tables_.push_back(t);
+        while (tables_.size() > std::max<size_t>(1, tables_keep)) tables_.erase(tables_.begin());
+        return t;
+    }
+    void clear_board_tables() const {
+        std::lock_guard<std::mutex> lk(tables_mu_);
+        tables_.clear();
+    }
 
     SearchGame(const Spec& s, std::shared_ptr<Bucketer> bk, std::shared_ptr<const BlueprintTable> bp)
         : spec(s), grid(s.grid()), bucketer(std::move(bk)), blueprint(std::move(bp)) {
@@ -215,6 +261,10 @@ struct SearchGame {
         }
         presampled = std::move(out);
     }
+
+private:
+    mutable std::mutex tables_mu_;
+    mutable std::vector<std::shared_ptr<SearchBoardTables>> tables_;
 };
 
 struct LikelihoodOverride {  // replaces sigma = blueprint for one seat's actions on one street
@@ -244,6 +294,7 @@ struct SearchParams {
     int rollouts = 3;          // rollouts per leaf value (Depth-Limited Solving 2018: three)
     double bias = 5.0;         // the continuations' factor (Pluribus: 5)
     int debug_leaves = 0;      // tests: log this many leaf choices made inside the solver
+    bool legacy_traverse = false;  // tests: traverse with the engine at every node instead of the public tree (same numbers)
 };
 
 struct LeafInfo {  // tests: one leaf of the public tree
@@ -316,6 +367,7 @@ public:
         if (game_->blueprint)
             for (size_t i = 0; i < grid_to_bp_.size(); i++)
                 grid_to_bp_[i] = game_->blueprint->name_index(game_->grid.names[i].data(), game_->grid.names[i].size());
+        bt_ = game_->board_tables(hand_.board);
         build_river_table();
         init_turn_table();
     }
@@ -336,7 +388,7 @@ public:
     int n_classes() const { return n_classes_; }
     double range_seconds() const { return range_seconds_; }
     double river_table_seconds() const { return river_seconds_; }
-    int river_table_boards() const { return (int)(river_.b.size() / N_COMBOS); }
+    int river_table_boards() const { return (int)(bt_->river_b.size() / N_COMBOS); }
     int limit_street() const { return limit_street_; }
     int raise_limit() const { return raise_limit_; }
     NodeActions actions_at(const HandState& st, int k) const {
@@ -440,6 +492,7 @@ public:
                                        std::chrono::duration<double>(params_.time_budget > 0 ? params_.time_budget : 0.0));
         std::vector<int> traversers;
         for (int s = 0; s < root_.n; s++) if (root_.players[s].can_act()) traversers.push_back(s);
+        if (!frozen_ && !params_.legacy_traverse) build_troot();  // the public tree of this solve (its node caches point into table_)
         // our decision (our actual hole's class at the end of the real path): its strategy is added up
         // once per iteration, which is the average our hole plays (its own reach there is fixed)
         NodeActions our_na;
@@ -463,13 +516,17 @@ public:
                     for (int trav : traversers) {
                         const bool focused = trav == hand_.our_seat && ctx.rng.uniform() < params_.focus;
                         deal(ctx, focused);
-                        HandState st(root_);
-                        st.deck = ctx.deck;
-                        for (int s = 0; s < st.n; s++) {
-                            st.players[s].hole[0] = ctx.holes[s][0];
-                            st.players[s].hole[1] = ctx.holes[s][1];
+                        if (frozen_ || params_.legacy_traverse) {
+                            HandState st(root_);
+                            st.deck = ctx.deck;
+                            for (int s = 0; s < st.n; s++) {
+                                st.players[s].hole[0] = ctx.holes[s][0];
+                                st.players[s].hole[1] = ctx.holes[s][1];
+                            }
+                            traverse(st, PathHash(), 0, true, trav, weight, 1.0, focused, ctx);
+                        } else {
+                            traverse_tree(troot_, trav, weight, 1.0, focused, ctx);
                         }
-                        traverse(st, PathHash(), 0, true, trav, weight, 1.0, focused, ctx);
                         ctx.traversals++;
                         if (focused) ctx.focused++;
                     }
@@ -1246,6 +1303,11 @@ private:
         long long iterations = 0, traversals = 0, focused = 0, nodes = 0, forced = 0, redeals = 0;
         long long leaves = 0, leaf_evals = 0, rollouts = 0, rollout_steps = 0;
         double ours[MAX_ACTIONS] = {0.0};  // sum over this thread's iterations of weight x our decision's strategy
+        // the deal's board (the root's cards, then the deck from the root's position) and the showdown
+        // strengths of the live seats, computed once per deal (the public tree's terminals)
+        int board5[5];
+        int str_board = -1;  // board size the strengths are for (-1: not computed for this deal)
+        int64_t str[MAX_PLAYERS];
     };
 
     // a leaf: who chooses a continuation, what of the board they saw, the blueprint history there
@@ -1256,46 +1318,34 @@ private:
         HistHash hh;
     };
 
-    // river buckets of every board the subgame can reach from a flop or turn root, computed at once
-    // (Bucketer::river_buckets_all; empty when the abstraction has no batch)
-    struct RiverTable {
-        int base = -1;                // the root board's size (3 or 4)
-        std::vector<int32_t> slot;    // 52 x 52: base 4 the fifth card, base 3 the smaller x 52 + the larger extra card
-        std::vector<uint8_t> b;       // boards x 1326
-    };
-    RiverTable river_;
-    double river_seconds_ = 0.0;
-
-    // flop roots: turn buckets of every combo per turn card, filled on first use from the bucketer
-    // (its cache when warm): a lookup instead of a canonical form and a cache probe per rollout step
-    struct TurnTable {
-        bool on = false;
-        std::vector<uint8_t> b;                       // 52 x 1326
-        std::unique_ptr<std::once_flag[]> once;       // per turn card
-    };
-    mutable TurnTable turn_;
+    // the bucket tables of the root's board, shared through the game (SearchBoardTables)
+    std::shared_ptr<SearchBoardTables> bt_;
+    double river_seconds_ = 0.0;  // seconds this search spent building the river table (0: shared)
 
     void init_turn_table() {
-        turn_ = TurnTable();
         if (root_.n_board != 3 || game_->spec.max_street < TURN) return;
-        turn_.b.assign((size_t)52 * N_COMBOS, 255);
-        turn_.once.reset(new std::once_flag[52]);
-        turn_.on = true;
+        SearchBoardTables& t = *bt_;
+        std::call_once(t.turn_init, [&t]() {
+            t.turn_b.assign((size_t)52 * N_COMBOS, 255);
+            t.turn_once.reset(new std::once_flag[52]);
+            t.turn_on = true;
+        });
     }
     int turn_bucket(const int* hole, const int* board4) const {
+        SearchBoardTables& tb = *bt_;
         const int t = board4[3];
-        std::call_once(turn_.once[(size_t)t], [&]() {
+        std::call_once(tb.turn_once[(size_t)t], [&]() {
             const ComboTable& ct = combo_table();
             bool on[52] = {false};
             for (int i = 0; i < 4; i++) on[board4[i]] = true;
-            uint8_t* row = &turn_.b[(size_t)t * N_COMBOS];
+            uint8_t* row = &tb.turn_b[(size_t)t * N_COMBOS];
             for (int c = 0; c < N_COMBOS; c++) {
                 if (on[ct.c0[c]] || on[ct.c1[c]]) continue;
                 const int h[2] = {ct.c0[c], ct.c1[c]};
                 row[c] = (uint8_t)game_->bucketer->bucket(h, board4, 4);
             }
         });
-        return turn_.b[(size_t)t * N_COMBOS + (size_t)combo_index(hole[0], hole[1])];
+        return tb.turn_b[(size_t)t * N_COMBOS + (size_t)combo_index(hole[0], hole[1])];
     }
     int limit_street_ = RIVER;   // the last street searched; the start of the next one is a leaf
     int raise_limit_ = 0;        // > 0: right after this many raises on the root street is a leaf too
@@ -1333,8 +1383,11 @@ private:
     }
 
     void build_river_table() {
+        river_seconds_ = 0.0;
+        std::call_once(bt_->river_once, [&]() { build_river_table_once(*bt_); });
+    }
+    void build_river_table_once(SearchBoardTables& rt) {
         const auto t0 = std::chrono::steady_clock::now();
-        river_ = RiverTable();
         const int base = root_.n_board;
         if (base != 3 && base != 4) return;
         if (game_->spec.max_street < RIVER) return;  // no river decisions, in the subgame or in rollouts
@@ -1370,31 +1423,32 @@ private:
         work();
         for (auto& th : pool) th.join();
         if (unsupported.load()) return;
-        river_.base = base;
-        river_.slot.assign(52 * 52, -1);
+        rt.river_slot.assign(52 * 52, -1);
         for (size_t i = 0; i < extras.size(); i++) {
             const int key = base == 4 ? extras[i].second : extras[i].first * 52 + extras[i].second;
-            river_.slot[(size_t)key] = (int32_t)i;
+            rt.river_slot[(size_t)key] = (int32_t)i;
         }
-        river_.b = std::move(b);
+        rt.river_b = std::move(b);
+        rt.river_base = base;
         river_seconds_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     }
 
     // bucket of `hole` on a board past the root's street: the river table on the river when it
     // exists, else the bucketer (and its cache)
     int later_bucket(const int* hole, const int* board, int n_board) const {
-        if (n_board == 5 && river_.base > 0) {
+        const SearchBoardTables& rt = *bt_;
+        if (n_board == 5 && rt.river_base > 0) {
             int key;
-            if (river_.base == 4) {
+            if (rt.river_base == 4) {
                 key = board[4];
             } else {
                 const int t = std::min(board[3], board[4]), r = std::max(board[3], board[4]);
                 key = t * 52 + r;
             }
-            const int32_t i = river_.slot[(size_t)key];
-            if (i >= 0) return river_.b[(size_t)i * N_COMBOS + (size_t)combo_index(hole[0], hole[1])];
+            const int32_t i = rt.river_slot[(size_t)key];
+            if (i >= 0) return rt.river_b[(size_t)i * N_COMBOS + (size_t)combo_index(hole[0], hole[1])];
         }
-        if (n_board == 4 && turn_.on) return turn_bucket(hole, board);
+        if (n_board == 4 && rt.turn_on) return turn_bucket(hole, board);
         return game_->bucketer->bucket(hole, board, n_board);
     }
 
@@ -1937,6 +1991,8 @@ private:
         ctx.actual = ctx.combo[hand_.our_seat] == our_combo_;
         for (int s = 0; s < MAX_PLAYERS; s++)
             for (int b = 0; b < 6; b++) ctx.bucket_memo[s][b] = -1;
+        for (int i = 0; i < 5; i++) ctx.board5[i] = i < root_.n_board ? root_.board[i] : ctx.deck[root_.deck_pos + (i - root_.n_board)];
+        ctx.str_board = -1;
     }
 
     int card_part(const HandState& st, int seat, Ctx& ctx) const {
@@ -2023,6 +2079,259 @@ private:
         st.apply(na.type[a], na.amount[a]);
         ph.step(a);
         return traverse(st, ph, k + 1, path_node && a == path_[(size_t)k].index, traverser, weight, w_imp, focused, ctx);
+    }
+
+    // ---- the subgame's public tree: what traverse() recomputes from the engine at every visit (the
+    // actions, the path hash, whether the node is on the real path or a leaf, the pot at a terminal),
+    // stored once per public node and solve.  Nodes are created on first visit by replaying the path
+    // from the root; a decision node caches, per card part (class on the root's street, bucket later),
+    // the table node traverse() would look up.  traverse_tree() makes the same random draws, the same
+    // table updates and the same arithmetic in the same order as traverse(): the same search, bit for bit.
+    struct TNode {
+        TNode* parent = nullptr;
+        int parent_action = 0;
+        bool terminal = false, leaf = false, on_path = false, path_node = false;
+        int k = 0, seat = -1, street = 0, n_board = 0, path_index = -1;
+        PathHash ph;
+        NodeActions na;
+        // terminal: what HandState::finish needs besides the cards, prepared once: the contribution
+        // levels (sorted, distinct), the portion of each and its eligible seats in the order the odd
+        // chips go (seat after the button first); a pot without showdown is a fixed value per seat
+        int n_act = 0;
+        bool folded[MAX_PLAYERS];
+        int32_t invested[MAX_PLAYERS];
+        double fixed_value[MAX_PLAYERS];  // n_act <= 1: the net result per seat in bb
+        int n_levels = 0;
+        int portion[MAX_PLAYERS];
+        int n_el[MAX_PLAYERS];
+        int8_t el[MAX_PLAYERS][MAX_PLAYERS];
+        std::unique_ptr<std::atomic<TNode*>[]> child;
+        std::unique_ptr<std::atomic<Node*>[]> cache;
+        int n_cache = 0;
+    };
+    std::vector<std::unique_ptr<TNode>> tnodes_;
+    std::mutex tree_mu_;
+    TNode* troot_ = nullptr;
+
+    TNode* make_tnode(TNode* parent, int a, const HandState& st, const PathHash& ph, int k, bool on_path) {
+        std::unique_ptr<TNode> up(new TNode);
+        TNode* t = up.get();
+        t->parent = parent;
+        t->parent_action = a;
+        t->ph = ph;
+        t->k = k;
+        t->on_path = on_path;
+        t->street = st.street;
+        t->n_board = st.n_board;
+        if (st.terminal) {
+            t->terminal = true;
+            for (int s = 0; s < st.n; s++) {
+                t->folded[s] = st.players[s].folded;
+                t->invested[s] = st.players[s].invested;
+                if (!st.players[s].folded) t->n_act++;
+            }
+            prepare_terminal(*t);
+        } else if (is_leaf(st, k, on_path)) {
+            t->leaf = true;
+        } else {
+            t->seat = st.to_act;
+            t->path_node = on_path && k < (int)path_.size();
+            build_actions(st, observe(st, t->seat), t->path_node ? &path_[(size_t)k] : nullptr, t->na);
+            if (t->path_node) t->path_index = path_[(size_t)k].index;
+            t->child.reset(new std::atomic<TNode*>[(size_t)t->na.n]);
+            for (int i = 0; i < t->na.n; i++) t->child[(size_t)i].store(nullptr, std::memory_order_relaxed);
+            t->n_cache = st.street == root_street_ ? n_classes_ : tree_buckets_;
+            if (st.street == PREFLOP && st.street != root_street_) t->n_cache = 169;
+            t->cache.reset(new std::atomic<Node*>[(size_t)t->n_cache]);
+            for (int i = 0; i < t->n_cache; i++) t->cache[(size_t)i].store(nullptr, std::memory_order_relaxed);
+        }
+        tnodes_.push_back(std::move(up));
+        return t;
+    }
+
+    // the public state at `t` for the deck `deck` (and the holes of `holes`, if given): the root, then
+    // the path's actions
+    HandState replay_tnode(const TNode* t, const int* deck, const int (*holes)[2]) const {
+        const TNode* chain[512];
+        int m = 0;
+        for (const TNode* p = t; p->parent; p = p->parent) chain[m++] = p;
+        HandState st(root_);
+        st.deck = deck;
+        if (holes)
+            for (int s = 0; s < st.n; s++) {
+                st.players[s].hole[0] = holes[s][0];
+                st.players[s].hole[1] = holes[s][1];
+            }
+        for (int i = m - 1; i >= 0; i--) {
+            const TNode* par = chain[i]->parent;
+            const int a = chain[i]->parent_action;
+            st.apply(par->na.type[a], par->na.amount[a]);
+        }
+        return st;
+    }
+
+    TNode* tchild(TNode* t, int a) {
+        TNode* c = t->child[(size_t)a].load(std::memory_order_acquire);
+        return c ? c : new_tchild(t, a);
+    }
+    // (out of line: the replay's state and path buffers would otherwise be set up at every tchild call)
+    NEGP_NOINLINE TNode* new_tchild(TNode* t, int a) {
+        TNode* c;
+        std::lock_guard<std::mutex> lk(tree_mu_);
+        c = t->child[(size_t)a].load(std::memory_order_relaxed);
+        if (c) return c;
+        HandState st = replay_tnode(t, deck_, nullptr);
+        st.apply(t->na.type[a], t->na.amount[a]);
+        PathHash ph = t->ph;
+        ph.step(a);
+        c = make_tnode(t, a, st, ph, t->k + 1, t->path_node && a == t->path_index);
+        t->child[(size_t)a].store(c, std::memory_order_release);
+        return c;
+    }
+
+    int tree_buckets_ = 1;  // card parts cached per node past the root's street: the bucketer's bucket count
+
+    // the card-independent part of HandState::finish at terminal t (see TNode)
+    void prepare_terminal(TNode& t) const {
+        const int n = root_.n;
+        const int button = root_.button;
+        int active[MAX_PLAYERS];
+        int n_act = 0;
+        for (int i = 0; i < n; i++) if (!t.folded[i]) active[n_act++] = i;
+        int levels[MAX_PLAYERS];
+        int n_levels = 0;
+        for (int i = 0; i < n; i++) if (t.invested[i] > 0) levels[n_levels++] = t.invested[i];
+        std::sort(levels, levels + n_levels);
+        n_levels = (int)(std::unique(levels, levels + n_levels) - levels);
+        t.n_levels = n_levels;
+        int prev = 0;
+        int won_fixed[MAX_PLAYERS] = {0};
+        for (int li = 0; li < n_levels; li++) {
+            const int lvl = levels[li];
+            int portion = 0;
+            for (int i = 0; i < n; i++) portion += std::max(0, std::min(t.invested[i], lvl) - prev);
+            int eligible[MAX_PLAYERS];
+            int n_el = 0;
+            for (int j = 0; j < n_act; j++) if (t.invested[active[j]] >= lvl) eligible[n_el++] = active[j];
+            if (n_el == 0) for (int j = 0; j < n_act; j++) eligible[n_el++] = active[j];
+            // winners are a subsequence of the eligible seats; HandState::finish stable-sorts them by
+            // (seat - button - 1) mod n, distinct per seat, so sorting the eligible seats once gives the same order
+            std::stable_sort(eligible, eligible + n_el, [&](int x, int y) { return ((x - button - 1) % n + n) % n < ((y - button - 1) % n + n) % n; });
+            t.portion[li] = portion;
+            t.n_el[li] = n_el;
+            for (int j = 0; j < n_el; j++) t.el[li][j] = (int8_t)eligible[j];
+            if (n_el == 1) won_fixed[eligible[0]] += portion;
+            prev = lvl;
+        }
+        for (int s = 0; s < n; s++) t.fixed_value[s] = (double)(won_fixed[s] - t.invested[s]) / (double)game_->spec.bb;
+    }
+
+    void build_troot() {
+        tree_buckets_ = std::max(1, game_->bucketer->identity().n_buckets);
+        tnodes_.clear();
+        HandState st(root_);
+        troot_ = make_tnode(nullptr, 0, st, PathHash(), 0, true);
+    }
+
+    // HandState::finish + net for `seat`, from the prepared terminal and the deal's cards
+    double tree_net(const TNode* t, int seat, Ctx& ctx) const {
+        if (t->n_act <= 1) return t->fixed_value[seat];
+        const int n = root_.n;
+        if (ctx.str_board != t->n_board) {
+            for (int s = 0; s < n; s++) {  // every seat: with 3+ players another terminal of this board has other folds
+                int cards[7];
+                cards[0] = ctx.holes[s][0];
+                cards[1] = ctx.holes[s][1];
+                for (int i = 0; i < t->n_board; i++) cards[2 + i] = ctx.board5[i];
+                ctx.str[s] = evaluate(cards, 2 + t->n_board);
+            }
+            ctx.str_board = t->n_board;
+        }
+        int won = 0;
+        for (int li = 0; li < t->n_levels; li++) {
+            const int n_el = t->n_el[li];
+            const int8_t* el = t->el[li];
+            if (n_el == 1) {
+                if (el[0] == seat) won += t->portion[li];
+                continue;
+            }
+            int64_t best = -1;
+            for (int j = 0; j < n_el; j++) best = std::max(best, ctx.str[el[j]]);
+            int n_ws = 0, mine = -1;
+            for (int j = 0; j < n_el; j++)
+                if (ctx.str[el[j]] == best) {
+                    if (el[j] == seat) mine = n_ws;
+                    n_ws++;
+                }
+            if (mine >= 0) {
+                const int share = t->portion[li] / n_ws, odd = t->portion[li] % n_ws;
+                won += share + (mine < odd ? 1 : 0);
+            }
+        }
+        return (double)(won - t->invested[seat]) / (double)game_->spec.bb;
+    }
+
+    int tree_card_part(const TNode* t, int seat, Ctx& ctx) const {
+        if (t->street == root_street_) return class_of_[(size_t)ctx.combo[seat]];
+        int& m = ctx.bucket_memo[seat][t->n_board];
+        if (m < 0) m = later_bucket(ctx.holes[seat], ctx.board5, t->n_board);
+        return m;
+    }
+
+    NEGP_NOINLINE double tree_leaf_value(const TNode* t, int traverser, double weight, double w_imp, bool focused, Ctx& ctx) {
+        HandState st = replay_tnode(t, ctx.deck, ctx.holes);
+        return leaf_value(st, t->ph, traverser, weight, w_imp, focused, ctx);
+    }
+
+    // traverse() on the public tree (no frozen round)
+    double traverse_tree(TNode* t, int traverser, double weight, double w_imp, bool focused, Ctx& ctx) {
+        if (t->terminal) return tree_net(t, traverser, ctx);
+        if (t->leaf) return tree_leaf_value(t, traverser, weight, w_imp, focused, ctx);
+        const int seat = t->seat;
+        const NodeActions& na = t->na;
+        const int card = tree_card_part(t, seat, ctx);
+        Node* node = card < t->n_cache ? t->cache[(size_t)card].load(std::memory_order_acquire) : nullptr;
+        if (!node) {
+            node = table_->get_or_create(search_key(t->street, seat, card, t->ph), ctx.tid, na.n, [&](Node& nd, NodeArena&) {
+                nd.init(na.id, na.n);
+                return "";
+            }).node;
+            if (card < t->n_cache) t->cache[(size_t)card].store(node, std::memory_order_release);
+        }
+        ctx.nodes++;
+        if (t->path_node && seat == hand_.our_seat && ctx.actual) {  // our action already taken: fixed for our actual hole
+            ctx.forced++;
+            return traverse_tree(tchild(t, t->path_index), traverser, weight, w_imp, focused, ctx);
+        }
+        double sigma[MAX_ACTIONS];
+        node->lock.lock();
+        node->current_strategy(sigma);
+        node->lock.unlock();
+        if (t->path_node && focused && seat != traverser) {  // an opponent's real action, weighted by its probability
+            const int a = t->path_index;
+            const double w2 = w_imp * sigma[a];
+            if (!(w2 > 0.0)) return 0.0;
+            return traverse_tree(tchild(t, a), traverser, weight, w2, focused, ctx);
+        }
+        if (seat == traverser) {
+            double utils[MAX_ACTIONS];
+            for (int i = 0; i < na.n; i++) utils[i] = traverse_tree(tchild(t, i), traverser, weight, w_imp, focused, ctx);
+            double u = 0.0;
+            for (int i = 0; i < na.n; i++) u += sigma[i] * utils[i];
+            const double w = weight * w_imp;
+            node->lock.lock();
+            for (int i = 0; i < na.n; i++) node->regret()[i] += w * (utils[i] - u);
+            node->lock.unlock();
+            return u;
+        }
+        if (!focused) {
+            node->lock.lock();
+            for (int i = 0; i < na.n; i++) node->strategy_sum()[i] += weight * sigma[i];
+            node->visits += 1;
+            node->lock.unlock();
+        }
+        const int a = sample(sigma, na.n, ctx.rng);
+        return traverse_tree(tchild(t, a), traverser, weight, w_imp, focused, ctx);
     }
 };
 

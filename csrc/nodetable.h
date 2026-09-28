@@ -50,6 +50,7 @@
 #endif
 
 #include "abstraction.h"
+#include "cfrmath.h"
 #include "engine.h"
 
 namespace negp {
@@ -62,7 +63,7 @@ inline void cpu_relax() {
 #endif
 }
 
-constexpr int MAX_ACTIONS = 8;
+// MAX_ACTIONS, regret_matching: cfrmath.h
 
 // Per-node lock, held for a handful of arithmetic operations.  Waiters spin with a pause and give
 // their time slice away after a while: with more runnable threads than cores (other programs, or
@@ -151,14 +152,7 @@ struct Node {
         visits = 0;
     }
     // Node.current_strategy() with CPython sum() semantics; caller holds the lock
-    void current_strategy(double* out) const {
-        double pos[MAX_ACTIONS];
-        const double* r = regret();
-        for (int i = 0; i < n; i++) pos[i] = r[i] > 0 ? r[i] : 0.0;
-        double s = py_sum(pos, n);
-        if (s <= 0) { for (int i = 0; i < n; i++) out[i] = 1.0 / n; return; }
-        for (int i = 0; i < n; i++) out[i] = pos[i] / s;
-    }
+    void current_strategy(double* out) const { regret_matching(regret(), n, out); }
     void average_strategy(double* out) const {
         const double* ss = strategy_sum();
         double s = py_sum(ss, n);

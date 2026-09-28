@@ -26,9 +26,14 @@ if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
     exit 0
 }
 
-# 1. No project job may be running (they hold files in data/ open or append to logs).
+# 1. No project job may be running (they hold files in data/ open or append to logs). Any interpreter
+#    name counts (the main session runs a renamed copy, tools\python_np.exe), and so do the bash
+#    queue scripts that start them; this script's own shells are skipped.
 $jobs = Get-CimInstance Win32_Process | Where-Object {
-    $_.Name -match '^(python|pythonw)\.exe$' -and $_.CommandLine -match 'scripts[/\\]|negpluribus|play_slumbot|aivat'
+    $_.CommandLine -and $_.CommandLine -notmatch 'move_data_to_d' -and (
+        ($_.Name -match '^python' -and $_.CommandLine -match 'scripts[/\\]|negpluribus|webapp|play_slumbot|aivat') -or
+        ($_.Name -eq 'bash.exe' -and $_.CommandLine -match 'queue|duels64|train_pot64|scripts[/\\]')
+    )
 }
 if ($jobs) {
     Say "ABORT: project jobs are running:"
