@@ -750,6 +750,8 @@ PYBIND11_MODULE(_fastcore, m) {
     // ---- files (persist.h): formats, conversions, test hooks of the Python-identical spellings
     m.def("_debug_fail_table_growth", [](long long n) { FlatNodeTable::debug_fail_grow().store(n); }, py::arg("n"),
           "tests: the n-th node-table growth from now fails with std::bad_alloc (0: never)");
+    m.def("_debug_fail_prepare", [](long long n) { FlatTrainer::debug_fail_prepare().store(n); }, py::arg("n"),
+          "tests: the n-th preparation of a flat / GPU iteration from now fails with std::bad_alloc (0: never; < 0: every one)");
     m.def("file_kind", &file_kind, "'checkpoint' / 'blueprint' (binary, by magic), 'json', 'unknown' or 'unreadable'");
     m.def("checkpoint_bin_to_json", [](const std::string& src, const std::string& dst) {
         py::gil_scoped_release nogil;
@@ -1224,6 +1226,8 @@ PYBIND11_MODULE(_fastcore, m) {
             t.train(iterations);
         }, py::arg("iterations"))
         .def_property_readonly("iteration", &FlatTrainer::iteration)
+        .def_property_readonly("tables_consistent", &FlatTrainer::tables_consistent,
+                               "after train() raised: True if the tables are those of iteration (a checkpoint resumes exactly)")
         .def_readwrite("batch_size", &FlatTrainer::batch_size)
         .def_readwrite("linear_until", &FlatTrainer::linear_until)
         .def_readwrite("pass_iterations", &FlatTrainer::pass_iterations)
@@ -1352,6 +1356,8 @@ PYBIND11_MODULE(_fastcore, m) {
            "regret-based pruning (Pluribus): skip actions with regret < -below (stored units), or with relative=True below "
            "-below bb per unit of the node's own traverser weight; below = 0 turns it off")
         .def_property_readonly("pruned_actions", &Trainer::pruned_actions)
+        .def_property_readonly("tables_consistent", &Trainer::tables_consistent,
+                               "after train() raised: True if the tables are those of iteration (a checkpoint resumes exactly)")
         .def_property("batch_size", [](const Trainer& t) { return t.batch_size; },
                       [](Trainer& t, long long v) {
                           ApiLock lk(t.api_mu);

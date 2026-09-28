@@ -29,6 +29,7 @@
 #include <thread>
 #include <vector>
 
+#include "workers.h"
 #include "abstraction.h"
 #include "engine.h"
 #include "histtree.h"
@@ -254,29 +255,30 @@ public:
         // hyperthread) do more of them instead of waiting for the slowest thread at the end;
         // each thread still draws its deals from its own RNG stream.
         std::atomic<long long> next{base + 1};
+        WorkerErrors errs;
         auto work = [&](int tid) {
             ThreadCtx& ctx = ctxs_[tid];
             if (T == 1) {
                 for (long long t = base + 1; t <= target; t++) run_iteration(t, ctx);
             } else {
                 for (;;) {
+                    if (errs.failed.load(std::memory_order_relaxed)) break;  // another worker failed: stop
                     const long long lo = next.fetch_add(ITER_CHUNK, std::memory_order_relaxed);
                     if (lo > target) break;
                     const long long hi = lo + ITER_CHUNK - 1 < target ? lo + ITER_CHUNK - 1 : target;
                     for (long long t = lo; t <= hi; t++) run_iteration(t, ctx);
                 }
             }
-            group_.leave();
         };
-        if (T == 1) {
-            work(0);
-        } else {
-            std::vector<std::thread> pool;
-            for (int t = 1; t < T; t++) pool.emplace_back(work, t);
-            work(0);
-            for (auto& th : pool) th.join();
-        }
+        run_workers(T, errs, work, [&](int) { group_.leave(); });
         group_.end();
+        if (errs.failed.load()) {
+            // updates are applied as the iterations run: the tables hold part of them
+            tables_consistent_ = false;
+            throw std::runtime_error("training failed: " + errs.message() + ". The tables hold part of the iterations after " +
+                                     std::to_string(iteration_) + " (the last completed train() call): do not save them; "
+                                     "resume from the last checkpoint on disk");
+        }
         iteration_ = target;
         long long touched = 0;
         for (auto& c : ctxs_) { touched += c.nodes_touched; c.nodes_touched = 0; pruned_ += c.pruned; c.pruned = 0; }
@@ -284,6 +286,9 @@ public:
         checker_.rethrow();
     }
     long long pruned_actions() const { return pruned_; }
+    // after train() raised: whether the tables are those of iteration() (batched mode: the failed batch was not
+    // applied; a checkpoint of them resumes exactly) or hold part of the failed call's iterations (do not save)
+    bool tables_consistent() const { return tables_consistent_; }
 
     void train_batched(long long iterations) {
         if (prune_below > 0.0) throw std::invalid_argument("pruning is not supported in batched mode");
@@ -299,23 +304,34 @@ public:
             // phase 1: traverse, reading the tables only (nodes may be created)
             group_.begin(T);
             std::atomic<long long> next{lo};
+            WorkerErrors errs;
             auto work = [&](int tid) {
                 ThreadCtx& ctx = ctxs_[tid];
-                for (long long t = next.fetch_add(1); t <= hi; t = next.fetch_add(1)) run_iteration_batched(t, ctx);
-                group_.leave();
+                for (long long t = next.fetch_add(1); t <= hi && !errs.failed.load(std::memory_order_relaxed); t = next.fetch_add(1))
+                    run_iteration_batched(t, ctx);
             };
-            if (T == 1) {
-                work(0);
-            } else {
-                std::vector<std::thread> pool;
-                for (int t = 1; t < T; t++) pool.emplace_back(work, t);
-                work(0);
-                for (auto& th : pool) th.join();
-            }
+            run_workers(T, errs, work, [&](int) { group_.leave(); });
             group_.end();
-            // phase 2: apply the updates in a fixed order
+            // phase 2: apply the updates in a fixed order (gathering them may run out of memory: nothing applied yet)
             all.clear();
-            for (auto& c : ctxs_) { all.insert(all.end(), c.upd.begin(), c.upd.end()); c.upd.clear(); }
+            if (!errs.failed.load()) {
+                try {
+                    for (auto& c : ctxs_) { all.insert(all.end(), c.upd.begin(), c.upd.end()); c.upd.clear(); }
+                } catch (...) {
+                    errs.record(current_error_text());
+                }
+            }
+            if (errs.failed.load()) {
+                // the batch's traversals only read the tables (new nodes start at zero) and nothing was applied:
+                // the tables are those of iteration_, and a checkpoint of them resumes exactly
+                for (auto& c : ctxs_) { c.upd.clear(); c.upd.shrink_to_fit(); }
+                all.clear();
+                all.shrink_to_fit();
+                tables_consistent_ = true;
+                throw std::runtime_error("training failed in the batch of iterations " + std::to_string(lo) + ".." + std::to_string(hi) +
+                                         ": " + errs.message() + ". The tables are those of iteration " + std::to_string(iteration_) +
+                                         " (the batch was not applied): a checkpoint of them resumes exactly");
+            }
             std::sort(all.begin(), all.end(), [](const ThreadCtx::Upd& x, const ThreadCtx::Upd& y) {
                 if (x.k1 != y.k1) return x.k1 < y.k1;
                 if (x.k2 != y.k2) return x.k2 < y.k2;
@@ -348,6 +364,7 @@ public:
 private:
     TableGroup group_;
     KeyChecker checker_;
+    bool tables_consistent_ = true;
     std::vector<ThreadCtx> ctxs_;
     long long iteration_ = 0;
     long long nodes_touched_ = 0;
