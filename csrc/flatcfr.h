@@ -155,7 +155,7 @@ public:
         if (batch_size < 1) throw std::invalid_argument("flat trainer: batch_size >= 1");
         trained_ = true;
         const long long target = iteration_ + iterations;
-        if (gpu_ || emulate_gpu) { train_gpu(target); return; }
+        if (gpu_ || emulate_gpu || prep_bench) { train_gpu(target); return; }
         const int T = threads;
         std::vector<std::vector<Rec>> recs(T);
         std::vector<Rec> all;
@@ -464,9 +464,150 @@ private:
                                                          std::to_string(lo + k - 1) + ": " + errs.message());
     }
 
+    // ---- the host's batch preparation for the GPU: a persistent pool fills a ring of `prep_depth` batches ahead of
+    // the device.  Workers take chunks of 64 iterations from the earliest batch not yet handed out, so a worker
+    // the OS preempts delays one chunk, not the whole batch behind a barrier, and the batches queued ahead absorb
+    // such delays.  prepare_iter is a pure function of the iteration number: the same buffers as prepare_batch.
+  public:
+    int prep_depth = 3;          // batches prepared ahead of the device (1: the old double buffering's depth)
+    bool prep_pool = true;       // false: the old path (threads started per batch, a barrier per batch)
+    class PrepPool {
+    public:
+        struct Slot {
+            long long batch = -1, lo = 0;
+            int k = 0;
+            std::atomic<int> next{0}, done{0};
+            std::vector<FlatIter> iters;
+        };
+        PrepPool(FlatTrainer& ft, int workers, int depth) : ft_(ft), slots_((size_t)std::max(1, depth)) {
+            for (int i = 0; i < std::max(1, workers); i++) th_.emplace_back([this]() { run(); });
+        }
+        ~PrepPool() {
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                quit_ = true;
+            }
+            cv_.notify_all();
+            for (auto& t : th_) t.join();
+        }
+        // batch b = iterations lo .. lo + k - 1 into slot b % depth (the slot must be free)
+        void assign(long long b, long long lo, int k) {
+            Slot& s = slots_[(size_t)(b % (long long)slots_.size())];
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                s.iters.resize((size_t)k);
+                s.lo = lo;
+                s.k = k;
+                s.next.store(0);
+                s.done.store(0);
+                s.batch = b;
+            }
+            cv_.notify_all();
+        }
+        // wait until batch b is prepared; its buffer (valid until the slot is assigned again)
+        FlatIter* wait(long long b) {
+            Slot& s = slots_[(size_t)(b % (long long)slots_.size())];
+            std::unique_lock<std::mutex> lk(mu_);
+            done_cv_.wait(lk, [&] { return (s.batch == b && s.done.load() >= s.k) || !err_.empty(); });
+            if (!err_.empty()) throw std::runtime_error("preparing the batches: " + err_);
+            return s.iters.data();
+        }
+
+    private:
+        void run() {
+            int order[52];
+            for (;;) {
+                Slot* s = nullptr;
+                {
+                    std::unique_lock<std::mutex> lk(mu_);
+                    cv_.wait(lk, [&] { return quit_ || (s = pick()) != nullptr; });
+                    if (quit_) return;
+                }
+                const int i = s->next.fetch_add(64);
+                if (i >= s->k) continue;
+                const int j1 = std::min(s->k, i + 64);
+                try {
+                    for (int j = i; j < j1; j++) ft_.prepare_iter(s->lo + j, s->iters[(size_t)j], order);
+                } catch (const std::exception& e) {
+                    std::lock_guard<std::mutex> lk(mu_);
+                    if (err_.empty()) err_ = e.what();
+                    done_cv_.notify_all();
+                }
+                if (s->done.fetch_add(j1 - i) + (j1 - i) >= s->k) {
+                    std::lock_guard<std::mutex> lk(mu_);  // (the waiter checks under the lock)
+                    done_cv_.notify_all();
+                }
+            }
+        }
+        // mu_ held: the earliest batch with chunks left
+        Slot* pick() {
+            Slot* best = nullptr;
+            for (Slot& s : slots_)
+                if (s.batch >= 0 && s.next.load() < s.k && (!best || s.batch < best->batch)) best = &s;
+            return best;
+        }
+        FlatTrainer& ft_;
+        std::vector<Slot> slots_;
+        std::vector<std::thread> th_;
+        std::mutex mu_;
+        std::condition_variable cv_, done_cv_;
+        bool quit_ = false;
+        std::string err_;
+    };
+
+    // the batches of lo .. target as (lo, k), aligned on absolute iterations as batch_end() does
+    std::vector<std::pair<long long, int>> batches_to(long long target) const {
+        std::vector<std::pair<long long, int>> out;
+        long long done = iteration_;
+        while (done < target) {
+            const long long hi = std::min(target, (done / batch_size + 1) * batch_size);
+            out.push_back({done + 1, (int)(hi - done)});
+            done = hi;
+        }
+        return out;
+    }
+
+    // train_gpu with the pool: the device runs batch i while the pool prepares i + 1 .. i + prep_depth
+    void train_gpu_pooled(long long target) {
+        using clk = std::chrono::steady_clock;
+        auto ms = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+        const std::vector<std::pair<long long, int>> bs = batches_to(target);
+        if (bs.empty()) return;
+        const int depth = std::max(1, prep_depth);
+        PrepPool pool(*this, threads, depth + 1);  // depth ahead + the one the device runs
+        for (long long b = 0; b < (long long)bs.size() && b <= depth; b++) pool.assign(b, bs[(size_t)b].first, bs[(size_t)b].second);
+        for (long long b = 0; b < (long long)bs.size(); b++) {
+            const auto j0 = clk::now();
+            FlatIter* its = pool.wait(b);
+            ms_wait_prepare += ms(j0, clk::now());
+            const auto d0 = clk::now();
+            if (gpu_) gpu_->run_batch(its, bs[(size_t)b].second, gpu_pass);
+            else if (emulate_gpu) emu_run_batch(its, bs[(size_t)b].second, gpu_pass);
+            else prep_bench_device(bs[(size_t)b].second);
+            ms_device_total += ms(d0, clk::now());
+            if (b + depth + 1 < (long long)bs.size()) pool.assign(b + depth + 1, bs[(size_t)(b + depth + 1)].first, bs[(size_t)(b + depth + 1)].second);
+            host_stale_ = true;
+            iteration_ = bs[(size_t)b].first + bs[(size_t)b].second - 1;
+        }
+    }
+
+    // prepare-only benchmark (no device): each batch "runs" for prep_bench_ms (sleeping, as the host thread
+    // waiting for a GPU does); the iterations only advance the counter, the tables are not touched
+  public:
+    double prep_bench_ms = 0.0;
+    bool prep_bench = false;
+    void prep_bench_device(int) {
+        if (prep_bench_ms > 0) std::this_thread::sleep_for(std::chrono::duration<double, std::milli>(prep_bench_ms));
+    }
+
+  private:
     // the host prepares batch i + 1 while the device runs batch i (the preparation is a pure function of
     // the iteration numbers, so the overlap changes the time, never the result)
     void train_gpu(long long target) {
+        if (prep_pool) {
+            train_gpu_pooled(target);
+            return;
+        }
         using clk = std::chrono::steady_clock;
         auto ms = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
         auto batch_end = [&](long long done) { return std::min(target, (done / batch_size + 1) * batch_size); };
@@ -501,7 +642,8 @@ private:
             const auto d0 = clk::now();
             try {
                 if (gpu_) gpu_->run_batch(buf[w].data(), (int)(hi - lo + 1), gpu_pass);
-                else emu_run_batch(buf[w].data(), (int)(hi - lo + 1), gpu_pass);
+                else if (emulate_gpu) emu_run_batch(buf[w].data(), (int)(hi - lo + 1), gpu_pass);
+                else prep_bench_device((int)(hi - lo + 1));
             } catch (...) {
                 if (prep.joinable()) prep.join();
                 tables_consistent_ = false;  // the device's batch failed part way: its tables are not known to be whole

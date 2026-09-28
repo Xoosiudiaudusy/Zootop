@@ -1241,6 +1241,12 @@ PYBIND11_MODULE(_fastcore, m) {
             return d;
         })
         .def_readwrite("gpu_pass", &FlatTrainer::gpu_pass)
+        .def_readwrite("prep_depth", &FlatTrainer::prep_depth, "GPU mode: batches the host prepares ahead of the device (pool)")
+        .def_readwrite("prep_pool", &FlatTrainer::prep_pool, "GPU mode: the persistent preparation pool (False: threads per batch, as before)")
+        .def_readwrite("prep_bench", &FlatTrainer::prep_bench, "benchmark of the host part: no device, each batch sleeps prep_bench_ms")
+        .def_readwrite("prep_bench_ms", &FlatTrainer::prep_bench_ms)
+        .def_readonly("ms_wait_prepare", &FlatTrainer::ms_wait_prepare)
+        .def_readonly("ms_device_total", &FlatTrainer::ms_device_total)
         .def_readwrite("emulate_gpu", &FlatTrainer::emulate_gpu)
         .def("use_gpu", [](FlatTrainer& t, int device) { py::gil_scoped_release nogil; t.use_gpu(device); }, py::arg("device") = 0)
         .def_property_readonly("on_gpu", &FlatTrainer::on_gpu)
