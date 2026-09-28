@@ -556,12 +556,25 @@ public:
         if (T == 1) {
             work(0);
         } else {
+            // no exception may leave while a worker runs (a joinable std::thread destroyed: std::terminate):
+            // a thread that cannot be started stops the solve, its slot leaves the group, the others are joined
             std::vector<std::thread> pool;
-            for (int t = 1; t < T; t++) pool.emplace_back(work, t);
+            try {
+                pool.reserve((size_t)T - 1);
+                for (int t = 1; t < T; t++) pool.emplace_back(work, t);
+            } catch (const std::exception& e) {
+                {
+                    std::lock_guard<std::mutex> lk(err_mu);
+                    if (err.empty()) err = std::string("starting the search threads: ") + e.what();
+                }
+                stop.store(true);
+                for (int t = (int)pool.size() + 1; t < T; t++) group_->leave();
+            }
             work(0);
             for (auto& th : pool) th.join();
         }
         group_->end();
+        if (err.empty() && group_->failed()) err = group_->failure();
         if (!err.empty()) throw std::runtime_error("search failed: " + err);
         SearchResult r;
         r.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();

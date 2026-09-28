@@ -748,6 +748,8 @@ PYBIND11_MODULE(_fastcore, m) {
     m.def("raise_name", &raise_name);
 
     // ---- files (persist.h): formats, conversions, test hooks of the Python-identical spellings
+    m.def("_debug_fail_table_growth", [](long long n) { FlatNodeTable::debug_fail_grow().store(n); }, py::arg("n"),
+          "tests: the n-th node-table growth from now fails with std::bad_alloc (0: never)");
     m.def("file_kind", &file_kind, "'checkpoint' / 'blueprint' (binary, by magic), 'json', 'unknown' or 'unreadable'");
     m.def("checkpoint_bin_to_json", [](const std::string& src, const std::string& dst) {
         py::gil_scoped_release nogil;
