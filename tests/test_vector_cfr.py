@@ -35,7 +35,7 @@ def trained():
     for players, iters in ((2, 6000), (3, 4000)):
         spec = GameSpec(n_players=players, stack_bb=30, max_street=Street.RIVER, n_buckets=8, max_raises_per_street=2,
                         preflop_fracs=(1.0,), postflop_fracs=(0.5, 1.0))
-        t = MCCFRTrainer(spec, bk, seed=players, backend="cpp", threads=4).train(iters)
+        t = MCCFRTrainer(spec, bk, seed=players, backend="cpp", threads=1).train(iters)  # one thread: the same blueprint every run
         out[players] = (spec, core.SearchGame(spec_to_dict(spec), core_bucketer(bk), t.blueprint().lookup))
     return out
 
