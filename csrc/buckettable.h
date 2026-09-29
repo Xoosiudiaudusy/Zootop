@@ -53,13 +53,14 @@ public:
     // compute street `street` with `threads` threads (chunks handed out dynamically, so slow and
     // fast cores both stay busy); `done` (optional) counts finished classes for progress reports
     // a build in progress stops at its workers' next chunk and raises (another thread's request, e.g. the
-    // binding's progress callback that raised); build() clears it when it starts
+    // binding's progress callback that raised); the caller clears it before a build starts (clear_cancel: the
+    // binding does, before its build thread; a callback may run before the build itself begins)
     void cancel() { cancel_.store(true, std::memory_order_relaxed); }
+    void clear_cancel() { cancel_.store(false, std::memory_order_relaxed); }
     bool cancelled() const { return cancel_.load(std::memory_order_relaxed); }
 
     void build(const Bucketer& bk, int street, int threads, std::atomic<uint64_t>* done = nullptr) {
         if (street < FLOP || street > RIVER) throw std::invalid_argument("street must be flop, turn or river");
-        cancel_.store(false, std::memory_order_relaxed);
         if (!bk.fitted()) throw std::invalid_argument("bucketer not fitted");
         const BucketerIdentity id = bk.identity();
         if (id.n_buckets > 256) throw std::invalid_argument("bucket tables hold at most 256 buckets");
