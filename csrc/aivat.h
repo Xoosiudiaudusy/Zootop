@@ -1481,28 +1481,26 @@ private:
     }
 
     void river_tree(Ctx& ctx, const HandState& st, const std::vector<char>& need, std::vector<double>& out) const {
-        const Combos& cb = combos();
         const std::vector<uint8_t>& bk = river_buckets(ctx, st.board);
-        std::vector<int> needed;
+        bool seen[256] = {false};
         for (int c = 0; c < NC; c++)
-            if (need[(size_t)c] && std::find(needed.begin(), needed.end(), (int)bk[(size_t)c]) == needed.end()) needed.push_back(bk[(size_t)c]);
-        std::sort(needed.begin(), needed.end());
-        const int by = g_->bucketer->bucket(ctx.d, st.board, 5);
+            if (need[(size_t)c]) seen[bk[(size_t)c]] = true;
+        std::vector<int> needed;  // the needed buckets, increasing
+        int pos[256];
+        for (int b = 0; b < 256; b++)
+            if (seen[b]) {
+                pos[b] = (int)needed.size();
+                needed.push_back(b);
+            }
+        const int by = g_->bucket_memo(g_->memo(), ctx.d, st.board, 5);  // (bucket(), memoized: the same number)
         std::vector<double> A(needed.size()), S(needed.size());
         ctx.river_trees++;
         river_walk(ctx, st, HistHash(), by, needed, A.data(), S.data());
-        int cards[7];
-        for (int i = 0; i < 5; i++) cards[2 + i] = st.board[i];
-        cards[0] = ctx.d[0];
-        cards[1] = ctx.d[1];
-        const int64_t sd = negp::evaluate(cards, 7);
+        const std::vector<int8_t>& sg = river_signs(ctx, st.board);  // x's showdown sign per combo, once per board
         for (int c = 0; c < NC; c++) {
             if (!need[(size_t)c]) continue;
-            cards[0] = cb.c0[c];
-            cards[1] = cb.c1[c];
-            const int64_t sc = negp::evaluate(cards, 7);
-            const double s = sc > sd ? 1.0 : (sc < sd ? -1.0 : 0.0);
-            const size_t i = (size_t)(std::lower_bound(needed.begin(), needed.end(), (int)bk[(size_t)c]) - needed.begin());
+            const double s = (double)sg[(size_t)c];
+            const size_t i = (size_t)pos[bk[(size_t)c]];
             out[(size_t)c] = A[i] + S[i] * s;
         }
     }

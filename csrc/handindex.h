@@ -146,6 +146,36 @@ public:
         return index_sorted(k);
     }
 
+    struct SuitKey {
+        uint64_t order;  // (pattern << 40) | value: sorted descending
+        int pat;         // m0 * 8 + m1
+        uint64_t val;    // rank of the suit's configuration within its pattern
+        int suit;
+    };
+    // index() of many holes on one board: the board's suit keys once, then per hole only its one or two suits
+    // (the same keys, sort and index as index(): the same number)
+    struct BoardKeys {
+        uint32_t a1[4];
+        SuitKey k[4];  // the suit keys with no hole card
+    };
+    void board_keys(const int* board, BoardKeys& b) const {
+        for (int s = 0; s < 4; s++) b.a1[s] = 0;
+        for (int i = 0; i < nb_; i++) b.a1[board[i] & 3] |= 1u << (board[i] >> 2);
+        for (int s = 0; s < 4; s++) b.k[s] = suit_key(0, b.a1[s], s);
+    }
+    uint64_t index_on(const BoardKeys& b, const int* hole) const {
+        SuitKey k[4] = {b.k[0], b.k[1], b.k[2], b.k[3]};
+        const int s0 = hole[0] & 3, s1 = hole[1] & 3;
+        if (s0 == s1) {
+            k[s0] = suit_key((1u << (hole[0] >> 2)) | (1u << (hole[1] >> 2)), b.a1[s0], s0);
+        } else {
+            k[s0] = suit_key(1u << (hole[0] >> 2), b.a1[s0], s0);
+            k[s1] = suit_key(1u << (hole[1] >> 2), b.a1[s1], s1);
+        }
+        sort4(k);
+        return index_sorted(k);
+    }
+
     // a representative (hole, board) of the class `idx` (the same for every member)
     void unindex(uint64_t idx, int* hole, int* board) const {
         if (idx >= size_) throw std::out_of_range("HandIndexer::unindex");
@@ -213,12 +243,6 @@ public:
     }
 
 private:
-    struct SuitKey {
-        uint64_t order;  // (pattern << 40) | value: sorted descending
-        int pat;         // m0 * 8 + m1
-        uint64_t val;    // rank of the suit's configuration within its pattern
-        int suit;
-    };
     struct Config {
         int pat[4];        // sorted descending
         int n_runs = 0;

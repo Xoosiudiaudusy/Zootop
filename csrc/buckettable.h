@@ -395,6 +395,8 @@ public:
         bool on[52] = {false};
         for (int i = 0; i < 5; i++) on[board[i]] = true;
         const HandIndexer& ix = tab_->indexer(RIVER);
+        HandIndexer::BoardKeys bk;
+        ix.board_keys(board, bk);  // (index_on = index, the board's part once)
         for (int c = 0; c < 52; c++)
             for (int d = c + 1; d < 52; d++) {
                 if (on[c] || on[d]) {
@@ -402,7 +404,7 @@ public:
                     continue;
                 }
                 const int h[2] = {c, d};
-                out[idx[c][d]] = tab_->at(RIVER, ix.index(h, board));
+                out[idx[c][d]] = tab_->at(RIVER, ix.index_on(bk, h));
             }
         return true;
     }
