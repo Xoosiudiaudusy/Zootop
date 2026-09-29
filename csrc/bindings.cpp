@@ -1659,7 +1659,8 @@ PYBIND11_MODULE(_fastcore, m) {
                          const std::vector<int>& hole, long long iterations, double time_budget, int threads, uint64_t seed,
                          double focus, double min_prob, bool linear, const py::object& overrides, const py::object& depth,
                          int rollouts, double bias, int debug_leaves, bool legacy_traverse, bool vector_cfr, bool river_exact,
-                         int river_buckets, int vector_discount, double river_warm) {
+                         int river_buckets, int vector_discount, double river_warm, int prune_mode, double prune_below,
+                         double prune_prob, double prune_start, double prune_stop, bool prune_river) {
             HandInput h;
             h.stacks = stacks;
             h.button = button;
@@ -1697,6 +1698,15 @@ PYBIND11_MODULE(_fastcore, m) {
             p.river_buckets = river_buckets;
             p.vector_discount = vector_discount;
             p.river_warm = river_warm;
+            if (prune_mode < 0 || prune_mode > 3) throw std::invalid_argument("prune_mode: 0 off, 1 absolute, 2 x t, 3 relative");
+            if (prune_mode != 0 && !(prune_below > 0.0)) throw std::invalid_argument("prune_below > 0 with pruning");
+            if (!(prune_start >= 0.0 && prune_stop >= 0.0 && prune_start + prune_stop <= 1.0)) throw std::invalid_argument("prune_start, prune_stop: shares of the budget");
+            p.prune_mode = prune_mode;
+            p.prune_below = prune_below;
+            p.prune_prob = prune_prob;
+            p.prune_start = prune_start;
+            p.prune_stop = prune_stop;
+            p.prune_river = prune_river;
             py::gil_scoped_release nogil;
             return new SubgameSearch(std::shared_ptr<const SearchGame>(game), h, p);
         }), py::arg("game"), py::arg("stacks"), py::arg("button"), py::arg("actions"), py::arg("board"), py::arg("seat"),
@@ -1705,6 +1715,8 @@ PYBIND11_MODULE(_fastcore, m) {
             py::arg("depth") = "end", py::arg("rollouts") = 3, py::arg("bias") = 5.0, py::arg("debug_leaves") = 0,
             py::arg("legacy_traverse") = false, py::arg("vector_cfr") = false, py::arg("river_exact") = false,
             py::arg("river_buckets") = 0, py::arg("vector_discount") = 0, py::arg("river_warm") = 0.0,
+            py::arg("prune_mode") = 0, py::arg("prune_below") = 0.0, py::arg("prune_prob") = 0.95, py::arg("prune_start") = 0.0,
+            py::arg("prune_stop") = 0.1, py::arg("prune_river") = true,
             "the subgame of the hand so far: root at the start of the current round, ranges by Bayes over the blueprint; "
             "depth 'end' / 'pluribus' / 'hu_flop_limit' / 'next_street' (leaves: four continuations, `rollouts` rollouts each)")
         .def("set_budget", &SubgameSearch::set_budget, py::arg("iterations"), py::arg("time_budget"),
@@ -1739,6 +1751,7 @@ PYBIND11_MODULE(_fastcore, m) {
             d["focused"] = r.focused;
             d["nodes_touched"] = r.nodes_touched;
             d["forced"] = r.forced;
+            d["pruned"] = r.pruned;
             d["redeals"] = r.redeals;
             d["leaves"] = r.leaves;
             d["leaf_evals"] = r.leaf_evals;

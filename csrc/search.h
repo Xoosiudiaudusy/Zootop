@@ -343,6 +343,22 @@ struct SearchParams {
     // regrets and strategy sums set as if that strategy had been played the T_w iterations so far (Linear weights
     // 1..T_w), and learns exactly from there.  0: off
     double river_warm = 0.0;
+    // Regret-based pruning in the MCCFR (type b: another algorithm, off by default -- then nothing changes, not
+    // even the random draws).  Pluribus's MCCFR-P (Brown & Sandholm 2019, supplement) for the blueprint: in 95 % of
+    // the iterations the traverser does not explore an action whose regret is below a threshold (terminal actions
+    // always explored); here in the subgame search, which Pluribus did not do.  The threshold, by prune_mode:
+    //   1 absolute: regret < -prune_below (stored units: bb x Linear weight),
+    //   2 x t:      regret < -prune_below x t (t: the iteration),
+    //   3 relative: regret < -prune_below x (sum over the node's actions of |regret|).
+    // Never on the real path's nodes (path_node), never in the last prune_stop share of the budget (iterations, or
+    // time with a time budget), only after the first prune_start share; the average strategy is untouched (regret
+    // matching over every action; only the traversal of pruned actions is skipped and their regrets not updated).
+    int prune_mode = 0;
+    double prune_below = 0.0;
+    double prune_prob = 0.95;
+    double prune_start = 0.0;
+    double prune_stop = 0.1;
+    bool prune_river = true;  // false: never on river nodes (Pluribus did not prune on the last street)
 };
 
 struct LeafInfo {  // tests: one leaf of the public tree
@@ -367,6 +383,7 @@ struct SearchResult {
     std::vector<double> table_average;
     bool visited = false;                       // our current infoset was reached
     long long iterations = 0, traversals = 0, focused = 0, nodes_touched = 0, forced = 0, redeals = 0;
+    long long pruned = 0;  // actions the traverser did not explore (prune_mode)
     long long leaves = 0, leaf_evals = 0, rollouts = 0, rollout_steps = 0;
     size_t table_size = 0;
     double seconds = 0.0;
@@ -583,6 +600,19 @@ public:
                     if (params_.iterations > 0 && t > params_.iterations) break;
                     const long long t_cur = t++;
                     const double weight = params_.linear ? (double)t_cur : 1.0;
+                    ctx.prune = false;
+                    if (params_.prune_mode != 0) {  // (off: no draw)
+                        double frac;  // how far into the budget
+                        if (params_.iterations > 0) frac = (double)t_cur / (double)params_.iterations;
+                        else frac = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / params_.time_budget;
+                        const bool in_window = frac >= params_.prune_start && frac < 1.0 - params_.prune_stop;
+                        if (ctx.rng.uniform() < params_.prune_prob && in_window) {
+                            ctx.prune = true;
+                            ctx.prune_limit = params_.prune_mode == 1 ? -params_.prune_below
+                                              : params_.prune_mode == 2 ? -params_.prune_below * (double)t_cur
+                                                                        : -params_.prune_below;
+                        }
+                    }
                     for (int trav : traversers) {
                         const bool focused = trav == hand_.our_seat && ctx.rng.uniform() < params_.focus;
                         deal(ctx, focused);
@@ -661,6 +691,7 @@ public:
             r.focused += c.focused;
             r.nodes_touched += c.nodes;
             r.forced += c.forced;
+            r.pruned += c.pruned;
             r.redeals += c.redeals;
             r.leaves += c.leaves;
             r.leaf_evals += c.leaf_evals;
@@ -1423,6 +1454,9 @@ private:
         int bucket_memo[MAX_PLAYERS][6];
         bool actual = false;
         bool mt = true;  // other threads share the table (false: a one-thread solve skips the node locks)
+        bool prune = false;         // this iteration prunes (prune_mode)
+        double prune_limit = 0.0;   // modes 1, 2: regrets below this are pruned; mode 3: the factor of sum |regret|
+        long long pruned = 0;       // actions not explored
         std::string tok;
         long long iterations = 0, traversals = 0, focused = 0, nodes = 0, forced = 0, redeals = 0;
         long long leaves = 0, leaf_evals = 0, rollouts = 0, rollout_steps = 0;
@@ -2490,8 +2524,13 @@ private:
         double sigma[MAX_ACTIONS];
         // an opponent's node off the focused path adds its strategy in the same critical section as it reads it
         const bool add_sum = seat != traverser && !focused;
+        const bool prune_here = ctx.prune && seat == traverser && !t->path_node &&  // (never on the real path)
+                                (params_.prune_river || t->street < RIVER);
+        double reg[MAX_ACTIONS];
         nlock(node, ctx);
         node->current_strategy(sigma);
+        if (prune_here)
+            for (int i = 0; i < na.n; i++) reg[i] = node->regret()[i];
         if (add_sum) {
             for (int i = 0; i < na.n; i++) node->strategy_sum()[i] += weight * sigma[i];
             node->visits += 1;
@@ -2503,6 +2542,7 @@ private:
             if (!(w2 > 0.0)) return 0.0;
             return traverse_tree(tchild(t, a), traverser, weight, w2, focused, ctx);
         }
+        if (seat == traverser && prune_here) return traverse_pruned(t, node, sigma, reg, traverser, weight, w_imp, focused, ctx);
         if (seat == traverser) {
             double utils[MAX_ACTIONS];
             for (int i = 0; i < na.n; i++) utils[i] = traverse_tree(tchild(t, i), traverser, weight, w_imp, focused, ctx);
@@ -2516,6 +2556,42 @@ private:
         }
         const int a = sample(sigma, na.n, ctx.rng);
         return traverse_tree(tchild(t, a), traverser, weight, w_imp, focused, ctx);
+    }
+    // the traverser's node in an iteration that prunes (prune_mode): actions whose regret is below the threshold are
+    // not explored (their value counts 0, their regret is not updated); terminal actions always are, and all of
+    // them when every action would be pruned (Pluribus's MCCFR-P)
+    NEGP_NOINLINE double traverse_pruned(TNode* t, Node* node, const double* sigma, const double* reg, int traverser, double weight,
+                                         double w_imp, bool focused, Ctx& ctx) {
+        const int na = t->na.n;
+        double limit = ctx.prune_limit;
+        if (params_.prune_mode == 3) {
+            double s = 0.0;
+            for (int i = 0; i < na; i++) s += reg[i] < 0.0 ? -reg[i] : reg[i];
+            limit = -params_.prune_below * s;
+        }
+        bool explore[MAX_ACTIONS];
+        int n_explore = 0;
+        for (int i = 0; i < na; i++) {
+            explore[i] = !(reg[i] < limit) || tchild(t, i)->terminal;
+            n_explore += explore[i];
+        }
+        if (n_explore == 0)
+            for (int i = 0; i < na; i++) explore[i] = true;
+        double utils[MAX_ACTIONS];
+        for (int i = 0; i < na; i++) {
+            if (explore[i]) utils[i] = traverse_tree(tchild(t, i), traverser, weight, w_imp, focused, ctx);
+            else {
+                utils[i] = 0.0;
+                ctx.pruned++;
+            }
+        }
+        double u = 0.0;
+        for (int i = 0; i < na; i++) if (explore[i]) u += sigma[i] * utils[i];
+        const double w = weight * w_imp;
+        nlock(node, ctx);
+        for (int i = 0; i < na; i++) if (explore[i]) node->regret()[i] += w * (utils[i] - u);
+        nunlock(node, ctx);
+        return u;
     }
 
     // ---- vector Linear CFR (SearchParams::vector_cfr)
