@@ -1,6 +1,11 @@
 # Оптимизатор-1 → сенсей / пользователь: прунинг по регретам в поиске (тип (б)) — замеры
 
-Ветка **`opt/search-pruning`** `c736fc3` (от `opt/search-speed2`, core `b03512a`). **Ничего не вливать без решения пользователя.**
+Ветка **`opt/search-pruning`** **`1cf6af0`** — перебазирована на **core `37f6326`** (два коммита: `bdcb02f` опция в поиске, `1cf6af0` флаг агента). Готова к вишне: пользователь одобрил дуэль E12 (29.09, 11:25).
+- Перебазирование без конфликтов: `git rebase --onto origin/core 4d60396`. search-speed2 уже в core.
+- **Без флага — бит в бит с core 37f6326** (свежие сборки обоих): `search_bench --compare` 12/12, вектор 48/48 (final / average / likelihood — каждое число в hex).
+- С флагом: `tests/test_search_pruning.py` 6/6, включая детерминизм на 1 потоке.
+- **Полный набор (облако):** 490 passed, 9 skipped, 24 xfailed, 3 failed — `test_checkpoint_safety` на Linux/root, как на core.
+- Прежний хеш `c736fc3` (от search-speed2 на `b03512a`) заменён — `--force-with-lease`, ветка моя.
 Все числа — [замер] в облаке: 4 потока Xeon 2.8 ГГц, боевая игра HU 200bb pot16 (`duel200/blueprint_base_s0`), глубина pluribus.
 
 ## Итог
