@@ -17,6 +17,8 @@ Configs: mccfr | vec (blueprint's river buckets) | k<K> (K strength buckets) | e
 warm-started from K buckets after <percent> % of the budget); a suffix "+" = CFR+,
 "d" = DCFR(1.5, 0, 2) (e.g. k200d, vecd).  Exact exploitability of the average strategy (subgame_exploitability,
 kind 0, the best responder deviating from the root's street), bb per deal of the subgame; MCCFR: mean of --seeds.
+On river roots (--street river) the river's abstraction options act only on turn roots: k<K> is vec there (and k<K>d is
+vecd, k<K>+ is vec+), exact and warm are vec as well -- the same numbers, printed under their names.
 """
 import argparse
 import ctypes

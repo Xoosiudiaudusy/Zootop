@@ -2674,6 +2674,11 @@ private:
     }
 
     // p's counterfactual values at terminal t (o's reach ro; river board index bidx)
+    // the river board bidx was not filled (its combos in neither order nor off)
+    bool B_invalid(int bidx) const {
+        const VBoard& B = vboards_[(size_t)bidx];
+        return B.order.size() + B.off.size() != (size_t)N_COMBOS;
+    }
     void v_terminal(const TNode* t, int p, int o, const double* ro, int bidx, double* v) const {
         const ComboTable& ct = combo_table();
         if (t->n_act <= 1) {  // a fold: the same net for every disjoint pair
@@ -2689,6 +2694,9 @@ private:
             for (int c = 0; c < N_COMBOS; c++) v[c] = net * (total - card[ct.c0[c]] - card[ct.c1[c]] + ro[c]);
             return;
         }
+        // a showdown is on a 5-card board (an all-in before the river deals the rest as chance nodes): B.order and B.off
+        // cover every combo, which the clearing below relies on
+        if (t->n_board != 5 || B_invalid(bidx)) throw std::logic_error("vector CFR: a showdown terminal off a 5-card board");
         const VBoard& B = vboards_[(size_t)bidx];
         const double nw = v_showdown_net(t, p, o, 1), nt = v_showdown_net(t, p, o, 0), nl = v_showdown_net(t, p, o, -1);
         for (const int c : B.off) v[c] = 0.0;  // (every combo of B.order is written below)
