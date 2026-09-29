@@ -32,6 +32,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -86,6 +87,16 @@ public:
         static std::atomic<long long> n{0};
         return n;
     }
+    // tests: the n-th batch the device (or its emulation) runs from now fails with std::bad_alloc part way (0: never)
+    static std::atomic<long long>& debug_fail_device() {
+        static std::atomic<long long> n{0};
+        return n;
+    }
+    // tests: a preparation-pool worker sleeps this many microseconds after taking a chunk (preemption in that window)
+    static std::atomic<int>& debug_prep_delay_us() {
+        static std::atomic<int> n{0};
+        return n;
+    }
 
 
     int gpu_pass = 0;  // GPU mode: iterations traversed at once (0: the whole batch); memory only
@@ -135,6 +146,10 @@ public:
     // GPU mode: bring the host copies of the tables up to date
     void sync() {
         if (!host_stale_) return;
+        if (!gpu_ && emu_touched_.size() != game.n_cells) {  // (nothing ran on a device or its emulation)
+            host_stale_ = false;
+            return;
+        }
         std::vector<uint8_t> dl;
         if (gpu_) {
             dl.resize(game.n_cells);
@@ -322,8 +337,7 @@ private:
     // what iteration t needs from its deal: weight, button, buckets, showdown strengths
     void prepare_iter(long long t, Iter& it, int* order) {
         {
-            const long long f = debug_fail_prepare().load(std::memory_order_relaxed);
-            if (f < 0 || (f > 0 && debug_fail_prepare().fetch_sub(1) == 1)) throw std::bad_alloc();
+            if (debug_hit(debug_fail_prepare())) throw std::bad_alloc();  // (a CAS: exactly the n-th)
         }
         const int n = spec.n_players;
         it.t = t;
@@ -473,19 +487,25 @@ private:
     bool prep_pool = true;       // false: the old path (threads started per batch, a barrier per batch)
     class PrepPool {
     public:
+        // every field under mu_, but `done` (chunks finished; the waiter reads it under mu_)
         struct Slot {
             long long batch = -1, lo = 0;
-            int k = 0;
-            std::atomic<int> next{0}, done{0};
+            int k = 0, next = 0;
+            std::atomic<int> done{0};
             std::vector<FlatIter> iters;
-            std::string err;  // (under mu_) the first failure preparing this batch
+            std::string err;  // the first failure preparing this batch
+            std::chrono::steady_clock::time_point t0;  // its first chunk taken
+            double ms = 0.0;                           // wall time from the first chunk taken to the last done
         };
         PrepPool(FlatTrainer& ft, int workers, int depth) : ft_(ft), slots_((size_t)std::max(1, depth)) {
             // (a thread that cannot start: the started ones are stopped and joined before the error leaves, never
             // destroyed joinable)
             try {
                 th_.reserve((size_t)std::max(1, workers));
-                for (int i = 0; i < std::max(1, workers); i++) th_.emplace_back([this]() { run(); });
+                for (int i = 0; i < std::max(1, workers); i++) {
+                    if (debug_hit(debug_fail_thread_start())) throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again));
+                    th_.emplace_back([this]() { run(); });
+                }
             } catch (...) {
                 stop();
                 throw;
@@ -509,9 +529,10 @@ private:
                 s.iters.resize((size_t)k);
                 s.lo = lo;
                 s.k = k;
-                s.next.store(0);
+                s.next = 0;
                 s.done.store(0);
                 s.err.clear();
+                s.ms = 0.0;
                 s.batch = b;
             }
             cv_.notify_all();
@@ -527,30 +548,48 @@ private:
                                          ": " + s.err);
             return s.iters.data();
         }
+        // after wait(b): the wall time batch b took to prepare
+        double prep_ms(long long b) {
+            std::lock_guard<std::mutex> lk(mu_);
+            const Slot& s = slots_[(size_t)(b % (long long)slots_.size())];
+            return s.batch == b ? s.ms : 0.0;
+        }
 
     private:
+        // A chunk is taken under mu_ together with its batch's lo, k and buffer (kept in locals): a worker preempted
+        // after taking it still writes where and what it took.  The slot cannot be assigned again before the chunk is
+        // counted in `done` (wait() returns only then), nor after a failure (train() then ends and the pool stops).
         void run() {
             int order[52];
             for (;;) {
                 Slot* s = nullptr;
+                int i = 0, j1 = 0, k = 0;
+                long long lo = 0;
+                FlatIter* buf = nullptr;
                 {
                     std::unique_lock<std::mutex> lk(mu_);
                     cv_.wait(lk, [&] { return quit_ || (s = pick()) != nullptr; });
                     if (quit_) return;
+                    i = s->next;
+                    k = s->k;
+                    j1 = std::min(k, i + 64);
+                    s->next = j1;
+                    lo = s->lo;
+                    buf = s->iters.data();
+                    if (i == 0) s->t0 = std::chrono::steady_clock::now();
                 }
-                const int i = s->next.fetch_add(64);
-                if (i >= s->k) continue;
-                const int j1 = std::min(s->k, i + 64);
+                if (const int us = debug_prep_delay_us().load(std::memory_order_relaxed)) std::this_thread::sleep_for(std::chrono::microseconds(us));
                 try {
-                    for (int j = i; j < j1; j++) ft_.prepare_iter(s->lo + j, s->iters[(size_t)j], order);
+                    for (int j = i; j < j1; j++) ft_.prepare_iter(lo + j, buf[(size_t)j], order);
                 } catch (...) {
                     const std::string what = current_error_text();  // (std::bad_alloc: "out of memory")
                     std::lock_guard<std::mutex> lk(mu_);
                     if (s->err.empty()) s->err = what;
                     done_cv_.notify_all();
                 }
-                if (s->done.fetch_add(j1 - i) + (j1 - i) >= s->k) {
-                    std::lock_guard<std::mutex> lk(mu_);  // (the waiter checks under the lock)
+                std::lock_guard<std::mutex> lk(mu_);
+                if (s->done.fetch_add(j1 - i) + (j1 - i) >= k) {
+                    s->ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s->t0).count();
                     done_cv_.notify_all();
                 }
             }
@@ -559,7 +598,7 @@ private:
         Slot* pick() {
             Slot* best = nullptr;
             for (Slot& s : slots_)
-                if (s.batch >= 0 && s.next.load() < s.k && (!best || s.batch < best->batch)) best = &s;
+                if (s.batch >= 0 && s.next < s.k && (!best || s.batch < best->batch)) best = &s;
             return best;
         }
         FlatTrainer& ft_;
@@ -585,7 +624,10 @@ private:
     // train_gpu with the pool: the device runs batch i while the pool prepares i + 1 .. i + prep_depth.
     // Failures as on the per-batch path: a batch that cannot be prepared ends train() with the tables of the last
     // batch the device ran (a checkpoint of them resumes exactly); a failure inside the device's batch leaves tables
-    // that may hold part of it (tables_consistent false); a pool that cannot start its threads falls back to that path.
+    // that may hold part of it (tables_consistent false).  A pool that cannot start one of its threads falls back to that
+    // path (threads per batch): it trains, preparing on this thread when a batch's preparation thread cannot start; if
+    // the threads of prepare_batch cannot start either (threads > 1), that batch's preparation ends train() with an
+    // error as above (the tables whole, resumable) -- not a one-thread training.
     void train_gpu_pooled(long long target) {
         using clk = std::chrono::steady_clock;
         auto ms = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
@@ -597,7 +639,7 @@ private:
         try {
             pool.reset(new PrepPool(*this, threads, depth + 1));  // depth ahead + the one the device runs
         } catch (...) {
-            train_gpu_threads(target);  // (it prepares on this thread when it cannot start one either)
+            train_gpu_threads(target);  // (see above: it trains, or fails a preparation with a resumable error)
             return;
         }
         auto prep_failed = [&](const std::string& what) {
@@ -625,6 +667,7 @@ private:
             const long long lo = bs[(size_t)b].first, hi = lo + bs[(size_t)b].second - 1;
             const auto d0 = clk::now();
             try {
+                if (debug_hit(debug_fail_device())) throw std::bad_alloc();
                 if (gpu_) gpu_->run_batch(its, bs[(size_t)b].second, gpu_pass);
                 else if (emulate_gpu) emu_run_batch(its, bs[(size_t)b].second, gpu_pass);
                 else prep_bench_device(bs[(size_t)b].second);
@@ -636,7 +679,8 @@ private:
                                          "do not save them; resume from the last checkpoint on disk");
             }
             ms_device_total += ms(d0, clk::now());
-            host_stale_ = true;
+            ms_prepare_total += pool->prep_ms(b);
+            if (gpu_ || emulate_gpu) host_stale_ = true;  // (the prepare-only benchmark touches no table)
             iteration_ = hi;
             if (b + depth + 1 < (long long)bs.size()) assign(b + depth + 1);
         }
@@ -648,7 +692,12 @@ private:
     double prep_bench_ms = 0.0;
     bool prep_bench = false;
     void prep_bench_device(int) {
-        if (prep_bench_ms > 0) std::this_thread::sleep_for(std::chrono::duration<double, std::milli>(prep_bench_ms));
+        // a spin wait, as the CUDA runtime's default wait for the device: exact to microseconds (a sleep rounds up to
+        // the system's tick, 15.6 ms on Windows)
+        if (prep_bench_ms <= 0) return;
+        const auto end = std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                                                 std::chrono::duration<double, std::milli>(prep_bench_ms));
+        while (std::chrono::steady_clock::now() < end) cpu_relax();
     }
 
   private:
@@ -692,6 +741,7 @@ private:
             }
             const auto d0 = clk::now();
             try {
+                if (debug_hit(debug_fail_device())) throw std::bad_alloc();
                 if (gpu_) gpu_->run_batch(buf[w].data(), (int)(hi - lo + 1), gpu_pass);
                 else if (emulate_gpu) emu_run_batch(buf[w].data(), (int)(hi - lo + 1), gpu_pass);
                 else prep_bench_device((int)(hi - lo + 1));
@@ -709,7 +759,7 @@ private:
             if (prep_later) prepare_next();
             ms_wait_prepare += ms(j0, clk::now());
             if (prep_error) {  // the device's batch is complete: the tables are those of its last iteration
-                host_stale_ = true;
+                if (gpu_ || emulate_gpu) host_stale_ = true;
                 iteration_ = hi;
                 tables_consistent_ = true;
                 std::string what;
@@ -722,7 +772,7 @@ private:
                                          " (every batch before it complete): a checkpoint of them resumes exactly");
             }
             ms_prepare_total += prep_ms;
-            host_stale_ = true;
+            if (gpu_ || emulate_gpu) host_stale_ = true;
             iteration_ = hi;
             if (!more) break;
             lo = nlo;

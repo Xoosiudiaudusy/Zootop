@@ -124,10 +124,12 @@ def test_flat_and_gpu_host_keep_the_last_batch_and_continue_exactly(threads, mod
         ft.train(1280 - ft.iteration)
         print("continued identical", export(ft) == export(ref))
         core._debug_fail_prepare(-1)
+        f2 = flat()
         try:
-            flat().train(640)
+            f2.train(640)
         except RuntimeError as e:
-            print("every preparation failing: raised", ft.iteration == 1280)
+            print("every preparation failing: raised", f2.iteration == 0 and f2.tables_consistent)
+        core._debug_fail_prepare(0)
     ''', threads=threads, emu=emu, pool=pool, depth=depth)
     assert "raised True True True True" in out and "continued identical True" in out and "failing: raised True" in out, out
 
@@ -196,3 +198,60 @@ def test_gpu_setup_error_on_resume_keeps_the_checkpoint(tmp_path):
     assert [hashlib.sha256(f.read_bytes()).hexdigest() for f in files] == before
     p = subprocess.run(base + ["0", "--gpu-emulate", "--resume", "--iters", "1024"], capture_output=True, text=True, timeout=600)
     assert p.returncode == 0 and "resumed from iteration 1,024" in p.stdout, (p.stdout[-2000:], p.stderr[-2000:])
+
+
+def test_gpu_host_pool_edge_cases():
+    """The GPU path's preparation pool (emulated device): a worker delayed after taking its chunk, with a short first
+    batch, gives the tables of the path without the pool; a failure inside the device's batch leaves tables marked
+    not whole, on both paths; the prepare-only benchmark touches no table (export after it used to read out of
+    bounds); a pool whose thread cannot start falls back to the per-batch path and trains; the pool reports its
+    preparation time."""
+    out = run('''
+        def flat(pool, threads=4):
+            ft = core.FlatTrainer(spec_to_dict(spec), core_bucketer(bk), 5, True, threads)
+            ft.batch_size = 64
+            ft.gpu_pass = 16
+            ft.emulate_gpu = True
+            ft.prep_pool = pool
+            ft.prep_depth = 3
+            return ft
+        def export(ft):
+            return {{k: (list(r), list(s), v) for k, (r, s, v) in ft.export_nodes().items()}}
+        ref = flat(False)
+        ref.train(37)  # a short first batch, then whole ones
+        ref.train(600)
+        core._debug_prep_delay_us(3000)
+        ft = flat(True)
+        ft.train(37)
+        ft.train(600)
+        core._debug_prep_delay_us(0)
+        print("delayed pool identical", export(ft) == export(ref), ft.ms_prepare_total > 0)
+        for pool in (False, True):
+            ft = flat(pool)
+            ft.train(128)
+            core._debug_fail_device(2)
+            try:
+                ft.train(256)
+                print("device failure: no error")
+            except RuntimeError as e:
+                print("device failure", pool, "do not save" in str(e), ft.tables_consistent)
+            core._debug_fail_device(0)
+        for pool in (False, True):
+            ft = core.FlatTrainer(spec_to_dict(spec), core_bucketer(bk), 5, True, 4)
+            ft.batch_size = 64
+            ft.prep_bench = True
+            ft.prep_pool = pool
+            ft.train(256)
+            print("bench export", pool, len(export(ft)) >= 0, ft.iteration == 256)
+        ref2 = flat(False)
+        ref2.train(640)
+        core._debug_fail_thread_start(1)
+        ft = flat(True)
+        ft.train(640)
+        core._debug_fail_thread_start(0)
+        print("start fallback identical", export(ft) == export(ref2))
+    ''')
+    assert "delayed pool identical True True" in out, out
+    assert "device failure False True False" in out and "device failure True True False" in out, out
+    assert "bench export False True True" in out and "bench export True True True" in out, out
+    assert "start fallback identical True" in out, out
