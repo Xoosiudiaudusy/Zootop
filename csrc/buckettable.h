@@ -52,8 +52,14 @@ public:
 
     // compute street `street` with `threads` threads (chunks handed out dynamically, so slow and
     // fast cores both stay busy); `done` (optional) counts finished classes for progress reports
+    // a build in progress stops at its workers' next chunk and raises (another thread's request, e.g. the
+    // binding's progress callback that raised); build() clears it when it starts
+    void cancel() { cancel_.store(true, std::memory_order_relaxed); }
+    bool cancelled() const { return cancel_.load(std::memory_order_relaxed); }
+
     void build(const Bucketer& bk, int street, int threads, std::atomic<uint64_t>* done = nullptr) {
         if (street < FLOP || street > RIVER) throw std::invalid_argument("street must be flop, turn or river");
+        cancel_.store(false, std::memory_order_relaxed);
         if (!bk.fitted()) throw std::invalid_argument("bucketer not fitted");
         const BucketerIdentity id = bk.identity();
         if (id.n_buckets > 256) throw std::invalid_argument("bucket tables hold at most 256 buckets");
@@ -68,35 +74,27 @@ public:
         const uint64_t n = ix.size();
         std::vector<uint8_t> out(n);
         std::atomic<uint64_t> next{0};
-        std::atomic<bool> failed{false};
-        std::string error;
-        std::mutex err_mu;
         const uint64_t CHUNK = 4096;
-        auto work = [&]() {
-            try {
-                int hole[2], board[5];
-                CanonicalForm cf;
-                for (;;) {
-                    const uint64_t lo = next.fetch_add(CHUNK, std::memory_order_relaxed);
-                    if (lo >= n || failed.load(std::memory_order_relaxed) || pool_stopping()) return;
-                    const uint64_t hi = lo + CHUNK < n ? lo + CHUNK : n;
-                    for (uint64_t i = lo; i < hi; i++) {
-                        ix.unindex(i, hole, board);
-                        canonical_form(hole, board, ix.n_board(), cf);
-                        const int b = bk.bucket_of_form(cf);
-                        if (b < 0 || b > 255) throw std::runtime_error("bucket out of 0..255");
-                        out[i] = (uint8_t)b;
-                    }
-                    if (done) done->fetch_add(hi - lo, std::memory_order_relaxed);
+        auto work = [&]() {  // (an error leaves to run_pool: the other workers stop, the error is raised)
+            int hole[2], board[5];
+            CanonicalForm cf;
+            for (;;) {
+                const uint64_t lo = next.fetch_add(CHUNK, std::memory_order_relaxed);
+                if (lo >= n || pool_stopping() || cancelled()) return;
+                const uint64_t hi = lo + CHUNK < n ? lo + CHUNK : n;
+                for (uint64_t i = lo; i < hi; i++) {
+                    ix.unindex(i, hole, board);
+                    canonical_form(hole, board, ix.n_board(), cf);
+                    const int b = bk.bucket_of_form(cf);
+                    if (b < 0 || b > 255) throw std::runtime_error("bucket out of 0..255");
+                    out[i] = (uint8_t)b;
                 }
-            } catch (const std::exception& e) {
-                std::lock_guard<std::mutex> lk(err_mu);
-                if (!failed.exchange(true)) error = e.what();
+                if (done) done->fetch_add(hi - lo, std::memory_order_relaxed);
             }
         };
         const int T = threads < 1 ? 1 : threads;
         run_pool(T, "bucket table build", work);
-        if (failed.load()) throw std::runtime_error("bucket table build failed: " + error);
+        if (cancelled()) throw std::runtime_error("bucket table build cancelled");
         t_[street].swap(out);
     }
 
@@ -270,7 +268,7 @@ private:
         auto work = [&]() {
             std::vector<uint8_t> b(1326);
             std::vector<uint64_t> mine;
-            for (size_t i = next.fetch_add(1); i < boards.size() && !failed.load() && !pool_stopping(); i = next.fetch_add(1)) {
+            for (size_t i = next.fetch_add(1); i < boards.size() && !failed.load() && !pool_stopping() && !cancelled(); i = next.fetch_add(1)) {
                 const int* board = boards[i].data();
                 if (!bk.river_buckets_all(board, idx, b.data())) { failed.store(true); return; }
                 bool on[52] = {false};
@@ -295,6 +293,7 @@ private:
         };
         const int T = threads < 1 ? 1 : threads;
         run_pool(T, "bucket table (river batches)", work);
+        if (cancelled()) throw std::runtime_error("bucket table build cancelled");
         if (failed.load()) throw std::runtime_error("bucket table build failed: river batch refused a board");
         for (uint64_t id = 0; id < n; id++)
             if (!(seen[id >> 3] >> (id & 7) & 1)) throw std::logic_error("bucket table: a river class was not covered by the canonical boards");
@@ -313,7 +312,7 @@ private:
         auto work = [&]() {
             ExactFeatureBatch batch(pb.bins);
             int counts[MAX_BINS];
-            for (size_t i = next.fetch_add(1); i < boards.size() && !pool_stopping(); i = next.fetch_add(1)) {
+            for (size_t i = next.fetch_add(1); i < boards.size() && !pool_stopping() && !cancelled(); i = next.fetch_add(1)) {
                 const int* board = boards[i].data();
                 batch.compute(board, n_board);
                 bool on[52] = {false};
@@ -335,6 +334,7 @@ private:
         };
         const int T = threads < 1 ? 1 : threads;
         run_pool(T, "bucket table (exact features)", work);
+        if (cancelled()) throw std::runtime_error("bucket table build cancelled");
         t_[street].swap(out);
     }
 
@@ -361,6 +361,7 @@ private:
 
     std::unique_ptr<HandIndexer> ix_[4];
     std::vector<uint8_t> t_[4];
+    std::atomic<bool> cancel_{false};
     BucketerIdentity id_;
 };
 

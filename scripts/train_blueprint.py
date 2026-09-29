@@ -128,6 +128,8 @@ def main() -> None:
                     help="train for this wall time instead of --iters (whole batches with --batch); for equal-time comparisons")
     ap.add_argument("--data-dir", default=DATA, help="where buckets / checkpoints / blueprints go (default data/)")
     args = ap.parse_args()
+    if args.gpu_prep_pool < 0:
+        raise SystemExit("--gpu-prep-pool: 0 (off) or the batches prepared ahead")
     no_throttle = disable_power_throttling()  # scheduling only, results unchanged
 
     spec = GameSpec(
@@ -321,8 +323,6 @@ def main() -> None:
                                          not args.no_linear, trainer.threads)
             ft.batch_size = args.batch
             ft.linear_until = args.linear_until
-            if args.gpu_prep_pool < 0:
-                raise SystemExit("--gpu-prep-pool: 0 (off) or the batches prepared ahead")
             ft.prep_pool = args.gpu_prep_pool > 0
             ft.prep_depth = max(1, args.gpu_prep_pool)
             if args.gpu_emulate:

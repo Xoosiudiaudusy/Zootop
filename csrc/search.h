@@ -1286,30 +1286,22 @@ private:
         // the river cards' subtrees are independent: on the search's threads, summed in card order
         std::vector<std::vector<double>> per((size_t)cards.size());
         std::atomic<size_t> next{0};
-        std::string err;
-        std::mutex err_mu;
-        auto work = [&]() {
-            try {
-                std::vector<double> ror(ro.size());
-                for (size_t i = next.fetch_add(1); i < cards.size() && !pool_stopping(); i = next.fetch_add(1)) {
-                    const int r = cards[i];
-                    for (int t = 0; t < nto; t++)
-                        for (int d = 0; d < N_COMBOS; d++)
-                            ror[(size_t)t * N_COMBOS + d] = (ct.c0[d] == r || ct.c1[d] == r) ? 0.0 : ro[(size_t)t * N_COMBOS + d];
-                    HandState cr(child);
-                    cr.board[4] = r;
-                    if (cr.terminal) per[i] = ex_terminal(cr, ror, nto, r, ex);
-                    else if (ex.leaf_river) per[i] = ex_leaf(cr, ch, ror, nto, br, ex);
-                    else per[i] = ex_walk(cr, ch, k + 1, false, ror, nto, pk, hh, br, ex);
-                }
-            } catch (const std::exception& e) {
-                std::lock_guard<std::mutex> lk(err_mu);
-                err = e.what();
+        auto work = [&]() {  // (an error leaves to run_pool: the other workers stop, the error is raised)
+            std::vector<double> ror(ro.size());
+            for (size_t i = next.fetch_add(1); i < cards.size() && !pool_stopping(); i = next.fetch_add(1)) {
+                const int r = cards[i];
+                for (int t = 0; t < nto; t++)
+                    for (int d = 0; d < N_COMBOS; d++)
+                        ror[(size_t)t * N_COMBOS + d] = (ct.c0[d] == r || ct.c1[d] == r) ? 0.0 : ro[(size_t)t * N_COMBOS + d];
+                HandState cr(child);
+                cr.board[4] = r;
+                if (cr.terminal) per[i] = ex_terminal(cr, ror, nto, r, ex);
+                else if (ex.leaf_river) per[i] = ex_leaf(cr, ch, ror, nto, br, ex);
+                else per[i] = ex_walk(cr, ch, k + 1, false, ror, nto, pk, hh, br, ex);
             }
         };
         const int T = std::max(1, std::min(params_.threads, (int)cards.size()));
         run_pool(T, "exploitability (river cards)", work);
-        if (!err.empty()) throw std::runtime_error(err);
         // the leaf game's best responder: per river card its values under each continuation, chosen
         // (the best one per hole) only after the average over the river card it had not seen
         const int nt = ex.leaf_game && br && ex.leaf_river && !child.terminal ? N_CONTINUATIONS : 1;
@@ -2032,8 +2024,9 @@ private:
         }
         const ComboTable& ct = combo_table();
         const int T = std::max(1, std::min(params_.threads, 64));
-        auto work = [&](int tid) {
-            for (int c = tid; c < N_COMBOS; c += T) {
+        std::atomic<int> next{0};
+        auto work = [&]() {  // (each combo on its own: the same numbers whichever worker takes it)
+            for (int c = next.fetch_add(1); c < N_COMBOS && !pool_stopping(); c = next.fetch_add(1)) {
                 if (class_of_[(size_t)c] < 0) continue;
                 const int hole[2] = {ct.c0[c], ct.c1[c]};
                 int bucket_of_street[4] = {-1, -1, -1, -1};
@@ -2058,11 +2051,7 @@ private:
                 }
             }
         };
-        {
-            WorkerErrors errs;
-            run_workers(T, errs, work, [](int) {});
-            if (errs.failed.load()) throw std::runtime_error("the ranges: " + errs.message());
-        }
+        run_pool(T, "the ranges", work);
         build_cdfs();
         range_seconds_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     }

@@ -96,6 +96,8 @@ static void register_aivat(py::module_& m) {
         return py::make_tuple(n, py::bytes(reinterpret_cast<const char*>(o.data()), o.size() * sizeof(int32_t)));
     }, "(number of classes, int32 bytes of the 1326 x 1326 class ids of ordered hole pairs (-1: overlapping))");
     m.def("aivat_build_tables", [](std::shared_ptr<negp::Bucketer> bk, int threads, const std::vector<int>& streets) {
+        for (int s : streets)
+            if (s < negp::FLOP || s > negp::RIVER) throw std::invalid_argument("streets: 1 (flop), 2 (turn), 3 (river)");
         auto t = std::make_shared<negp::BucketTables>();
         py::dict info;
         {

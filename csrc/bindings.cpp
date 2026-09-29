@@ -751,6 +751,8 @@ PYBIND11_MODULE(_fastcore, m) {
           "tests: a GPU preparation-pool worker sleeps this long after taking a chunk (0: never)");
     m.def("_debug_fail_prepare", [](long long n) { FlatTrainer::debug_fail_prepare().store(n); }, py::arg("n"),
           "tests: the n-th preparation of a flat / GPU iteration from now fails with std::bad_alloc (0: never; < 0: every one)");
+    m.def("_debug_fail_in_work", [](long long n) { debug_fail_in_work().store(n); }, py::arg("n"),
+          "tests: the n-th stop check of a pool's worker (workers.h pool_stopping) from now throws std::bad_alloc inside its work (0: never)");
     m.def("_debug_fail_worker", [](long long n) { debug_fail_worker().store(n); }, py::arg("n"),
           "tests: the n-th worker of a thread pool (workers.h) from now fails before its work with std::bad_alloc (0: never; < 0: every one)");
     m.def("_debug_fail_thread_start", [](long long n) { debug_fail_thread_start().store(n); }, py::arg("n"),
@@ -1072,6 +1074,7 @@ PYBIND11_MODULE(_fastcore, m) {
         .def(py::init<>())
         .def("build", [](BucketTables& t, const Bucketer& bk, int street, int threads, const py::object& progress, double every) {
             // runs without the GIL; `progress(done, total)` is called from this thread every `every` s
+            if (street < FLOP || street > RIVER) throw std::invalid_argument("street must be 1 (flop), 2 (turn) or 3 (river)");
             std::atomic<uint64_t> done{0};
             std::atomic<bool> finished{false};
             std::exception_ptr err;
@@ -1091,13 +1094,14 @@ PYBIND11_MODULE(_fastcore, m) {
                             progress(done.load(), total);
                         } catch (...) {  // (an exception leaving here with the worker joinable would be std::terminate)
                             cb_err = std::current_exception();
+                            t.cancel();  // the build stops at its workers' next chunk
                         }
                     }
                 }
                 worker.join();
             }
+            if (cb_err) std::rethrow_exception(cb_err);  // (the callback's error first: the build's is then "cancelled")
             if (err) std::rethrow_exception(err);
-            if (cb_err) std::rethrow_exception(cb_err);
         }, py::arg("bucketer"), py::arg("street"), py::arg("threads") = 1, py::arg("progress") = py::none(), py::arg("every") = 10.0,
            "tabulate one street (1 flop, 2 turn, 3 river) of a fitted core bucketer")
         .def("build_from_features", [](BucketTables& t, const Bucketer& bk, int street, const std::string& path, int threads) {
@@ -1105,8 +1109,14 @@ PYBIND11_MODULE(_fastcore, m) {
             t.build_from_features(bk, street, path, threads);
         }, py::arg("bucketer"), py::arg("street"), py::arg("path"), py::arg("threads") = 1,
            "flop / turn of an exact potential-aware bucketer from a feature file (core.build_exact_features)")
-        .def("has", &BucketTables::has)
-        .def("size", &BucketTables::size)
+        .def("has", [](const BucketTables& t, int street) {
+            if (street < FLOP || street > RIVER) throw std::invalid_argument("street must be 1 (flop), 2 (turn) or 3 (river)");
+            return t.has(street);
+        })
+        .def("size", [](const BucketTables& t, int street) {
+            if (street < FLOP || street > RIVER) throw std::invalid_argument("street must be 1 (flop), 2 (turn) or 3 (river)");
+            return t.size(street);
+        })
         .def("lookup", [](const BucketTables& t, const py::sequence& hole, const py::sequence& board) {
             std::vector<int> h = to_cards(hole), bd = to_cards(board);
             if (h.size() != 2 || bd.size() < 3 || bd.size() > 5) throw std::invalid_argument("2 hole cards and a 3..5 card board");

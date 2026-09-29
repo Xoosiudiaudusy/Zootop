@@ -79,8 +79,14 @@ inline const std::atomic<bool>*& pool_stop_flag() {
     static thread_local const std::atomic<bool>* p = nullptr;
     return p;
 }
+// tests: the n-th pool_stopping() check from now throws std::bad_alloc, inside a worker's work (0: never)
+inline std::atomic<long long>& debug_fail_in_work() {
+    static std::atomic<long long> n{0};
+    return n;
+}
 inline bool pool_stopping() {
     const std::atomic<bool>* p = pool_stop_flag();
+    if (p != nullptr && debug_hit(debug_fail_in_work())) throw std::bad_alloc();
     return p != nullptr && p->load(std::memory_order_relaxed);
 }
 
@@ -128,9 +134,10 @@ void run_workers(int T, WorkerErrors& errs, W&& work, A&& after) {
 template <class W>
 void run_pool(int T, const std::string& what, W&& work) {
     WorkerErrors errs;
-    struct StopScope {  // (reset on every exit of the worker's work, exceptions included)
-        explicit StopScope(const std::atomic<bool>* f) { pool_stop_flag() = f; }
-        ~StopScope() { pool_stop_flag() = nullptr; }
+    struct StopScope {  // (the previous flag back on every exit of the worker's work, exceptions included: nested pools)
+        explicit StopScope(const std::atomic<bool>* f) : prev(pool_stop_flag()) { pool_stop_flag() = f; }
+        ~StopScope() { pool_stop_flag() = prev; }
+        const std::atomic<bool>* prev;
     };
     run_workers(T < 1 ? 1 : T, errs, [&](int) {
         StopScope scope(&errs.failed);

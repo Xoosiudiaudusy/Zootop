@@ -255,3 +255,27 @@ def test_gpu_host_pool_edge_cases():
     assert "device failure False True False" in out and "device failure True True False" in out, out
     assert "bench export False True True" in out and "bench export True True True" in out, out
     assert "start fallback identical True" in out, out
+
+
+def test_first_batch_preparation_failure_says_where_the_tables_are(tmp_path):
+    """The per-batch path: the first batch's preparation failing names the tables' iteration (a resumable
+    checkpoint), as every later batch does; train_blueprint.py refuses a negative --gpu-prep-pool before any work."""
+    out = run('''
+        ft = core.FlatTrainer(spec_to_dict(spec), core_bucketer(bk), 5, True, 2)
+        ft.batch_size = 64
+        ft.emulate_gpu = True
+        ft.prep_pool = False
+        ft.train(128)
+        core._debug_fail_prepare(1)
+        try:
+            ft.train(128)
+            print("no error")
+        except RuntimeError as e:
+            print("raised", "tables are those of iteration 128" in str(e), ft.tables_consistent)
+        core._debug_fail_prepare(0)
+    ''')
+    assert "raised True True" in out, out
+    p = subprocess.run([sys.executable, "-B", os.path.join(ROOT, "scripts", "train_blueprint.py"), "--players", "2", "--stack", "10",
+                        "--street", "flop", "--backend", "cpp", "--iters", "10", "--tag", "t", "--data-dir", str(tmp_path),
+                        "--gpu-prep-pool", "-1"], capture_output=True, text=True, timeout=600)
+    assert p.returncode != 0 and "--gpu-prep-pool" in p.stdout + p.stderr and "buckets:" not in p.stdout, p.stdout[-2000:]

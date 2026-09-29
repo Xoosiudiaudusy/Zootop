@@ -731,21 +731,12 @@ public:
         vp.seed = seed;
         Evaluator ev(std::make_shared<Game>(g), vp, nullptr);
         std::atomic<int> next{0};
-        std::string err;
-        std::mutex err_mu;
-        auto work = [&]() {
-            try {
-                for (int o = next.fetch_add(1); o < nc && !pool_stopping(); o = next.fetch_add(1))
-                    for (int pos = 0; pos < 2; pos++) rt->values[pos][(size_t)o] = ev.root_value(pos, rep_c[(size_t)o], rep_d[(size_t)o], o, rollouts);
-            } catch (const std::exception& e) {
-                std::lock_guard<std::mutex> lk(err_mu);
-                err = e.what();
-                next.store(nc);
-            }
+        auto work = [&]() {  // (an error leaves to run_pool: the other workers stop, the error is raised)
+            for (int o = next.fetch_add(1); o < nc && !pool_stopping(); o = next.fetch_add(1))
+                for (int pos = 0; pos < 2; pos++) rt->values[pos][(size_t)o] = ev.root_value(pos, rep_c[(size_t)o], rep_d[(size_t)o], o, rollouts);
         };
         const int T = std::max(1, threads);
         run_pool(T, "root table", work);
-        if (!err.empty()) throw std::runtime_error("root table: " + err);
         rt->finish();
         return rt;
     }
