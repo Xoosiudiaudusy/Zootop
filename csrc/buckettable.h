@@ -78,7 +78,7 @@ public:
                 CanonicalForm cf;
                 for (;;) {
                     const uint64_t lo = next.fetch_add(CHUNK, std::memory_order_relaxed);
-                    if (lo >= n || failed.load(std::memory_order_relaxed)) return;
+                    if (lo >= n || failed.load(std::memory_order_relaxed) || pool_stopping()) return;
                     const uint64_t hi = lo + CHUNK < n ? lo + CHUNK : n;
                     for (uint64_t i = lo; i < hi; i++) {
                         ix.unindex(i, hole, board);
@@ -210,7 +210,7 @@ public:
             int c[MAX_BINS];
             for (;;) {
                 const uint64_t lo = next.fetch_add(65536);
-                if (lo >= n) return;
+                if (lo >= n || pool_stopping()) return;
                 const uint64_t hi = lo + 65536 < n ? lo + 65536 : n;
                 for (uint64_t i = lo; i < hi; i++) {
                     for (int j = 0; j < bins; j++) c[j] = counts[i * (uint64_t)bins + (uint64_t)j];
@@ -270,7 +270,7 @@ private:
         auto work = [&]() {
             std::vector<uint8_t> b(1326);
             std::vector<uint64_t> mine;
-            for (size_t i = next.fetch_add(1); i < boards.size() && !failed.load(); i = next.fetch_add(1)) {
+            for (size_t i = next.fetch_add(1); i < boards.size() && !failed.load() && !pool_stopping(); i = next.fetch_add(1)) {
                 const int* board = boards[i].data();
                 if (!bk.river_buckets_all(board, idx, b.data())) { failed.store(true); return; }
                 bool on[52] = {false};
@@ -313,7 +313,7 @@ private:
         auto work = [&]() {
             ExactFeatureBatch batch(pb.bins);
             int counts[MAX_BINS];
-            for (size_t i = next.fetch_add(1); i < boards.size(); i = next.fetch_add(1)) {
+            for (size_t i = next.fetch_add(1); i < boards.size() && !pool_stopping(); i = next.fetch_add(1)) {
                 const int* board = boards[i].data();
                 batch.compute(board, n_board);
                 bool on[52] = {false};

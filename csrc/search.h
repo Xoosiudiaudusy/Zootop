@@ -1291,7 +1291,7 @@ private:
         auto work = [&]() {
             try {
                 std::vector<double> ror(ro.size());
-                for (size_t i = next.fetch_add(1); i < cards.size(); i = next.fetch_add(1)) {
+                for (size_t i = next.fetch_add(1); i < cards.size() && !pool_stopping(); i = next.fetch_add(1)) {
                     const int r = cards[i];
                     for (int t = 0; t < nto; t++)
                         for (int d = 0; d < N_COMBOS; d++)
@@ -1543,7 +1543,7 @@ private:
         auto work = [&]() {
             int board5[5];
             for (int i = 0; i < base; i++) board5[i] = root_.board[i];
-            for (size_t i = next.fetch_add(1); i < extras.size() && !unsupported.load(); i = next.fetch_add(1)) {
+            for (size_t i = next.fetch_add(1); i < extras.size() && !unsupported.load() && !pool_stopping(); i = next.fetch_add(1)) {
                 if (base == 4) {
                     board5[4] = extras[i].second;
                 } else {
