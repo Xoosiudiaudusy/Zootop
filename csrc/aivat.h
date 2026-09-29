@@ -487,6 +487,9 @@ struct ValueParams {
     int rollouts[4] = {4, 8, 8, 0};  // per street of the state reached (preflop, flop, turn)
     int eq_samples = 2000;           // random boards of a preflop all-in value
     uint64_t seed = 0;
+    // v2 "turn exact" (docs/aivat.md, type (b)): a turn state with decisions ahead and its turn card known is
+    // valued exactly (the betting trees walked, the river card enumerated) instead of by rollouts
+    bool turn_exact = false;
 };
 
 // one finished hand (negpluribus/eval/aivat.py AivatHand)
@@ -570,6 +573,7 @@ public:
         int x = 0, y = 1;
         int d[2] = {0, 0};
         std::unordered_map<uint64_t, std::vector<uint8_t>> river_buckets;
+        std::unordered_map<uint64_t, std::vector<int8_t>> river_signs;  // x's showdown sign per combo on a 5-card board
         std::unordered_map<uint64_t, std::vector<int>> buckets;  // x's buckets per board (the agent model)
         std::string tok;
         long long rollouts = 0, rollout_steps = 0, river_trees = 0;
@@ -1125,6 +1129,7 @@ private:
             return equity_mc(ctx, board, nbrd, m, node, need, out);
         }
         if (n_random == 0 && pr.street == RIVER) return river_tree(ctx, pr, need, out);
+        if (vp_.turn_exact && n_random == 0 && pr.street == TURN) return turn_exact(ctx, pr, need, out);
         if (n_random == 1 && pr.street == RIVER) return river_card(ctx, parent, has_action, atype, amount, fixed, need, out);
         const int k = vp_.rollouts[std::min(pr.street, 3)];
         if (k <= 0) throw std::runtime_error("aivat: no rollouts set for street " + std::to_string(pr.street));
@@ -1360,6 +1365,246 @@ private:
             const double s = sc > sd ? 1.0 : (sc < sd ? -1.0 : 0.0);
             const size_t i = (size_t)(std::lower_bound(needed.begin(), needed.end(), (int)bk[(size_t)c]) - needed.begin());
             out[(size_t)c] = A[i] + S[i] * s;
+        }
+    }
+
+    // ---- v2 "turn exact": the value of turn state `st` (turn card known, decisions ahead) for every needed combo:
+    // E over the river card (uniform over the cards off the board, y's hole and the combo) and over both players'
+    // blueprint policies (per bucket, unknown keys check / call, as the rollouts play) of x's net.  The rollouts of
+    // v1 estimate the same expectation (their law: the same policies sampled with one uniform per decision).
+    // Walks: the turn's betting tree with x's probabilities per turn bucket; at each path into the river the river's
+    // tree once, with x's probabilities per river bucket and y's per its river bucket (the tree does not depend on
+    // the river card, only y's bucket does); the combos' values are then summed over the river cards.
+    struct TurnEx {
+        std::vector<int> tb;             // x's turn bucket index (into xb_of) per combo, -1 not needed
+        std::vector<int> xb_of;          // x's turn buckets needed
+        int nT = 0, by_t = 0;
+        std::vector<int> rcards;         // the river cards (off the board and y's hole)
+        std::vector<int> ky;             // per river card: index of y's river bucket in ybs
+        std::vector<int> ybs;            // distinct y river buckets
+        std::vector<int> xbs;            // x's river buckets needed (sorted)
+        std::vector<int> ir;             // [card * NC + c]: index into xbs, -1 when the card is in c or c not needed
+        std::vector<int8_t> sg;          // [card * NC + c]: x's showdown sign
+        std::vector<double> inv_cnt;     // per combo: 1 / number of river cards off it
+        std::vector<double> fold_acc, eq_acc;  // per turn bucket: sum of path weight x net at folds; x m at all-in showdowns
+        std::vector<double> val;         // per combo: the river paths' part
+    };
+    void river_leafs(Ctx& ctx, Game::Memo& mm, const HandState& s, HistHash hh, const TurnEx& T, const std::vector<double>& px,
+                     const std::vector<double>& py, std::vector<double>& A, std::vector<double>& S) const {
+        const size_t nX = T.xbs.size(), nY = T.ybs.size();
+        if (s.terminal) {
+            const bool fold = folded(s);
+            const double v = fold ? (double)s.net(ctx.x) : (double)std::min(s.players[ctx.x].invested, s.players[ctx.y].invested);
+            std::vector<double>& D = fold ? A : S;
+            for (size_t i = 0; i < nX; i++) {
+                if (px[i] == 0.0) continue;
+                const double a = px[i] * v;
+                for (size_t k = 0; k < nY; k++) D[i * nY + k] += a * py[k];
+            }
+            return;
+        }
+        const BetGrid& grid = g_->grid;
+        const int seat = s.to_act;
+        const Obs obs = observe(s, seat);
+        ActionList al;
+        grid.abstract_actions(obs, al);
+        hh.catch_up(s, grid, ctx.tok);
+        int ctype[8], camt[8];
+        for (int i = 0; i < al.n; i++) grid.to_concrete(obs, al.a[i], ctype[i], camt[i]);
+        const int rel = ((seat - s.button) % 2 + 2) % 2;
+        const int n_active = s.n_active();
+        const bool is_y = seat == ctx.y;
+        const std::vector<int>& bs = is_y ? T.ybs : T.xbs;
+        const std::vector<double>& pin = is_y ? py : px;
+        std::vector<std::array<double, 8>> P(bs.size());
+        for (size_t i = 0; i < bs.size(); i++) {
+            double p[8];
+            if (pin[i] == 0.0 || !g_->policy_memo(mm, node_key(s.street, rel, n_active, bs[i], hh), al, p))
+                for (int j = 0; j < al.n; j++) p[j] = al.a[j].id == 1 ? 1.0 : 0.0;
+            for (int j = 0; j < al.n; j++) P[i][(size_t)j] = p[j];
+        }
+        std::vector<double> pn(bs.size());
+        for (int j = 0; j < al.n; j++) {
+            bool any = false;
+            for (size_t i = 0; i < bs.size(); i++) {
+                pn[i] = pin[i] * P[i][(size_t)j];
+                any = any || pn[i] != 0.0;
+            }
+            if (!any) continue;
+            HandState ch(s);
+            ch.apply(ctype[j], ctype[j] == RAISE ? camt[j] : 0);
+            if (is_y) river_leafs(ctx, mm, ch, hh, T, px, pn, A, S);
+            else river_leafs(ctx, mm, ch, hh, T, pn, py, A, S);
+        }
+    }
+    void turn_walk(Ctx& ctx, Game::Memo& mm, const HandState& s, HistHash hh, TurnEx& T, const std::vector<double>& px, double py) const {
+        const Combos& cb = combos();
+        if (s.terminal) {
+            const bool fold = folded(s);
+            const double v = fold ? (double)s.net(ctx.x) : (double)std::min(s.players[ctx.x].invested, s.players[ctx.y].invested);
+            std::vector<double>& D = fold ? T.fold_acc : T.eq_acc;  // (not folded: an all-in, the river run out)
+            for (int i = 0; i < T.nT; i++) D[(size_t)i] += px[(size_t)i] * py * v;
+            return;
+        }
+        const BetGrid& grid = g_->grid;
+        if (s.street == RIVER) {  // a path into the river: its tree, then the combos over the river cards
+            const size_t nX = T.xbs.size(), nY = T.ybs.size();
+            std::vector<double> A(nX * nY, 0.0), S(nX * nY, 0.0);
+            ctx.river_trees++;
+            river_leafs(ctx, mm, s, hh, T, std::vector<double>(nX, 1.0), std::vector<double>(nY, 1.0), A, S);
+            const size_t NR = T.rcards.size();
+            for (int c = 0; c < NC; c++) {
+                const int t = T.tb[(size_t)c];
+                if (t < 0 || px[(size_t)t] == 0.0) continue;
+                double tot = 0.0;
+                for (size_t r = 0; r < NR; r++) {
+                    const int i = T.ir[r * NC + (size_t)c];
+                    if (i < 0) continue;
+                    const size_t q = (size_t)i * nY + (size_t)T.ky[r];
+                    tot += A[q] + S[q] * (double)T.sg[r * NC + (size_t)c];
+                }
+                T.val[(size_t)c] += px[(size_t)t] * py * tot * T.inv_cnt[(size_t)c];
+            }
+            (void)cb;
+            return;
+        }
+        const int seat = s.to_act;
+        const Obs obs = observe(s, seat);
+        ActionList al;
+        grid.abstract_actions(obs, al);
+        hh.catch_up(s, grid, ctx.tok);
+        int ctype[8], camt[8];
+        for (int i = 0; i < al.n; i++) grid.to_concrete(obs, al.a[i], ctype[i], camt[i]);
+        const int rel = ((seat - s.button) % 2 + 2) % 2;
+        const int n_active = s.n_active();
+        if (seat == ctx.y) {
+            double p[8];
+            if (!g_->policy_memo(mm, node_key(s.street, rel, n_active, T.by_t, hh), al, p))
+                for (int j = 0; j < al.n; j++) p[j] = al.a[j].id == 1 ? 1.0 : 0.0;
+            for (int j = 0; j < al.n; j++) {
+                if (p[j] == 0.0) continue;
+                HandState ch(s);
+                ch.apply(ctype[j], ctype[j] == RAISE ? camt[j] : 0);
+                turn_walk(ctx, mm, ch, hh, T, px, py * p[j]);
+            }
+            return;
+        }
+        std::vector<std::array<double, 8>> P((size_t)T.nT);
+        for (int i = 0; i < T.nT; i++) {
+            double p[8];
+            if (px[(size_t)i] == 0.0 || !g_->policy_memo(mm, node_key(s.street, rel, n_active, T.xb_of[(size_t)i], hh), al, p))
+                for (int j = 0; j < al.n; j++) p[j] = al.a[j].id == 1 ? 1.0 : 0.0;
+            for (int j = 0; j < al.n; j++) P[(size_t)i][(size_t)j] = p[j];
+        }
+        std::vector<double> pn((size_t)T.nT);
+        for (int j = 0; j < al.n; j++) {
+            bool any = false;
+            for (int i = 0; i < T.nT; i++) {
+                pn[(size_t)i] = px[(size_t)i] * P[(size_t)i][(size_t)j];
+                any = any || pn[(size_t)i] != 0.0;
+            }
+            if (!any) continue;
+            HandState ch(s);
+            ch.apply(ctype[j], ctype[j] == RAISE ? camt[j] : 0);
+            turn_walk(ctx, mm, ch, hh, T, pn, py);
+        }
+    }
+    const std::vector<int8_t>& river_signs(Ctx& ctx, const int* board5) const {
+        int s5[5];
+        std::copy(board5, board5 + 5, s5);
+        std::sort(s5, s5 + 5);
+        uint64_t key = 0;
+        for (int i = 0; i < 5; i++) key = key * 53 + (uint64_t)s5[i] + 1;
+        auto it = ctx.river_signs.find(key);
+        if (it != ctx.river_signs.end()) return it->second;
+        const Combos& cb = combos();
+        std::vector<int8_t> sg((size_t)NC, 0);
+        int cards[7];
+        for (int i = 0; i < 5; i++) cards[2 + i] = board5[i];
+        cards[0] = ctx.d[0];
+        cards[1] = ctx.d[1];
+        const int64_t sd = negp::evaluate(cards, 7);
+        uint64_t bm = 0;
+        for (int i = 0; i < 5; i++) bm |= 1ULL << board5[i];
+        for (int c = 0; c < NC; c++) {
+            if (cb.mask[c] & bm) continue;
+            cards[0] = cb.c0[c];
+            cards[1] = cb.c1[c];
+            const int64_t sc = negp::evaluate(cards, 7);
+            sg[(size_t)c] = sc > sd ? 1 : (sc < sd ? -1 : 0);
+        }
+        return ctx.river_signs.emplace(key, std::move(sg)).first->second;
+    }
+    void turn_exact(Ctx& ctx, const HandState& st, const std::vector<char>& need, std::vector<double>& out) const {
+        const Combos& cb = combos();
+        TurnEx T;
+        const std::vector<int>& bk = buckets_of(ctx, st.board, 4);  // x's turn buckets (the agent model's)
+        T.tb.assign((size_t)NC, -1);
+        std::vector<int> xb_of;
+        for (int c = 0; c < NC; c++) {
+            if (!need[(size_t)c]) continue;
+            const int b = bk[(size_t)c];
+            auto it = std::find(xb_of.begin(), xb_of.end(), b);
+            if (it == xb_of.end()) {
+                xb_of.push_back(b);
+                it = xb_of.end() - 1;
+            }
+            T.tb[(size_t)c] = (int)(it - xb_of.begin());
+        }
+        T.nT = (int)xb_of.size();
+        T.xb_of = xb_of;
+        T.by_t = g_->bucketer->bucket(ctx.d, st.board, 4);
+        uint64_t known = (1ULL << ctx.d[0]) | (1ULL << ctx.d[1]);
+        for (int i = 0; i < 4; i++) known |= 1ULL << st.board[i];
+        for (int r = 0; r < 52; r++) if (!(known >> r & 1)) T.rcards.push_back(r);
+        const size_t NR = T.rcards.size();
+        T.ir.assign(NR * NC, -1);
+        T.sg.assign(NR * NC, 0);
+        T.ky.assign(NR, 0);
+        T.inv_cnt.assign((size_t)NC, 0.0);
+        std::vector<int> cnt((size_t)NC, 0);
+        std::vector<int> xpos(256, -1);
+        for (size_t r = 0; r < NR; r++) {
+            int b5[5] = {st.board[0], st.board[1], st.board[2], st.board[3], T.rcards[r]};
+            const std::vector<uint8_t>& rb = river_buckets(ctx, b5);
+            const std::vector<int8_t>& sg = river_signs(ctx, b5);
+            const int by = g_->bucketer->bucket(ctx.d, b5, 5);
+            auto it = std::find(T.ybs.begin(), T.ybs.end(), by);
+            if (it == T.ybs.end()) {
+                T.ybs.push_back(by);
+                it = T.ybs.end() - 1;
+            }
+            T.ky[r] = (int)(it - T.ybs.begin());
+            for (int c = 0; c < NC; c++) {
+                if (T.tb[(size_t)c] < 0 || (cb.mask[c] >> T.rcards[r] & 1)) continue;
+                const int b = rb[(size_t)c];
+                if (xpos[(size_t)b] < 0) {
+                    xpos[(size_t)b] = (int)T.xbs.size();
+                    T.xbs.push_back(b);
+                }
+                T.ir[r * NC + (size_t)c] = xpos[(size_t)b];
+                T.sg[r * NC + (size_t)c] = sg[(size_t)c];
+                cnt[(size_t)c]++;
+            }
+        }
+        for (int c = 0; c < NC; c++) if (cnt[(size_t)c] > 0) T.inv_cnt[(size_t)c] = 1.0 / (double)cnt[(size_t)c];
+        T.fold_acc.assign((size_t)T.nT, 0.0);
+        T.eq_acc.assign((size_t)T.nT, 0.0);
+        T.val.assign((size_t)NC, 0.0);
+        HistHash hh;
+        hh.catch_up(st, g_->grid, ctx.tok);
+        Game::Memo& mm = g_->memo();
+        turn_walk(ctx, mm, st, hh, T, std::vector<double>((size_t)T.nT, 1.0), 1.0);
+        for (int c = 0; c < NC; c++) {
+            const int t = T.tb[(size_t)c];
+            if (t < 0) continue;
+            double eq = 0.0;  // x's mean showdown sign over the river cards (an all-in on the turn)
+            if (T.eq_acc[(size_t)t] != 0.0) {
+                for (size_t r = 0; r < NR; r++)
+                    if (T.ir[r * NC + (size_t)c] >= 0) eq += (double)T.sg[r * NC + (size_t)c];
+                eq *= T.inv_cnt[(size_t)c];
+            }
+            out[(size_t)c] = T.fold_acc[(size_t)t] + T.eq_acc[(size_t)t] * eq + T.val[(size_t)c];
         }
     }
 
