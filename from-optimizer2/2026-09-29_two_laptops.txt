@@ -61,3 +61,17 @@ port 22).  The 4060's AmneziaVPN routes 0.0.0.0/0 and 192.168.1.0/24 into its tu
 The 4060's firewall: port 8765 open to the local subnet (agent-bridge), 50052 only to .3 / 192.168.2.4, C:\Python314
 without a rule.  Needs the user: the VPN off during the test, or .7 excluded, or whiskas back on .2 / .6; and one more
 open port on the 4060 (or the coordinator on the 4060 with an inbound rule for Python on whiskas).
+
+GIGABIT ESTIMATES (for the decision on the cable and the design; same game and batch; 1 Gbit ~110 MB/s) [оценка]:
+basis [замер]: one 3050 GPU node computes the whole game in 54.8 ms/batch, the 4060 = 1.22x; lockstep rounds cost 1.3x the
+ideal split (measured 33.7 ms vs 26 ideal for 2 GPU nodes); crossings per batch: 65.6k into the 3050's branches, 79.8k
+into the 4060's (the coordinator's byte counters).
+  current design (head on every node), 2 GPU:        1.16 MB/batch ->   ~11 ms net, compute ~34 ms  -> ~360-440k it/s
+  current design, 4 nodes (CPU nodes head only):     2.32 MB/batch ->   ~21 ms net, compute ~53 ms  -> ~270-300k it/s
+  option 1 (head only on the 4060), 2 GPU:           1.05 MB/batch (lists + values of the 3050's crossings) -> ~10 ms net,
+                                                     compute ~32 ms (the head once)                   -> ~410-470k it/s
+  option 1, 2 GPU + 2 CPU nodes (cold branches, no head): the CPU nodes take ~7% of the work (their speed share); +0.15 MB
+                                                     -> ~11 ms net, compute ~30 ms                   -> ~430-500k it/s
+                                                     (they compete with the GPU nodes' host threads on the same laptops:
+                                                     the gain over 2 GPU may vanish; their use is memory, not speed)
+  for comparison: one 4060 GPU node alone 292k (TCP) / 403k (in-process).
