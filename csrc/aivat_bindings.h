@@ -86,6 +86,8 @@ static void register_aivat(py::module_& m) {
         return out;
     });
     m.def("aivat_coin_prob", &coin_prob);
+    m.def("aivat_set_lanes", [](int n) { Evaluator::set_lanes(n); return Evaluator::lanes_in_flight(); }, py::arg("n"),
+          "rollouts in flight per branch (1..8; 1 = one after another, the default); the numbers do not depend on it");
     m.def("aivat_pair_orbits", []() {
         int n = 0;
         std::vector<int32_t> o;

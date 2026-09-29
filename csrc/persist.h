@@ -16,6 +16,12 @@
 // Records are written in increasing numeric-key order, so the same contents always give the same
 // bytes (whatever the insertion history of the table).
 #pragma once
+#if defined(_MSC_VER)
+#include <xmmintrin.h>
+#define NEGP_PREFETCH(p) _mm_prefetch((const char*)(p), _MM_HINT_T0)
+#else
+#define NEGP_PREFETCH(p) __builtin_prefetch(p)
+#endif
 #include <algorithm>
 #include <charconv>
 #include <cmath>
@@ -670,6 +676,10 @@ public:
         packed = true;
     }
 
+    // the directory line find(k) reads first, prefetched (a hint only)
+    void prefetch(const NodeKey& k) const {
+        if (!dir_.empty()) NEGP_PREFETCH(&dir_[(size_t)(k.k1 >> shift_)]);
+    }
     long long find(const NodeKey& k) const {
         if (keys.empty()) return -1;
         const size_t j = (size_t)(k.k1 >> shift_);

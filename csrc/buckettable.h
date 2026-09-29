@@ -49,6 +49,7 @@ public:
         return t_[s][ix_[s]->index(hole, board)];
     }
     uint8_t at(int street, uint64_t idx) const { return t_[street][idx]; }
+    const uint8_t* data(int street) const { return t_[street].data(); }
 
     // compute street `street` with `threads` threads (chunks handed out dynamically, so slow and
     // fast cores both stay busy); `done` (optional) counts finished classes for progress reports

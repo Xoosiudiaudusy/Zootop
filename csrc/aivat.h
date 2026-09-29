@@ -302,11 +302,21 @@ struct Game {
     std::shared_ptr<const BlueprintTable> blueprint;
     std::vector<int> grid_to_bp;  // grid action id -> index in the blueprint's names (-1 unknown)
 
+    uint64_t serial;              // unique per Game object: owner of the per-thread memo (below)
+    // the bucketer's tables when it is a TabulatedBucketer: its bucket() on street s with tab_on[s] is
+    // tabs->at(s, tabs->indexer(s).index(hole, board)) (csrc/buckettable.h)
+    const BucketTables* tabs = nullptr;
+    bool tab_on[4] = {false, false, false, false};
+
     Game(const Spec& s, std::shared_ptr<Bucketer> bk, std::shared_ptr<const BlueprintTable> bp)
-        : spec(s), grid(s.grid()), bucketer(std::move(bk)), blueprint(std::move(bp)) {
+        : spec(s), grid(s.grid()), bucketer(std::move(bk)), blueprint(std::move(bp)), serial(next_serial()) {
         if (!bucketer) throw std::invalid_argument("aivat: a bucketer is needed");
         if (!blueprint) throw std::invalid_argument("aivat: a blueprint is needed");
         if (spec.n_players != 2) throw std::invalid_argument("aivat: heads-up only");
+        if (auto* tb = dynamic_cast<const TabulatedBucketer*>(bucketer.get()))
+            if (tb->tables())
+                for (int st = FLOP; st <= RIVER; st++)
+                    if (tb->tables()->has(st)) tabs = tb->tables().get(), tab_on[st] = true;  // (kept alive by the bucketer)
         grid_to_bp.assign(grid.names.size(), -1);
         for (size_t i = 0; i < grid.names.size(); i++) grid_to_bp[i] = blueprint->name_index(grid.names[i].data(), grid.names[i].size());
     }
@@ -318,6 +328,158 @@ struct Game {
         int legal[8];
         for (int a = 0; a < al.n; a++) legal[a] = grid_to_bp[(size_t)al.a[a].id];
         return blueprint->policy_at(i, legal, al.n, out);
+    }
+
+    // The same through a per-thread memo: policy() and bucket() are pure functions of their arguments
+    // (a rollout repeats a (key, legal) lookup about 30 times per hand, a (hole, board) bucket about 4
+    // times), so a memo hit returns exactly the numbers the call would.  Entries are checked in full
+    // (both key words, the legal ids; every card), a collision just overwrites.
+    struct Memo {
+        static constexpr size_t N_POL = 1 << 14, N_BK = 1 << 16;
+        struct Pol {
+            uint64_t k1 = 0, k2 = 0, sig = 0;  // sig 0: empty
+            bool have = false;
+            double p[8];
+        };
+        struct Bk {
+            uint64_t key = 0;
+            int b = 0;
+        };
+        static constexpr size_t N_TOK = 1 << 10;
+        struct Tok {  // BetGrid::from_concrete of an event with these fields (k0 0: empty)
+            uint64_t k0 = 0, k1 = 0, k2 = 0, k3 = 0;
+            uint8_t len = 0;
+            char t[23];
+        };
+        uint64_t owner = 0;
+        std::vector<Pol> pol;
+        std::vector<Bk> bk;
+        std::vector<Tok> tok;
+        std::string scratch;
+    };
+    // the slot of a key (from k1 alone, so it can be prefetched before the legal actions are known)
+    Memo::Pol& pol_slot(Memo& m, const NodeKey& key) const { return m.pol[(size_t)((key.k1 ^ key.k1 >> 29) & (Memo::N_POL - 1))]; }
+    bool policy_memo(Memo& m, const NodeKey& key, const ActionList& al, double* out) const {
+        uint64_t sig = 0;
+        for (int a = 0; a < al.n; a++) {
+            const int id = al.a[a].id;
+            if (id < 0 || id >= 255) return policy(key, al, out);
+            sig = (sig << 8) | (uint64_t)(id + 1);
+        }
+        if (sig == 0) return policy(key, al, out);
+        Memo::Pol& e = pol_slot(m, key);
+        if (e.sig == sig && e.k1 == key.k1 && e.k2 == key.k2) {
+            for (int a = 0; a < al.n; a++) out[a] = e.p[a];
+            return e.have;
+        }
+        const bool have = policy(key, al, out);
+        e.k1 = key.k1;
+        e.k2 = key.k2;
+        e.sig = sig;
+        e.have = have;
+        if (have) for (int a = 0; a < al.n; a++) e.p[a] = out[a];
+        return have;
+    }
+    static uint64_t bucket_key(const int* hole, const int* board, int n_board) {
+        uint64_t k = (uint64_t)n_board;
+        k = (k << 6) | (uint64_t)hole[0];
+        k = (k << 6) | (uint64_t)hole[1];
+        for (int i = 0; i < n_board; i++) k = (k << 6) | (uint64_t)board[i];
+        return k | 1ULL << 63;  // (never 0: 0 marks an empty slot; 3 + 42 bits used)
+    }
+    int bucket_memo(Memo& m, const int* hole, const int* board, int n_board) const {
+        const uint64_t k = bucket_key(hole, board, n_board);
+        Memo::Bk& e = m.bk[(size_t)(fmix64(k) & (Memo::N_BK - 1))];
+        if (e.key == k) return e.b;
+        const int b = bucketer->bucket(hole, board, n_board);
+        e.key = k;
+        e.b = b;
+        return b;
+    }
+    // bucket lookups of a rollout's later streets, started early (the run-out is dealt first, so every board is
+    // known): stage 1 prefetches the memo slot; stage 2 (a step later) reads it and on a miss computes the
+    // table index and prefetches the table byte; the bucket is read when the street comes.  The same numbers
+    // as bucket_memo (the memo holds bucket() values; the table byte is what TabulatedBucketer::bucket reads).
+    struct Ahead {
+        uint64_t key = 0, idx = 0;
+        int b = -1, stage = 0;  // 0 none, 1 memo slot prefetched, 2 table byte prefetched, 3 bucket known
+    };
+    Memo::Bk& bk_slot(Memo& m, uint64_t key) const { return m.bk[(size_t)(fmix64(key) & (Memo::N_BK - 1))]; }
+    void ahead_start(Memo& m, Ahead& a, const int* hole, const int* board, int n_board) const {
+        a.key = bucket_key(hole, board, n_board);
+        NEGP_PREFETCH(&bk_slot(m, a.key));
+        a.stage = 1;
+    }
+    void ahead_step(Memo& m, Ahead& a, int street, const int* hole, const int* board) const {
+        const Memo::Bk& e = bk_slot(m, a.key);
+        if (e.key == a.key) {
+            a.b = e.b;
+            a.stage = 3;
+            return;
+        }
+        a.idx = tabs->indexer(street).index(hole, board);
+        NEGP_PREFETCH(tabs->data(street) + a.idx);
+        a.stage = 2;
+    }
+    int ahead_bucket(Memo& m, Ahead& a, int street, const int* hole, const int* board) const {
+        if (a.stage == 1) ahead_step(m, a, street, hole, board);
+        if (a.stage == 3) return a.b;
+        const int b = tabs->at(street, a.idx);
+        Memo::Bk& e = bk_slot(m, a.key);
+        e.key = a.key;
+        e.b = b;
+        a.b = b;
+        a.stage = 3;
+        return b;
+    }
+
+    // HistHash::event through the memo: the token is a function of the event's fields (from_concrete reads
+    // type, street, all_in, raises_this_street, to_call, pot_before, paid, stack_after; the key holds every field)
+    void hash_event(Memo& m, HistHash& h, const Event& ev) const {
+        const uint64_t k0 = 1ULL << 63 | (uint64_t)(uint8_t)ev.street | (uint64_t)(uint8_t)ev.seat << 8 | (uint64_t)(uint8_t)ev.type << 16 |
+                            (uint64_t)ev.facing_raise << 24 | (uint64_t)ev.all_in << 25 | (uint64_t)(uint16_t)ev.raises_this_street << 32;
+        const uint64_t k1 = (uint64_t)(uint32_t)ev.amount | (uint64_t)(uint32_t)ev.to_call << 32;
+        const uint64_t k2 = (uint64_t)(uint32_t)ev.pot_before | (uint64_t)(uint32_t)ev.paid << 32;
+        const uint64_t k3 = (uint64_t)(uint32_t)ev.stack_after;
+        Memo::Tok& e = m.tok[(size_t)(fmix64(k0 ^ fmix64(k1 ^ fmix64(k2 ^ k3))) & (Memo::N_TOK - 1))];
+        if (!(e.k0 == k0 && e.k1 == k1 && e.k2 == k2 && e.k3 == k3)) {
+            m.scratch.clear();
+            grid.from_concrete(ev, m.scratch);
+            if (m.scratch.size() > sizeof(e.t)) {  // (a token this long is not memoized)
+                h.event(ev, grid, m.scratch);
+                return;
+            }
+            e.k0 = k0;
+            e.k1 = k1;
+            e.k2 = k2;
+            e.k3 = k3;
+            e.len = (uint8_t)m.scratch.size();
+            std::memcpy(e.t, m.scratch.data(), e.len);
+        }
+        if (ev.street != h.cur) {
+            if (h.cur != -1) h.byte('/');
+            h.cur = ev.street;
+        } else {
+            h.byte(' ');
+        }
+        h.bytes(e.t, e.len);
+        h.n++;
+    }
+    // this thread's memo (made empty when it last served another Game)
+    Memo& memo() const {
+        thread_local Memo m;
+        if (m.owner != serial) {  // another Game on this thread: start empty
+            m.pol.assign(Memo::N_POL, Memo::Pol());
+            m.bk.assign(Memo::N_BK, Memo::Bk());
+            m.tok.assign(Memo::N_TOK, Memo::Tok());
+            m.owner = serial;
+        }
+        return m;
+    }
+private:
+    static uint64_t next_serial() {
+        static std::atomic<uint64_t> n{0};
+        return ++n;
     }
 };
 
@@ -386,6 +548,17 @@ struct RootTable {
 // -------------------------------------------------------------------------- heuristic v1
 class Evaluator {
 public:
+    // rollouts in flight per branch (1..MAX_LANES; set_lanes, the binding's aivat_set_lanes): 1, one after
+    // another, is the fastest in the cloud, where the tables sit in its 260 MB L3; more may pay where they do
+    // not.  The numbers do not depend on it.
+    static constexpr int MAX_LANES = 8;
+    static std::atomic<int>& lanes_setting() {
+        static std::atomic<int> n{1};
+        return n;
+    }
+    static void set_lanes(int n) { lanes_setting().store(n < 1 ? 1 : (n > MAX_LANES ? MAX_LANES : n)); }
+    static int lanes_in_flight() { return lanes_setting().load(std::memory_order_relaxed); }
+
     Evaluator(std::shared_ptr<const Game> game, const ValueParams& vp, std::shared_ptr<const RootTable> root)
         : g_(std::move(game)), vp_(vp), root_(std::move(root)) {}
 
@@ -504,7 +677,7 @@ public:
                             if (b < 0 || rows.count(b)) continue;
                             std::array<double, 8> row{};
                             double probs[8];
-                            if (!g_->policy(node_key(st.street, rel, n_active, b, branches[t].hh), al, probs)) {
+                            if (!g_->policy_memo(g_->memo(), node_key(st.street, rel, n_active, b, branches[t].hh), al, probs)) {
                                 row[(size_t)call_col] = 1.0;
                             } else {
                                 double law[8];
@@ -956,15 +1129,50 @@ private:
         const int k = vp_.rollouts[std::min(pr.street, 3)];
         if (k <= 0) throw std::runtime_error("aivat: no rollouts set for street " + std::to_string(pr.street));
         const uint64_t hid = (uint64_t)ctx.hand->hand_id;
-        for (int c = 0; c < NC; c++) {
-            if (!need[(size_t)c]) continue;
-            const int hole[2] = {cb.c0[c], cb.c1[c]};
-            double tot = 0.0;
-            for (int r = 0; r < k; r++) {
-                CounterRng rng(stream_seed({vp_.seed, hid, (uint64_t)node, (uint64_t)c, (uint64_t)r}));
-                tot += rollout(ctx, parent, has_action, atype, amount, fixed, hole, rng);
+        // every rollout's state has the probe's events (the holes and cards do not change them)
+        HistHash hh0;
+        hh0.catch_up(pr, g_->grid, ctx.tok);
+        Start start;
+        start.tmpl = &pr;
+        start.dealt = dealt;
+        start.hh = &hh0;
+        // the rollouts (c, r) in order, LANES in flight at a time; each value is summed in r order as before
+        std::vector<int> list;
+        for (int c = 0; c < NC; c++) if (need[(size_t)c]) list.push_back(c);
+        const int n_jobs = (int)list.size() * k;
+        std::vector<double> vals((size_t)n_jobs, 0.0);
+        const int LANES = lanes_in_flight();
+        Lane lanes[MAX_LANES];
+        Game::Memo& mm = g_->memo();
+        int next = 0, active = 0;
+        auto load = [&](Lane& L) {
+            while (next < n_jobs) {
+                const int job = next++;
+                const int c = list[(size_t)(job / k)], r = job % k;
+                const int hole[2] = {cb.c0[c], cb.c1[c]};
+                L.rng = CounterRng(stream_seed({vp_.seed, hid, (uint64_t)node, (uint64_t)c, (uint64_t)r}));
+                lane_init(ctx, L, parent, has_action, atype, amount, fixed, hole, &start);
+                L.job = job;
+                if (!L.st.terminal) return true;
+                vals[(size_t)job] = (double)L.st.net(ctx.x);
             }
-            out[(size_t)c] = tot / k;
+            L.job = -1;
+            return false;
+        };
+        for (int w = 0; w < LANES; w++) active += load(lanes[w]) ? 1 : 0;
+        while (active > 0)
+            for (int w = 0; w < LANES; w++) {
+                Lane& L = lanes[w];
+                if (L.job < 0) continue;
+                lane_step(ctx, L, mm);
+                if (!L.st.terminal) continue;
+                vals[(size_t)L.job] = (double)L.st.net(ctx.x);
+                if (!load(L)) active--;
+            }
+        for (size_t i = 0; i < list.size(); i++) {
+            double tot = 0.0;
+            for (int r = 0; r < k; r++) tot += vals[i * (size_t)k + (size_t)r];
+            out[(size_t)list[i]] = tot / k;
         }
     }
 
@@ -1088,11 +1296,12 @@ private:
         for (int i = 0; i < al.n; i++) grid.to_concrete(obs, al.a[i], ctype[i], camt[i]);
         const int rel = ((seat - s.button) % 2 + 2) % 2;
         const int n_active = s.n_active();
+        Game::Memo& mm = g_->memo();
         for (size_t i = 0; i < nb; i++) A[i] = 0.0, S[i] = 0.0;
         std::vector<double> A2(nb), S2(nb);
         if (seat == ctx.y) {
             double p[8];
-            if (!g_->policy(node_key(s.street, rel, n_active, by, hh), al, p))
+            if (!g_->policy_memo(mm, node_key(s.street, rel, n_active, by, hh), al, p))
                 for (int j = 0; j < al.n; j++) p[j] = al.a[j].id == 1 ? 1.0 : 0.0;
             for (int j = 0; j < al.n; j++) {
                 if (p[j] == 0.0) continue;
@@ -1109,7 +1318,7 @@ private:
         std::vector<std::array<double, 8>> P(nb);
         for (size_t i = 0; i < nb; i++) {
             double p[8];
-            if (!g_->policy(node_key(s.street, rel, n_active, needed[i], hh), al, p))
+            if (!g_->policy_memo(mm, node_key(s.street, rel, n_active, needed[i], hh), al, p))
                 for (int j = 0; j < al.n; j++) p[j] = al.a[j].id == 1 ? 1.0 : 0.0;
             for (int j = 0; j < al.n; j++) P[i][(size_t)j] = p[j];
         }
@@ -1188,9 +1397,32 @@ private:
 
     // one blueprint self-play rollout (aivat_values.SelfPlayValues._rollout): the unknown board
     // cards first (index floor(u * n) into the sorted remaining cards), then one uniform per decision
-    double rollout(Ctx& ctx, const HandState& parent, bool has_action, int atype, int amount, const std::vector<int>& fixed, const int* c,
-                   CounterRng& rng) const {
-        const BetGrid& grid = g_->grid;
+    // A branch's rollouts share its probe state `tmpl` (probe() with any two holes): the action's events and
+    // whether the hand ended do not depend on the cards, so a rollout's state is `tmpl` with x's hole, the
+    // board cards the action dealt taken from the run-out, and the rollout's deck; `hh_start`: its events hashed.
+    struct Start {
+        const HandState* tmpl = nullptr;
+        int dealt = 0;
+        const HistHash* hh = nullptr;
+    };
+    // One rollout in flight: rollout() runs one to the end; branch() keeps several in flight and steps them in
+    // turn, so the cache misses of one overlap the work of the others (each has its own random stream and
+    // state, so the order of the steps does not change any number).
+    struct Lane {
+        HandState st;
+        int deck[52];
+        int full[5];
+        int memo[2][6];
+        Game::Ahead ah[2][4];
+        bool ahead = false;
+        HistHash hh;
+        CounterRng rng{0};
+        int job = -1;
+    };
+    // the unknown board cards first (index floor(u * n) into the sorted remaining cards), the state, the
+    // lookups ahead; L.rng must be set
+    void lane_init(Ctx& ctx, Lane& L, const HandState& parent, bool has_action, int atype, int amount, const std::vector<int>& fixed, const int* c,
+                   const Start* start) const {
         uint64_t known = (1ULL << c[0]) | (1ULL << c[1]) | (1ULL << ctx.d[0]) | (1ULL << ctx.d[1]);
         for (int i = 0; i < parent.n_board; i++) known |= 1ULL << parent.board[i];
         for (int f : fixed) known |= 1ULL << f;
@@ -1200,49 +1432,108 @@ private:
         for (int f : fixed) runout[nrun++] = f;
         const int need = 5 - parent.n_board - (int)fixed.size();
         for (int j = 0; j < need; j++) {
-            const int i = (int)(rng.uniform() * (double)nr);
+            const int i = (int)(L.rng.uniform() * (double)nr);
             runout[nrun++] = rest[i];
             std::memmove(rest + i, rest + i + 1, sizeof(int) * (size_t)(nr - i - 1));
             nr--;
         }
-        int deck[52], dealt = 0;
-        HandState st = probe(ctx, parent, has_action, atype, amount, c, runout, nrun, deck, dealt);
+        int dealt = 0;
+        HandState& st = L.st;
+        int* deck = L.deck;
+        if (start && start->tmpl) {  // = probe(ctx, parent, has_action, atype, amount, c, runout, nrun, deck, dealt)
+            int pos = 0;
+            for (int s = 0; s < 2; s++) {
+                const int* h = s == ctx.x ? c : ctx.d;
+                deck[pos++] = h[0];
+                deck[pos++] = h[1];
+            }
+            for (int i = 0; i < parent.n_board; i++) deck[pos++] = parent.board[i];
+            for (int i = 0; i < nrun; i++) deck[pos++] = runout[i];
+            for (int i = 0; i < nr; i++) deck[pos++] = rest[i];  // the other cards, increasing
+            st = *start->tmpl;
+            dealt = start->dealt;
+            st.deck = deck;
+            st.players[ctx.x].hole[0] = c[0];
+            st.players[ctx.x].hole[1] = c[1];
+            for (int i = 0; i < dealt; i++) st.board[parent.n_board + i] = runout[i];
+        } else {
+            st = probe(ctx, parent, has_action, atype, amount, c, runout, nrun, deck, dealt);
+        }
         ctx.rollouts++;
-        int memo[2][6];
         for (int s = 0; s < 2; s++)
-            for (int j = 0; j < 6; j++) memo[s][j] = -1;
-        HistHash hh;
-        while (!st.terminal) {
-            const int seat = st.to_act;
-            const Obs obs = observe(st, seat);
-            ActionList al;
-            grid.abstract_actions(obs, al);
-            hh.catch_up(st, grid, ctx.tok);
-            int& b = memo[seat][st.n_board];
-            if (b < 0) b = g_->bucketer->bucket(st.players[seat].hole, st.board, st.n_board);
-            const int rel = ((seat - st.button) % 2 + 2) % 2;
-            double p[8];
-            const bool have = g_->policy(node_key(st.street, rel, st.n_active(), b, hh), al, p);
-            const double u = rng.uniform();
-            int j = al.n - 1;
-            if (!have) {
-                for (int i = 0; i < al.n; i++) if (al.a[i].id == 1) j = i;
-            } else {
-                double acc = 0.0;
-                for (int i = 0; i < al.n; i++) {
-                    acc += p[i];
-                    if (u < acc) {
-                        j = i;
-                        break;
-                    }
+            for (int j = 0; j < 6; j++) L.memo[s][j] = -1;
+        Game::Memo& mm = g_->memo();
+        L.hh = HistHash();
+        if (start && start->hh && start->hh->n <= st.n_events) L.hh = *start->hh;  // the events of the branch's state, hashed once
+        // the buckets of both players on the later streets of this run-out, looked up ahead (Ahead above)
+        for (int i = 0; i < parent.n_board; i++) L.full[i] = parent.board[i];
+        for (int i = 0; i < nrun; i++) L.full[parent.n_board + i] = runout[i];
+        for (int s = 0; s < 2; s++)
+            for (int street = 0; street < 4; street++) L.ah[s][street] = Game::Ahead();
+        L.ahead = false;
+        if (g_->tabs && parent.n_board + nrun == 5 && !st.terminal)
+            for (int street = FLOP; street <= RIVER; street++) {
+                const int len = street == FLOP ? 3 : (street == TURN ? 4 : 5);
+                if (len <= st.n_board || !g_->tab_on[street]) continue;
+                for (int s = 0; s < 2; s++) g_->ahead_start(mm, L.ah[s][street], st.players[s].hole, L.full, len);
+                L.ahead = true;
+            }
+    }
+    // one decision of a lane whose state is not terminal: one uniform per decision (the agent's rule)
+    void lane_step(Ctx& ctx, Lane& L, Game::Memo& mm) const {
+        const BetGrid& grid = g_->grid;
+        HandState& st = L.st;
+        HistHash& hh = L.hh;
+        const int seat = st.to_act;
+        while (hh.n < st.n_events) g_->hash_event(mm, hh, st.events[hh.n]);  // = hh.catch_up(st, grid, ctx.tok)
+        if (L.ahead && st.street + 1 <= RIVER)  // the next street's lookups: a street of betting to hide the miss
+            for (int s = 0; s < 2; s++)
+                if (L.ah[s][st.street + 1].stage == 1) g_->ahead_step(mm, L.ah[s][st.street + 1], st.street + 1, st.players[s].hole, L.full);
+        int& b = L.memo[seat][st.n_board];
+        if (b < 0) {
+            Game::Ahead& a = L.ah[seat][st.street];
+            if (st.n_board > 0 && a.stage > 0)
+                b = g_->ahead_bucket(mm, a, st.street, st.players[seat].hole, L.full);
+            else
+                b = g_->bucket_memo(mm, st.players[seat].hole, st.board, st.n_board);
+        }
+        const int rel = ((seat - st.button) % 2 + 2) % 2;
+        const NodeKey key = node_key(st.street, rel, st.n_active(), b, hh);
+        NEGP_PREFETCH(&g_->pol_slot(mm, key));  // (its line is read after the legal actions)
+        g_->blueprint->prefetch(key);                  // (read on a memo miss)
+        const Obs obs = observe(st, seat);
+        ActionList al;
+        grid.abstract_actions(obs, al);
+        double p[8];
+        const bool have = g_->policy_memo(mm, key, al, p);
+        const double u = L.rng.uniform();
+        int j = al.n - 1;
+        if (!have) {
+            for (int i = 0; i < al.n; i++) if (al.a[i].id == 1) j = i;
+        } else {
+            double acc = 0.0;
+            for (int i = 0; i < al.n; i++) {
+                acc += p[i];
+                if (u < acc) {
+                    j = i;
+                    break;
                 }
             }
-            int type, amt;
-            grid.to_concrete(obs, al.a[j], type, amt);
-            st.apply(type, type == RAISE ? amt : 0);
-            ctx.rollout_steps++;
         }
-        return (double)st.net(ctx.x);
+        int type, amt;
+        grid.to_concrete(obs, al.a[j], type, amt);
+        st.apply(type, type == RAISE ? amt : 0);
+        ctx.rollout_steps++;
+    }
+    double rollout(Ctx& ctx, const HandState& parent, bool has_action, int atype, int amount, const std::vector<int>& fixed, const int* c,
+                   CounterRng& rng, const Start* start = nullptr) const {
+        Lane L;
+        L.rng = rng;
+        lane_init(ctx, L, parent, has_action, atype, amount, fixed, c, start);
+        Game::Memo& mm = g_->memo();
+        while (!L.st.terminal) lane_step(ctx, L, mm);
+        rng = L.rng;
+        return (double)L.st.net(ctx.x);
     }
 };
 
