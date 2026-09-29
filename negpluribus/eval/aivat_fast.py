@@ -51,10 +51,12 @@ def make_game(spec, core_bucketer, blueprint):
 
 class FastAivat:
     def __init__(self, game, rollouts: Sequence[int] = (4, 8, 8), eq_samples: int = 2000, seed: int = 0, root=None,
-                 alloc: int = 0, turn_exact: bool = False, preflop=None):
+                 alloc: int = 0, turn_exact: bool = False, preflop=None,
+                 strat: bool = False):
         """Heuristic v1 by default; v2 options, independent (docs/aivat.md):
         ``alloc=1`` rollouts by the combo's weight in the terms (at least 1); ``turn_exact`` turn states with
-        decisions ahead valued exactly; ``preflop`` (``preflop_equity``) a preflop all-in by the exact table."""
+        decisions ahead valued exactly; ``preflop`` (``preflop_equity``) a preflop all-in by the exact table;
+        ``strat`` a combo's rollouts take distinct first missing board cards."""
         self.game = game
         self.rollouts = list(rollouts)
         self.eq_samples = eq_samples
@@ -63,7 +65,8 @@ class FastAivat:
         self.alloc = alloc
         self.turn_exact = turn_exact
         self.preflop = preflop
-        self.ev = _core().AivatEvaluator(game, self.rollouts, eq_samples, seed, root, alloc, turn_exact, preflop)
+        self.strat = strat
+        self.ev = _core().AivatEvaluator(game, self.rollouts, eq_samples, seed, root, alloc, turn_exact, preflop, strat)
 
     def evaluate(self, hand, trace: bool = False) -> dict:
         return self.ev.evaluate(hand if isinstance(hand, dict) else hand_to_dict(hand), trace)

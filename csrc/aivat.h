@@ -52,6 +52,7 @@ namespace aiv {
 constexpr int NC = 1326;
 constexpr uint64_t GOLD = 0x9E3779B97F4A7C15ULL;
 constexpr uint64_t EQ_STREAM = 1000000;  // rollout index of the Monte-Carlo equity stream
+constexpr uint64_t STRAT_STREAM = 2000000;  // v2 "stratified": the stream of a combo's permutation of the first card
 enum TermKind { T_ROOT = 0, T_SEAT = 1, T_X = 2, T_FLOP = 3, T_TURN = 4, T_RIVER = 5 };
 
 // hole combos (a < b) in the order of Python's [(a, b) for a in range(52) for b in range(a + 1, 52)]
@@ -494,6 +495,10 @@ struct ValueParams {
     // v2 "turn exact" (docs/aivat.md, type (b)): a turn state with decisions ahead and its turn card known is
     // valued exactly (the betting trees walked, the river card enumerated) instead of by rollouts
     bool turn_exact = false;
+    // v2 "stratified" (docs/aivat.md, type (b)): the k rollouts of a combo take the first missing board card from
+    // one random permutation of the cards left (rollout r: its entry r mod n), stream (seed, hand, node, c,
+    // STRAT_STREAM); every rollout's run-out stays uniform on its own, the k first cards are distinct
+    bool strat = false;
 };
 
 // one finished hand (negpluribus/eval/aivat.py AivatHand)
@@ -1250,6 +1255,9 @@ private:
         Lane lanes[MAX_LANES];
         Game::Memo& mm = g_->memo();
         int next = 0, active = 0;
+        const int need_cards = 5 - parent.n_board - (int)fixed.size();
+        int perm_c = -1;
+        std::vector<int> perm;
         auto load = [&](Lane& L) {
             while (next < n_jobs) {
                 const int job = next++;
@@ -1257,6 +1265,23 @@ private:
                 const int c = list[(size_t)i], r = job - first[(size_t)i];
                 const int hole[2] = {cb.c0[c], cb.c1[c]};
                 L.rng = CounterRng(stream_seed({vp_.seed, hid, (uint64_t)node, (uint64_t)c, (uint64_t)r}));
+                L.first_card = -1;
+                if (vp_.strat && need_cards > 0) {
+                    if (c != perm_c) {  // the combo's permutation of the cards left (Fisher-Yates on its own stream)
+                        perm_c = c;
+                        uint64_t known = cb.mask[c] | (1ULL << ctx.d[0]) | (1ULL << ctx.d[1]);
+                        for (int b = 0; b < parent.n_board; b++) known |= 1ULL << parent.board[b];
+                        for (int f : fixed) known |= 1ULL << f;
+                        perm.clear();
+                        for (int q = 0; q < 52; q++) if (!(known >> q & 1)) perm.push_back(q);
+                        CounterRng pr2(stream_seed({vp_.seed, hid, (uint64_t)node, (uint64_t)c, STRAT_STREAM}));
+                        for (int q = (int)perm.size() - 1; q > 0; q--) {
+                            const int t = (int)(pr2.uniform() * (double)(q + 1));
+                            std::swap(perm[(size_t)q], perm[(size_t)t]);
+                        }
+                    }
+                    L.first_card = perm[(size_t)r % perm.size()];
+                }
                 lane_init(ctx, L, parent, has_action, atype, amount, fixed, hole, &start);
                 L.job = job;
                 if (!L.st.terminal) return true;
@@ -1777,6 +1802,7 @@ private:
         HistHash hh;
         CounterRng rng{0};
         int job = -1;
+        int first_card = -1;  // v2 stratified: the first missing board card, set by the caller (-1: drawn)
     };
     // the unknown board cards first (index floor(u * n) into the sorted remaining cards), the state, the
     // lookups ahead; L.rng must be set
@@ -1791,7 +1817,13 @@ private:
         for (int f : fixed) runout[nrun++] = f;
         const int need = 5 - parent.n_board - (int)fixed.size();
         for (int j = 0; j < need; j++) {
-            const int i = (int)(L.rng.uniform() * (double)nr);
+            int i = -1;
+            if (j == 0 && L.first_card >= 0) {
+                for (int q = 0; q < nr; q++) if (rest[q] == L.first_card) i = q;
+                if (i < 0) throw std::logic_error("stratified: the first card is not free");
+            } else {
+                i = (int)(L.rng.uniform() * (double)nr);
+            }
             runout[nrun++] = rest[i];
             std::memmove(rest + i, rest + i + 1, sizeof(int) * (size_t)(nr - i - 1));
             nr--;
