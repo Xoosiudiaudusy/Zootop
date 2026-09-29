@@ -64,6 +64,49 @@ def file_iteration(path: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
+def file_header(path: str) -> Optional[dict]:
+    """What the first bytes of a binary checkpoint / blueprint say, without reading the rest (a 1.4 GB checkpoint is
+    not loaded): {"kind", "identity" (the game, None if unknown), "iteration", "infosets" (the first table's nodes of
+    a checkpoint, the records of a blueprint; None if the header is longer than the part read)}; None for other files."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(_HEAD)
+    except OSError:
+        return None
+    magic = bytes(head[:8])
+    if magic not in (CHECKPOINT_MAGIC, BLUEPRINT_MAGIC):
+        return None
+    r = _Reader(head, path)
+    out: dict = {"kind": "checkpoint" if magic == CHECKPOINT_MAGIC else "blueprint", "identity": None, "iteration": None, "infosets": None}
+    try:
+        r.take(8)
+        r.u32()
+        r.u32()
+        out["identity"] = _identity(r)
+        if magic == CHECKPOINT_MAGIC:
+            r.u8()  # trainer kind
+            out["iteration"] = int(r.i64())
+            r.u8()  # linear
+            for _ in range(r.u32()):  # RNG streams: 624 words + an index each
+                r.take(624 * 4 + 4)
+            for _ in range(r.u16()):
+                r.str16()
+            if r.u32() > 0:
+                r.str16()
+                out["infosets"] = int(r.u64())
+        else:
+            out["iteration"] = int(r.i64())
+            r.u8()  # rounded
+            r.u8()  # packed
+            r.u32()  # codec players
+            for _ in range(r.u16()):
+                r.str16()
+            out["infosets"] = int(r.u64())
+    except Exception:
+        pass  # (a header longer than the part read: what was read so far)
+    return out
+
+
 def resume_checkpoint(data_dir: str, tag: str, binary: bool = True) -> str:
     """The checkpoint ``--resume`` continues from (see the module docstring); raises ResumeError."""
     stem = os.path.join(data_dir, f"checkpoint_{tag}")

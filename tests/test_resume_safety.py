@@ -45,7 +45,7 @@ def test_resume_takes_the_larger_iteration_not_the_newer_file(tmp_path):
 
     train(tmp_path, "--iters", "1000", "--format", "json")          # checkpoint_t.json at 1000
     old_json = (tmp_path / "checkpoint_t.json").read_bytes()
-    train(tmp_path, "--iters", "3000")                                # checkpoint_t.bin at 3000 (a new run)
+    train(tmp_path, "--iters", "3000", "--overwrite")                 # checkpoint_t.bin at 3000 (a new run)
     (tmp_path / "checkpoint_t.json").write_bytes(old_json)           # the old JSON, now the newer file
     assert file_iteration(str(tmp_path / "checkpoint_t.bin")) == 3000
     assert file_iteration(str(tmp_path / "checkpoint_t.json")) == 1000
@@ -63,7 +63,7 @@ def test_blueprint_path_by_iteration(tmp_path):
     shutil.copyfile(tmp_path / "blueprint_t.bin", tmp_path / "keep.bin")
     train(tmp_path, "--iters", "500", "--format", "json", "--tag", "u")
     # a binary blueprint of 2000 and a newer one of 500 converted to JSON by the checkpoint of 500: take the 2000
-    train(tmp_path, "--iters", "500")
+    train(tmp_path, "--iters", "500", "--overwrite")
     os.replace(tmp_path / "keep.bin", tmp_path / "blueprint_t.bin")
     j = subprocess.run([sys.executable, "-B", os.path.join(ROOT, "scripts", "export_json.py"), str(tmp_path / "checkpoint_t.bin"),
                         str(tmp_path / "blueprint_t.json")], capture_output=True, text=True, timeout=600)
@@ -113,3 +113,41 @@ def test_final_iteration_has_its_snapshot(tmp_path, gpu):
         assert (tmp_path / f"blueprint_t.it{it}.bin.run.json").exists(), it
     out = train(tmp_path, "--resume", "--iters", "512", "--checkpoint-every", "512", *extra)  # the settings match: continues
     assert "resumed from iteration 1,024" in out and (tmp_path / "blueprint_t.it1536.bin").exists()
+
+
+def test_a_new_run_does_not_overwrite_a_tags_checkpoints(tmp_path):
+    train(tmp_path, "--iters", "1000")
+    before = (tmp_path / "checkpoint_t.bin").read_bytes()
+    out = train(tmp_path, "--iters", "100", ok=False)
+    assert "--overwrite" in out and (tmp_path / "checkpoint_t.bin").read_bytes() == before
+    train(tmp_path, "--iters", "100", "--overwrite")
+    assert (tmp_path / "checkpoint_t.bin").read_bytes() != before
+
+
+def test_resume_checks_come_before_the_buckets(tmp_path):
+    base = ["--street", "flop", "--fit-situations", "40"]
+    train(tmp_path, "--iters", "200", *base)
+    os.remove(tmp_path / "buckets_t.json")
+    out = train(tmp_path, "--resume", "--iters", "100", "--linear-until", "50", *base, ok=False)
+    assert "was trained with other settings" in out and "buckets:" not in out
+    assert not (tmp_path / "buckets_t.json").exists()  # refused before fitting new buckets
+
+
+def test_blueprint_json_iteration_from_its_passport(tmp_path):
+    from negpluribus.fast.blueprint import tagged_path
+
+    train(tmp_path, "--iters", "2000", "--format", "json")               # blueprint_t.json: no iteration in the file
+    train(tmp_path, "--iters", "500", "--overwrite")                     # blueprint_t.bin at 500, newer
+    assert tagged_path(str(tmp_path), "blueprint", "t").endswith(".json")  # 2000 by the JSON's passport
+
+
+def test_blueprint_info_reads_headers(tmp_path):
+    from negpluribus.fast.runinfo import file_header
+
+    train(tmp_path, "--iters", "1000")
+    ck, bp = file_header(str(tmp_path / "checkpoint_t.bin")), file_header(str(tmp_path / "blueprint_t.bin"))
+    assert ck["kind"] == "checkpoint" and ck["iteration"] == 1000 and ck["infosets"] > 0 and ck["identity"]["n_players"] == 2
+    assert bp["kind"] == "blueprint" and bp["iteration"] == 1000 and bp["infosets"] == ck["infosets"]
+    info = subprocess.run([sys.executable, "-B", os.path.join(ROOT, "scripts", "blueprint_info.py"), str(tmp_path / "blueprint_t.bin")],
+                          capture_output=True, text=True, timeout=600)
+    assert f"{bp['infosets']:,} infosets" in info.stdout and "game: 2 players" in info.stdout, info.stdout

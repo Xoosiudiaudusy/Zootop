@@ -47,6 +47,7 @@
 #include "engine.h"
 #include "mccfr.h"
 #include "nodetable.h"
+#include "workers.h"
 #include "persist.h"
 
 #if defined(_MSC_VER)
@@ -1307,10 +1308,7 @@ private:
             }
         };
         const int T = std::max(1, std::min(params_.threads, (int)cards.size()));
-        std::vector<std::thread> pool;
-        for (int t = 1; t < T; t++) pool.emplace_back(work);
-        work();
-        for (auto& th : pool) th.join();
+        run_pool(T, "exploitability (river cards)", work);
         if (!err.empty()) throw std::runtime_error(err);
         // the leaf game's best responder: per river card its values under each continuation, chosen
         // (the best one per hole) only after the average over the river card it had not seen
@@ -1556,10 +1554,7 @@ private:
             }
         };
         const int T = std::max(1, std::min(params_.threads, 64));
-        std::vector<std::thread> pool;
-        for (int t = 1; t < T; t++) pool.emplace_back(work);
-        work();
-        for (auto& th : pool) th.join();
+        run_pool(T, "the search's river table", work);
         if (unsupported.load()) return 0.0;
         rt.river_slot.assign(52 * 52, -1);
         for (size_t i = 0; i < extras.size(); i++) {
@@ -2063,13 +2058,10 @@ private:
                 }
             }
         };
-        if (T == 1) {
-            work(0);
-        } else {
-            std::vector<std::thread> pool;
-            for (int t = 1; t < T; t++) pool.emplace_back(work, t);
-            work(0);
-            for (auto& th : pool) th.join();
+        {
+            WorkerErrors errs;
+            run_workers(T, errs, work, [](int) {});
+            if (errs.failed.load()) throw std::runtime_error("the ranges: " + errs.message());
         }
         build_cdfs();
         range_seconds_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();

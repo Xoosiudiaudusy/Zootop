@@ -733,7 +733,7 @@ JSON stays readable everywhere and is still written on request, byte for byte as
 ```text
 python scripts/train_blueprint.py ... --backend cpp        # data/checkpoint_<tag>.bin, data/blueprint_<tag>.bin (+ .it<N>.bin)
 python scripts/train_blueprint.py ... --backend cpp --json # the old JSON files as well (same bytes as before)
-python scripts/train_blueprint.py ... --resume             # checkpoint_<tag>.bin or .json, whichever was written last
+python scripts/train_blueprint.py ... --resume             # checkpoint_<tag>.bin or .json, the one of the larger iteration
 python scripts/export_json.py data/checkpoint_X.bin        # -> data/checkpoint_X.json (both trainers load it)
 python scripts/export_json.py data/blueprint_X.bin         # -> data/blueprint_X.json (the JSON of BlueprintStrategy.save)
 python scripts/export_json.py data/blueprint_X.json data/blueprint_X.bin   # an old JSON blueprint -> binary
@@ -743,9 +743,10 @@ python scripts/export_json.py data/blueprint_X.json data/blueprint_X.bin   # an 
 format (`fast.blueprint.load_blueprint` tells them apart by the first bytes) and, when the core is
 built, look probabilities up in C++ (`NEGPLURIBUS_BLUEPRINT=python` gives the old dict).  The
 tools that need the dict itself and open `blueprint_<tag>` by name (`exploitability.py`,
-`search_demo.py`, `search_exploit_demo.py`) take the `.bin` or the `.json`, whichever was written
-last (`fast.blueprint.tagged_path`; with `--json` the binary files are written after their JSON
-twins), and get a `BlueprintStrategy` from either.  In
+`search_demo.py`, `search_exploit_demo.py`) take the `.bin` or the `.json`, the one of the larger
+iteration when both are known (from the binary header, or the passport `<file>.run.json` the trainer writes next to
+every file; `fast.blueprint.tagged_path`), else the one written last (with `--json` the binary files are written after
+their JSON twins), and get a `BlueprintStrategy` from either.  In
 Python: `trainer.save_checkpoint("x.bin")` / `("x.json")`, `trainer.load_checkpoint(path)` (either
 format), `trainer.save_blueprint(path)`, `trainer.blueprint()` (the average strategy as a C++
 lookup), `trainer.strategy_change(prev)`.  The Python reference trainer is unchanged and keeps

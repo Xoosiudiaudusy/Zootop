@@ -18,6 +18,7 @@
 // bit for bit.  The sums over combos (dot products) are sequential here and pairwise in numpy: they
 // agree to rounding (tests compare with a relative tolerance).
 #pragma once
+#include "workers.h"
 #if defined(_MSC_VER)
 #pragma fp_contract(off)
 #endif
@@ -260,10 +261,7 @@ inline bool build_river_table_fast(const Bucketer& bk, BucketTables& tables, int
         filled.fetch_add(mine);
     };
     const int T = std::max(1, threads);
-    std::vector<std::thread> pool;
-    for (int k = 1; k < T; k++) pool.emplace_back(work);
-    work();
-    for (auto& th : pool) th.join();
+    run_pool(T, "river table from canonical boards", work);
     if (unsupported.load()) return false;
     for (uint8_t v : t)
         if (v == 255) throw std::runtime_error("river table: a class was not reached from the canonical boards");
@@ -290,10 +288,7 @@ inline uint64_t build_table_through_bucketer(Bucketer& bk, BucketTables& tables,
         }
     };
     const int T = std::max(1, threads);
-    std::vector<std::thread> pool;
-    for (int k = 1; k < T; k++) pool.emplace_back(work);
-    work();
-    for (auto& th : pool) th.join();
+    run_pool(T, "bucket table through the bucketer", work);
     const uint64_t computed = bk.cache_stats(street).computes - before;
     tables.set_table(street, std::move(t), bk.identity());
     return computed;
@@ -711,10 +706,7 @@ public:
             }
         };
         const int T = std::max(1, threads);
-        std::vector<std::thread> pool;
-        for (int t = 1; t < T; t++) pool.emplace_back(work);
-        work();
-        for (auto& th : pool) th.join();
+        run_pool(T, "evaluating hands", work);
         for (size_t i = 0; i < hands.size(); i++)
             if (!errors[i].empty()) {
                 res[i].trace.emplace_back("error: " + errors[i], std::vector<double>());
@@ -752,10 +744,7 @@ public:
             }
         };
         const int T = std::max(1, threads);
-        std::vector<std::thread> pool;
-        for (int t = 1; t < T; t++) pool.emplace_back(work);
-        work();
-        for (auto& th : pool) th.join();
+        run_pool(T, "root table", work);
         if (!err.empty()) throw std::runtime_error("root table: " + err);
         rt->finish();
         return rt;
