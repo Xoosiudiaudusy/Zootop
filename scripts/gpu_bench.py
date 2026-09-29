@@ -134,7 +134,7 @@ def main() -> int:
         dev = (s["ms_device_total"] - s0["ms_device_total"]) / 1000
         wait = (s["ms_wait_prepare"] - s0["ms_wait_prepare"]) / 1000
         print(f"  GPU batch {B}: {n} it in {wall:.1f}s = {n / wall:,.0f} it/s (x{(n / wall) / (args.iters / cpu):.2f} vs CPU); "
-              f"host deals+buckets {prep:.1f}s (overlapped; waited for it {wait:.1f}s), run_batch {dev:.1f}s; last batch: {s['items']:,} items, {s['records']:,} records, "
+              f"host deals+buckets {prep:.1f}s (overlapped; with the pool summed over batches prepared at once, may exceed the wall time; waited for it {wait:.1f}s), run_batch {dev:.1f}s; last batch: {s['items']:,} items, {s['records']:,} records, "
               f"device {s['ms_forward']:.1f} fwd + {s['ms_backward']:.1f} back + {s['ms_sort']:.1f} sort + {s['ms_runs']:.1f} add ms = "
               f"{B / max(1e-9, (s['ms_traverse'] + s['ms_apply']) / 1000):,.0f} it/s device-only", flush=True)
     return 0

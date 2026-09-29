@@ -104,7 +104,9 @@ public:
     // steps as GpuFlatTrainer::run_batch (a check of everything but the CUDA calls, on any machine)
     bool emulate_gpu = false;
     // GPU / emulation mode, wall time since construction: the host's deals, buckets and strengths, and run_batch
-    // (the preparation of batch i + 1 overlaps batch i; ms_wait_prepare: the device side waited for it)
+    // (the preparation of batch i + 1 overlaps batch i; ms_wait_prepare: the device side waited for it).  With the
+    // pool ms_prepare_total sums each batch's preparation time, and up to prep_depth batches are prepared at once:
+    // it can exceed the wall time and is not comparable with the older path's
     double ms_prepare_total = 0.0, ms_device_total = 0.0, ms_wait_prepare = 0.0;
 
     // move the tables to CUDA device `device` and train there from now on (a CUDA build is needed)
@@ -716,7 +718,12 @@ private:
         long long lo = iteration_ + 1, hi = batch_end(iteration_);
         const auto p0 = clk::now();
         tables_consistent_ = true;
-        prepare_batch(lo, (int)(hi - lo + 1), buf[0]);  // (a failure here: nothing ran, the tables are those of iteration_)
+        try {
+            prepare_batch(lo, (int)(hi - lo + 1), buf[0]);
+        } catch (...) {  // nothing ran: the tables are those of iteration_
+            throw std::runtime_error("training failed: " + current_error_text() + ". The tables are those of iteration " +
+                                     std::to_string(iteration_) + " (every batch before it complete): a checkpoint of them resumes exactly");
+        }
         ms_prepare_total += ms(p0, clk::now());
         for (int w = 0;; w ^= 1) {
             const bool more = hi < target;
