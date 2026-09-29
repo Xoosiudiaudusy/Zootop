@@ -73,7 +73,7 @@ inline long long precompute_buckets(Bucketer& bk, int street, int threads) {
     auto work = [&]() {
         try {
             long long mine = 0;
-            for (size_t i = next.fetch_add(1); i < boards.size(); i = next.fetch_add(1)) {
+            for (size_t i = next.fetch_add(1); i < boards.size() && !pool_stopping(); i = next.fetch_add(1)) {
                 const std::array<int, 5>& b = boards[i];
                 bool on[52] = {false};
                 for (int k = 0; k < n; k++) on[b[(size_t)k]] = true;

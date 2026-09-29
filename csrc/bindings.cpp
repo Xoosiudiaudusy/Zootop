@@ -671,7 +671,7 @@ PYBIND11_MODULE(_fastcore, m) {
             for (int f = 0; f < n; f++) work(f);
         } else {
             std::atomic<int> next{0};
-            run_pool(T, "exact equity", [&]() { for (int f = next.fetch_add(1); f < n; f = next.fetch_add(1)) work(f); });
+            run_pool(T, "exact equity", [&]() { for (int f = next.fetch_add(1); f < n && !pool_stopping(); f = next.fetch_add(1)) work(f); });
         }
         long long w2 = 0, r = 0;
         for (int f = 0; f < n; f++) { w2 += twice_won[(size_t)f]; r += runs[(size_t)f]; }
@@ -829,7 +829,7 @@ PYBIND11_MODULE(_fastcore, m) {
             py::gil_scoped_release nogil;
             std::atomic<size_t> next{0};
             auto work = [&]() {
-                for (size_t i = next.fetch_add(1); i < hands.size(); i = next.fetch_add(1))
+                for (size_t i = next.fetch_add(1); i < hands.size() && !pool_stopping(); i = next.fetch_add(1))
                     exact_feature(hands[i].data(), hands[i].data() + 2, n_board, bins, counts[i].data(), means[i]);
             };
             run_pool(threads, "exact features", work);
@@ -1076,18 +1076,24 @@ PYBIND11_MODULE(_fastcore, m) {
                 finished.store(true);
             });
             const uint64_t total = t.size(street);
+            std::exception_ptr cb_err;  // the progress callback raised: no more calls, the build is waited for, then raised
             {
                 py::gil_scoped_release nogil;
                 while (!finished.load()) {
                     for (int i = 0; i < (int)(every * 20) && !finished.load(); i++) std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                    if (!finished.load() && !progress.is_none()) {
+                    if (!finished.load() && !progress.is_none() && !cb_err) {
                         py::gil_scoped_acquire g;
-                        progress(done.load(), total);
+                        try {
+                            progress(done.load(), total);
+                        } catch (...) {  // (an exception leaving here with the worker joinable would be std::terminate)
+                            cb_err = std::current_exception();
+                        }
                     }
                 }
                 worker.join();
             }
             if (err) std::rethrow_exception(err);
+            if (cb_err) std::rethrow_exception(cb_err);
         }, py::arg("bucketer"), py::arg("street"), py::arg("threads") = 1, py::arg("progress") = py::none(), py::arg("every") = 10.0,
            "tabulate one street (1 flop, 2 turn, 3 river) of a fitted core bucketer")
         .def("build_from_features", [](BucketTables& t, const Bucketer& bk, int street, const std::string& path, int threads) {

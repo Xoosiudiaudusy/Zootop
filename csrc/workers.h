@@ -65,8 +65,23 @@ inline std::atomic<long long>& debug_fail_thread_start() {
     return n;
 }
 inline bool debug_hit(std::atomic<long long>& a) {
-    const long long f = a.load(std::memory_order_relaxed);
-    return f < 0 || (f > 0 && a.fetch_sub(1) == 1);
+    long long f = a.load(std::memory_order_relaxed);
+    for (;;) {  // (a CAS: two workers never take the counter below zero, which would read as "every one")
+        if (f == 0) return false;
+        if (f < 0) return true;
+        if (a.compare_exchange_weak(f, f - 1, std::memory_order_relaxed)) return f == 1;
+    }
+}
+
+// in a run_pool worker: the pool's error flag (loops poll pool_stopping() to stop early once another worker failed);
+// null outside a pool
+inline const std::atomic<bool>*& pool_stop_flag() {
+    static thread_local const std::atomic<bool>* p = nullptr;
+    return p;
+}
+inline bool pool_stopping() {
+    const std::atomic<bool>* p = pool_stop_flag();
+    return p != nullptr && p->load(std::memory_order_relaxed);
 }
 
 template <class W, class A>
@@ -113,7 +128,14 @@ void run_workers(int T, WorkerErrors& errs, W&& work, A&& after) {
 template <class W>
 void run_pool(int T, const std::string& what, W&& work) {
     WorkerErrors errs;
-    run_workers(T < 1 ? 1 : T, errs, [&](int) { work(); }, [](int) {});
+    struct StopScope {  // (reset on every exit of the worker's work, exceptions included)
+        explicit StopScope(const std::atomic<bool>* f) { pool_stop_flag() = f; }
+        ~StopScope() { pool_stop_flag() = nullptr; }
+    };
+    run_workers(T < 1 ? 1 : T, errs, [&](int) {
+        StopScope scope(&errs.failed);
+        work();
+    }, [](int) {});
     if (errs.failed.load()) throw std::runtime_error(what + ": " + errs.message());
 }
 

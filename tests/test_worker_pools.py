@@ -131,7 +131,14 @@ def test_search_pools_raise():
             obs = st.observe(st.current_player)
             return core.SubgameSearch(game, list(st.starting_stacks), 0, acts, list(obs.board), obs.seat, list(obs.hole),
                                       iterations=300, time_budget=0.0, threads=4, seed=1, depth="end")
-        check("search_setup", lambda: search(["r1", "c"]))  # the ranges, the river table of the flop's boards
+        check("search_setup", lambda: search(["r1", "c"]))  # every worker fails: the ranges' pool, the first one
+        core._debug_fail_worker(5)  # the ranges take 4 workers (4 threads): the 5th is the river table's first
+        try:
+            search(["r1", "c"])
+            print("river_table no error")
+        except RuntimeError as e:
+            print("river_table raised", "river table" in str(e), "out of memory" in str(e))
+        core._debug_fail_worker(0)
         s = search(["r1", "c", "c", "c"])  # a turn root
         s.solve()
         check("exploitability", lambda: s.subgame_exploitability(0, 2))
@@ -140,4 +147,42 @@ def test_search_pools_raise():
         search(["r1", "c"])  # the flop root's setup works again
         print("after ok", s.subgame_exploitability(0, 2)[0] >= 0)
     ''')
-    assert "search_setup raised True" in out and "exploitability raised True" in out and "after ok True" in out, out
+    assert "search_setup raised True" in out and "river_table raised True True" in out, out
+    assert "exploitability raised True" in out and "after ok True" in out, out
+
+
+def test_the_other_workers_stop_at_an_error():
+    """One worker fails: the others stop at their next chunk (run_pool's stop flag) instead of doing the whole work
+    that is then thrown away."""
+    out = run('''
+        import time
+        bk = bucketer()
+        t = time.perf_counter(); core.BucketTables().build(bk, 1, 4); normal = time.perf_counter() - t
+        core._debug_fail_worker(2)
+        t = time.perf_counter()
+        try:
+            core.BucketTables().build(bk, 1, 4)
+            print("no error")
+        except RuntimeError as e:
+            print("raised", "out of memory" in str(e))
+        failed = time.perf_counter() - t
+        core._debug_fail_worker(0)
+        print("fast", failed < 0.5 * normal, round(normal, 2), round(failed, 2))
+    ''')
+    assert "raised True" in out and "fast True" in out, out
+
+
+def test_progress_callback_that_raises():
+    """BucketTables.build's progress callback raising: the build is waited for, then the callback's error is raised
+    (it used to leave with the build thread joinable: std::terminate)."""
+    out = run('''
+        def progress(done, total):
+            raise ValueError("stop from the callback")
+        try:
+            core.BucketTables().build(bucketer(), 1, 2, progress, 0.05)
+            print("no error")
+        except ValueError as e:
+            print("raised", "stop from the callback" in str(e))
+        print("after ok")
+    ''')
+    assert "raised True" in out and "after ok" in out, out
