@@ -50,13 +50,17 @@ def make_game(spec, core_bucketer, blueprint):
 
 
 class FastAivat:
-    def __init__(self, game, rollouts: Sequence[int] = (4, 8, 8), eq_samples: int = 2000, seed: int = 0, root=None):
+    def __init__(self, game, rollouts: Sequence[int] = (4, 8, 8), eq_samples: int = 2000, seed: int = 0, root=None,
+                 preflop=None):
+        """``preflop``: v2, a preflop all-in valued by the exact equity table (``preflop_equity``) instead of
+        ``eq_samples`` random boards (docs/aivat.md)."""
         self.game = game
         self.rollouts = list(rollouts)
         self.eq_samples = eq_samples
         self.seed = seed
         self.root = root
-        self.ev = _core().AivatEvaluator(game, self.rollouts, eq_samples, seed, root)
+        self.preflop = preflop
+        self.ev = _core().AivatEvaluator(game, self.rollouts, eq_samples, seed, root, preflop)
 
     def evaluate(self, hand, trace: bool = False) -> dict:
         return self.ev.evaluate(hand if isinstance(hand, dict) else hand_to_dict(hand), trace)
@@ -85,6 +89,22 @@ def root_table(game, rollouts: int, seed: int = 0, threads: int = 1, cache_path:
         os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
         np.savez(cache_path, v0=np.array(v0), v1=np.array(v1), meta=json.dumps(meta))
     return rt
+
+
+def preflop_equity(threads: int = 1, cache_path: Optional[str] = None):
+    """The exact heads-up preflop all-in equity table (AivatPreflopEquity; independent of the blueprint and the
+    abstraction), built once (about 3.5 thread-hours) or read from ``cache_path`` (.npz)."""
+    c = _core()
+    if cache_path and os.path.exists(cache_path):
+        z = np.load(cache_path, allow_pickle=False)
+        if json.loads(str(z["meta"])) == {"kind": "preflop_equity_exact", "boards": int(c.AivatPreflopEquity.boards)}:
+            return c.AivatPreflopEquity.from_net(list(z["net"]))
+    t = c.AivatPreflopEquity.build(int(threads))
+    if cache_path:
+        os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
+        np.savez(cache_path, net=np.array(t.net, dtype=np.int32),
+                 meta=json.dumps({"kind": "preflop_equity_exact", "boards": int(c.AivatPreflopEquity.boards)}))
+    return t
 
 
 def summarize(results: Sequence[dict], nets: Optional[Sequence[float]] = None, per: float = 100.0,
