@@ -51,16 +51,18 @@ def make_game(spec, core_bucketer, blueprint):
 
 class FastAivat:
     def __init__(self, game, rollouts: Sequence[int] = (4, 8, 8), eq_samples: int = 2000, seed: int = 0, root=None,
-                 alloc: int = 0):
+                 alloc: int = 0, turn_exact: bool = False):
         """``alloc``: 0 heuristic v1 (``rollouts`` per combo and branch); 1 v2, rollouts by the combo's weight
-        in the terms (at least 1; docs/aivat.md)."""
+        in the terms (at least 1).  ``turn_exact``: v2, turn states with decisions ahead valued exactly
+        instead of by rollouts.  Independent options (docs/aivat.md)."""
         self.game = game
         self.rollouts = list(rollouts)
         self.eq_samples = eq_samples
         self.seed = seed
         self.root = root
         self.alloc = alloc
-        self.ev = _core().AivatEvaluator(game, self.rollouts, eq_samples, seed, root, alloc)
+        self.turn_exact = turn_exact
+        self.ev = _core().AivatEvaluator(game, self.rollouts, eq_samples, seed, root, alloc, turn_exact)
 
     def evaluate(self, hand, trace: bool = False) -> dict:
         return self.ev.evaluate(hand if isinstance(hand, dict) else hand_to_dict(hand), trace)

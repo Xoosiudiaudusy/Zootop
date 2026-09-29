@@ -147,7 +147,7 @@ static void register_aivat(py::module_& m) {
         .def_property_readonly("mean", [](const RootTable& r) { return py::make_tuple(r.mean[0], r.mean[1]); });
 
     py::class_<Evaluator, std::shared_ptr<Evaluator>>(m, "AivatEvaluator")
-        .def(py::init([](std::shared_ptr<Game> g, const std::vector<int>& rollouts, int eq_samples, uint64_t seed, const py::object& root, int alloc) {
+        .def(py::init([](std::shared_ptr<Game> g, const std::vector<int>& rollouts, int eq_samples, uint64_t seed, const py::object& root, int alloc, bool turn_exact) {
             ValueParams vp;
             if (rollouts.size() > 4) throw std::invalid_argument("rollouts: at most one per street (preflop, flop, turn)");
             for (size_t i = 0; i < rollouts.size(); i++) vp.rollouts[i] = rollouts[i];
@@ -155,10 +155,12 @@ static void register_aivat(py::module_& m) {
             vp.seed = seed;
             if (alloc != 0 && alloc != 1) throw std::invalid_argument("alloc: 0 (v1) or 1 (v2 rollouts by weight)");
             vp.alloc = alloc;
+            vp.turn_exact = turn_exact;
             std::shared_ptr<const RootTable> rt;
             if (!root.is_none()) rt = root.cast<std::shared_ptr<RootTable>>();
             return std::make_shared<Evaluator>(std::shared_ptr<const Game>(g), vp, rt);
-        }), py::arg("game"), py::arg("rollouts"), py::arg("eq_samples") = 2000, py::arg("seed") = 0, py::arg("root") = py::none(), py::arg("alloc") = 0)
+        }), py::arg("game"), py::arg("rollouts"), py::arg("eq_samples") = 2000, py::arg("seed") = 0, py::arg("root") = py::none(), py::arg("alloc") = 0,
+            py::arg("turn_exact") = false)
         .def("evaluate", [](const Evaluator& e, const py::dict& hand, bool trace) {
             const HandIn h = aivat_hand_from_py(hand);
             HandOut o;
