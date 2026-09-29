@@ -95,6 +95,11 @@ def test_flop_table_equals_bucket(flop_tables, name):
         for n in (3, 4, 5):
             cards = rng.sample(range(52), 2 + n)
             assert tb.bucket(cards[:2], cards[2:]) == cbk.bucket(cards[:2], cards[2:])
+    # the river batch (the search's river table): the wrapped bucketer's when the river is not tabulated
+    # (with a river table it reads the table per hole; checked against bucket() on the real tables)
+    for _ in range(3):
+        board = rng.sample(range(52), 5)
+        assert tb.river_buckets_all(board) == cbk.river_buckets_all(board)
 
 
 def test_file_roundtrip_and_identity_check(tmp_path, flop_tables):

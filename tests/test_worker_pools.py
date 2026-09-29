@@ -276,3 +276,38 @@ def test_progress_callback_error_cancels_the_build():
         print("fast", time.perf_counter() - t < 0.5 * normal)
     ''')
     assert "interrupted" in out and "fast True" in out, out
+
+
+def test_nested_pool_keeps_the_outer_stop_flag():
+    """A pool run inside another pool's worker (as the blueprint's river table from a search worker): after the inner
+    pool the worker still sees the outer pool's stop flag (it was reset to null before: the worker would not stop)."""
+    out = run('''
+        print("nested", core._debug_nested_pool_stop())
+    ''')
+    assert "nested True" in out, out
+
+
+def test_cancel_from_another_thread_and_a_fast_callback():
+    """BucketTables.cancel() from another Python thread stops a running build; a progress callback that raises at once
+    (every < 0.05 s, before the build thread has started its work) still cancels it."""
+    out = run('''
+        import threading, time
+        bk = bucketer()
+        t = core.BucketTables()
+        threading.Timer(0.3, t.cancel).start()
+        s = time.perf_counter()
+        try:
+            t.build(bk, 1, 2)
+            print("no error")
+        except RuntimeError as e:
+            print("cancelled", "cancelled" in str(e), round(time.perf_counter() - s, 2) < 5)
+        def progress(done, total):
+            raise KeyboardInterrupt
+        s = time.perf_counter()
+        try:
+            core.BucketTables().build(bk, 1, 2, progress, 0.0)
+            print("no error")
+        except KeyboardInterrupt:
+            print("interrupted", round(time.perf_counter() - s, 2) < 5)
+    ''')
+    assert "cancelled True True" in out and "interrupted True" in out, out

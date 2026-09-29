@@ -47,12 +47,31 @@ NEGP_HD inline double py_sum(const double* x, int n) {
 }
 
 // the current strategy of regrets r[0..n) (regret matching, CPython sum() semantics)
+// py_sum(pos, n) is computed over the positive entries only: pos >= +0.0, and a zero changes neither the
+// running sum (f + 0 == f) nor the compensation (it adds (f - f) + 0 == +0; with f == +inf it makes the
+// compensation nan, which is then skipped exactly as an inf + finite compensation leaves f == inf), so
+// the sum is the same double.  All entries are non-negative, so |f| >= |x| is f >= x.
 NEGP_HD inline void regret_matching(const double* r, int n, double* out) {
     double pos[MAX_ACTIONS];
-    for (int i = 0; i < n; i++) pos[i] = r[i] > 0 ? r[i] : 0.0;
-    double s = py_sum(pos, n);
-    if (s <= 0) { for (int i = 0; i < n; i++) out[i] = 1.0 / n; return; }
-    for (int i = 0; i < n; i++) out[i] = pos[i] / s;
+    double f = 0.0, c = 0.0;
+    int m = 0;
+    for (int i = 0; i < n; i++) {
+        const double x = r[i] > 0 ? r[i] : 0.0;
+        pos[i] = x;
+        if (x > 0) {
+            if (m++ == 0) {
+                f = x;
+            } else {
+                const double t = f + x;
+                if (f >= x) c += (f - t) + x;
+                else c += (x - t) + f;
+                f = t;
+            }
+        }
+    }
+    if (m == 0) { for (int i = 0; i < n; i++) out[i] = 1.0 / n; return; }
+    if (c != 0.0 && cfr_isfinite(c)) f += c;
+    for (int i = 0; i < n; i++) out[i] = pos[i] / f;
 }
 
 // net chips of relative seat `me` at a terminal (HandState::finish, in relative seats): `invested[r]`

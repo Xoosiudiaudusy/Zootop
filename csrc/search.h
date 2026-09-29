@@ -563,16 +563,26 @@ public:
         auto work = [&](int tid) {
             Ctx& ctx = ctxs[(size_t)tid];
             ctx.tid = tid;
+            ctx.mt = T > 1;
             ctx.rng.reseed(params_.seed * 0x9E3779B97F4A7C15ULL + (uint64_t)tid * 0xD1B54A32D192ED03ULL + 1);
             std::memcpy(ctx.deck, deck_, sizeof deck_);
             try {
+                // (MCCFR) iteration numbers are taken CHUNK at a time with more than one thread (one shared counter
+                // bumped per iteration costs a contended cache line at river speeds); one thread keeps 1, 2, 3, ...
+                const long long CHUNK = T > 1 ? 16 : 1;
+                long long t = 0, t_end = 0;
+                Node* our_node = nullptr;
                 if (use_vector) {
                     vector_loop(ctx, next_t, stop, deadline, our_key, our_na.n);
                 } else
                 while (!stop.load(std::memory_order_relaxed)) {
-                    const long long t = next_t.fetch_add(1);
+                    if (t == t_end) {
+                        t = next_t.fetch_add(CHUNK);
+                        t_end = t + CHUNK;
+                    }
                     if (params_.iterations > 0 && t > params_.iterations) break;
-                    const double weight = params_.linear ? (double)t : 1.0;
+                    const long long t_cur = t++;
+                    const double weight = params_.linear ? (double)t_cur : 1.0;
                     for (int trav : traversers) {
                         const bool focused = trav == hand_.our_seat && ctx.rng.uniform() < params_.focus;
                         deal(ctx, focused);
@@ -591,15 +601,20 @@ public:
                         if (focused) ctx.focused++;
                     }
                     if (!frozen_) {
-                        Node* node = table_->get_or_create(our_key, ctx.tid, our_na.n, [&](Node& nd, NodeArena&) {
-                            nd.init(our_na.id, our_na.n);
-                            return "";
-                        }).node;
+                        // the table's nodes do not move: looked up once per thread; the lookup's check for a growth
+                        // in progress stays once per iteration (cached tree paths may not reach the table otherwise)
+                        if (group_->pending()) group_->arrive();
+                        if (!our_node)
+                            our_node = table_->get_or_create(our_key, ctx.tid, our_na.n, [&](Node& nd, NodeArena&) {
+                                nd.init(our_na.id, our_na.n);
+                                return "";
+                            }).node;
+                        Node* node = our_node;
                         if (node->n == our_na.n) {
                             double sg[MAX_ACTIONS];
-                            node->lock.lock();
+                            nlock(node, ctx);
                             node->current_strategy(sg);
-                            node->lock.unlock();
+                            nunlock(node, ctx);
                             for (int i = 0; i < our_na.n; i++) ctx.ours[i] += weight * sg[i];
                         }
                     }
@@ -1398,7 +1413,7 @@ private:
         return v;
     }
 
-    struct Ctx {
+    struct alignas(64) Ctx {  // one cache line boundary per thread: no false sharing between neighbours in ctxs
         FastRng rng;
         int tid = 0;
         int deck[52];
@@ -1407,6 +1422,7 @@ private:
         int combo[MAX_PLAYERS];
         int bucket_memo[MAX_PLAYERS][6];
         bool actual = false;
+        bool mt = true;  // other threads share the table (false: a one-thread solve skips the node locks)
         std::string tok;
         long long iterations = 0, traversals = 0, focused = 0, nodes = 0, forced = 0, redeals = 0;
         long long leaves = 0, leaf_evals = 0, rollouts = 0, rollout_steps = 0;
@@ -1417,6 +1433,10 @@ private:
         int str_board = -1;  // board size the strengths are for (-1: not computed for this deal)
         int64_t str[MAX_PLAYERS];
     };
+
+    // a node's lock, taken only when other threads of the solve can touch it
+    static void nlock(Node* n, const Ctx& ctx) { if (ctx.mt) n->lock.lock(); }
+    static void nunlock(Node* n, const Ctx& ctx) { if (ctx.mt) n->lock.unlock(); }
 
     // a leaf: who chooses a continuation, what of the board they saw, the blueprint history there
     struct LeafCtx {
@@ -1808,9 +1828,9 @@ private:
         ctx.nodes++;
         if (params_.debug_leaves > 0) log_leaf(st, ph, p, key, ctx);
         double sigma[MAX_ACTIONS];
-        node->lock.lock();
+        nlock(node, ctx);
         node->current_strategy(sigma);
-        node->lock.unlock();
+        nunlock(node, ctx);
         if (p == traverser) {
             double u[N_CONTINUATIONS];
             const FastRng saved = ctx.rng;
@@ -1825,16 +1845,16 @@ private:
             double v = 0.0;
             for (int k = 0; k < N_CONTINUATIONS; k++) v += sigma[k] * u[k];
             const double w = weight * w_imp;
-            node->lock.lock();
+            nlock(node, ctx);
             for (int k = 0; k < N_CONTINUATIONS; k++) node->regret()[k] += w * (u[k] - v);
-            node->lock.unlock();
+            nunlock(node, ctx);
             return v;
         }
         if (!focused) {
-            node->lock.lock();
+            nlock(node, ctx);
             for (int k = 0; k < N_CONTINUATIONS; k++) node->strategy_sum()[k] += weight * sigma[k];
             node->visits += 1;
-            node->lock.unlock();
+            nunlock(node, ctx);
         }
         choice[p] = sample(sigma, N_CONTINUATIONS, ctx.rng);
         return choose(st, ph, L, i + 1, choice, traverser, weight, w_imp, focused, ctx);
@@ -2183,9 +2203,9 @@ private:
         if (frozen) {
             frozen_->strategy_row(key, na.n, frozen_kind_, sigma);
         } else {
-            node->lock.lock();
+            nlock(node, ctx);
             node->current_strategy(sigma);
-            node->lock.unlock();
+            nunlock(node, ctx);
         }
         if (path_node && focused && seat != traverser) {  // an opponent's real action, weighted by its probability
             const int a = path_[(size_t)k].index;
@@ -2208,16 +2228,16 @@ private:
             for (int i = 0; i < na.n; i++) u += sigma[i] * utils[i];
             if (frozen) return u;
             const double w = weight * w_imp;
-            node->lock.lock();
+            nlock(node, ctx);
             for (int i = 0; i < na.n; i++) node->regret()[i] += w * (utils[i] - u);
-            node->lock.unlock();
+            nunlock(node, ctx);
             return u;
         }
         if (!focused && !frozen) {
-            node->lock.lock();
+            nlock(node, ctx);
             for (int i = 0; i < na.n; i++) node->strategy_sum()[i] += weight * sigma[i];
             node->visits += 1;
-            node->lock.unlock();
+            nunlock(node, ctx);
         }
         const int a = sample(sigma, na.n, ctx.rng);
         st.apply(na.type[a], na.amount[a]);
@@ -2394,7 +2414,7 @@ private:
     }
 
     // HandState::finish + net for `seat`, from the prepared terminal and the deal's cards
-    double tree_net(const TNode* t, int seat, Ctx& ctx) const {
+    NEGP_NOINLINE double tree_net(const TNode* t, int seat, Ctx& ctx) const {
         if (t->n_act <= 1) return t->fixed_value[seat];
         const int n = root_.n;
         if (ctx.str_board != t->n_board) {
@@ -2443,10 +2463,14 @@ private:
         return leaf_value(st, t->ph, traverser, weight, w_imp, focused, ctx);
     }
 
-    // traverse() on the public tree (no frozen round)
+    // traverse() on the public tree (no frozen round).  Terminals and leaves are answered here, inlined in the
+    // callers: the decision nodes' frame (saved registers, the strategy and value arrays) is set up only for them
     double traverse_tree(TNode* t, int traverser, double weight, double w_imp, bool focused, Ctx& ctx) {
-        if (t->terminal) return tree_net(t, traverser, ctx);
+        if (t->terminal) return t->n_act <= 1 ? t->fixed_value[traverser] : tree_net(t, traverser, ctx);
         if (t->leaf) return tree_leaf_value(t, traverser, weight, w_imp, focused, ctx);
+        return traverse_decision(t, traverser, weight, w_imp, focused, ctx);
+    }
+    NEGP_NOINLINE double traverse_decision(TNode* t, int traverser, double weight, double w_imp, bool focused, Ctx& ctx) {
         const int seat = t->seat;
         const NodeActions& na = t->na;
         const int card = tree_card_part(t, seat, ctx);
@@ -2464,9 +2488,15 @@ private:
             return traverse_tree(tchild(t, t->path_index), traverser, weight, w_imp, focused, ctx);
         }
         double sigma[MAX_ACTIONS];
-        node->lock.lock();
+        // an opponent's node off the focused path adds its strategy in the same critical section as it reads it
+        const bool add_sum = seat != traverser && !focused;
+        nlock(node, ctx);
         node->current_strategy(sigma);
-        node->lock.unlock();
+        if (add_sum) {
+            for (int i = 0; i < na.n; i++) node->strategy_sum()[i] += weight * sigma[i];
+            node->visits += 1;
+        }
+        nunlock(node, ctx);
         if (t->path_node && focused && seat != traverser) {  // an opponent's real action, weighted by its probability
             const int a = t->path_index;
             const double w2 = w_imp * sigma[a];
@@ -2479,16 +2509,10 @@ private:
             double u = 0.0;
             for (int i = 0; i < na.n; i++) u += sigma[i] * utils[i];
             const double w = weight * w_imp;
-            node->lock.lock();
+            nlock(node, ctx);
             for (int i = 0; i < na.n; i++) node->regret()[i] += w * (utils[i] - u);
-            node->lock.unlock();
+            nunlock(node, ctx);
             return u;
-        }
-        if (!focused) {
-            node->lock.lock();
-            for (int i = 0; i < na.n; i++) node->strategy_sum()[i] += weight * sigma[i];
-            node->visits += 1;
-            node->lock.unlock();
         }
         const int a = sample(sigma, na.n, ctx.rng);
         return traverse_tree(tchild(t, a), traverser, weight, w_imp, focused, ctx);
@@ -2498,6 +2522,7 @@ private:
     struct VBoard {                      // one river board: strengths, combos in increasing strength, buckets
         std::vector<int64_t> strength;
         std::vector<int> order;
+        std::vector<int> off;            // the combos holding a board card (not in order)
         std::vector<int> bucket;         // turn root: the subgame's river bucket (search_bucket); -1: the combo holds a board card
         std::vector<int> rank;           // river_exact: the combo's class, the index of its strength among the board's (-1: on the board)
         int n_rank = 0;                  // distinct strengths
@@ -2567,7 +2592,10 @@ private:
             B.strength.assign((size_t)N_COMBOS, 0);
             B.bucket.assign((size_t)N_COMBOS, -1);
             for (int c = 0; c < N_COMBOS; c++) {
-                if (on[ct.c0[c]] || on[ct.c1[c]]) continue;
+                if (on[ct.c0[c]] || on[ct.c1[c]]) {
+                    B.off.push_back(c);
+                    continue;
+                }
                 int cards[7] = {ct.c0[c], ct.c1[c], b[0], b[1], b[2], b[3], b[4]};
                 B.strength[(size_t)c] = evaluate(cards, 7);
                 B.order.push_back(c);
@@ -2652,6 +2680,11 @@ private:
     }
 
     // p's counterfactual values at terminal t (o's reach ro; river board index bidx)
+    // the river board bidx was not filled (its combos in neither order nor off)
+    bool B_invalid(int bidx) const {
+        const VBoard& B = vboards_[(size_t)bidx];
+        return B.order.size() + B.off.size() != (size_t)N_COMBOS;
+    }
     void v_terminal(const TNode* t, int p, int o, const double* ro, int bidx, double* v) const {
         const ComboTable& ct = combo_table();
         if (t->n_act <= 1) {  // a fold: the same net for every disjoint pair
@@ -2667,16 +2700,22 @@ private:
             for (int c = 0; c < N_COMBOS; c++) v[c] = net * (total - card[ct.c0[c]] - card[ct.c1[c]] + ro[c]);
             return;
         }
+        // a showdown is on a 5-card board (an all-in before the river deals the rest as chance nodes): B.order and B.off
+        // cover every combo, which the clearing below relies on
+        if (t->n_board != 5 || B_invalid(bidx)) throw std::logic_error("vector CFR: a showdown terminal off a 5-card board");
         const VBoard& B = vboards_[(size_t)bidx];
         const double nw = v_showdown_net(t, p, o, 1), nt = v_showdown_net(t, p, o, 0), nl = v_showdown_net(t, p, o, -1);
-        for (int c = 0; c < N_COMBOS; c++) v[c] = 0.0;
+        for (const int c : B.off) v[c] = 0.0;  // (every combo of B.order is written below)
         double total = 0.0, card[52] = {0.0}, gcard[52] = {0.0};
         size_t i = 0;
         const size_t m = B.order.size();
         // wins and ties by prefix sums over the combos in increasing strength, card removal by per-card sums
+        // (win / tie of a combo of B.order are written before they are read: no clearing)
         static thread_local std::vector<double> win, tie;
-        win.assign((size_t)N_COMBOS, 0.0);
-        tie.assign((size_t)N_COMBOS, 0.0);
+        if (win.size() < (size_t)N_COMBOS) {
+            win.resize((size_t)N_COMBOS);
+            tie.resize((size_t)N_COMBOS);
+        }
         while (i < m) {
             size_t j = i;
             const int64_t sv = B.strength[(size_t)B.order[i]];
@@ -2888,10 +2927,7 @@ private:
                 const int from = std::max(1, (int)f.last[cp]);
                 if (f.last[cp] > 0 && from < it) {
                     double fp = 1.0;
-                    for (int k = from; k < it; k++) {
-                        const double p = std::pow((double)k, 1.5);
-                        fp *= p / (p + 1.0);
-                    }
+                    for (int k = from; k < it; k++) fp *= dcfr_factor(k);
                     const double fn = std::ldexp(1.0, -(it - from));
                     for (int a = 0; a < na; a++) R[a] *= R[a] > 0.0 ? fp : fn;
                 }
@@ -2915,6 +2951,22 @@ private:
             else f.dvis[cp] += 1;
         }
         t->vlock.unlock();
+    }
+
+    // DCFR's positive-regret discount of iteration k, k^1.5 / (k^1.5 + 1): the same double as computed in place,
+    // from a table for the first 2^16 iterations (the pow per row and iteration was 5 % of a turn solve)
+    static double dcfr_factor(int k) {
+        static const std::vector<double> tab = [] {
+            std::vector<double> v((size_t)1 << 16);
+            for (size_t i = 0; i < v.size(); i++) {
+                const double p = std::pow((double)i, 1.5);
+                v[i] = p / (p + 1.0);
+            }
+            return v;
+        }();
+        if (k >= 0 && (size_t)k < tab.size()) return tab[(size_t)k];
+        const double p = std::pow((double)k, 1.5);
+        return p / (p + 1.0);
     }
 
     // the average strategy of p below t where o's reach is zero: no values, no regrets (both would be
@@ -3040,19 +3092,22 @@ private:
         for (int a = 0; a < na; a++) vc.get();
         double* S[MAX_ACTIONS];
         for (int a = 0; a < na; a++) S[a] = vc.buf[base + (size_t)a].data();
-        for (int a = 0; a < na; a++) {
-            double* __restrict Sa = S[a];
+        {  // one pass over the combos (a row per combo, a zero row outside the round), not one per action
+            const double zero_row[MAX_ACTIONS] = {0.0};
             for (int c = 0; c < N_COMBOS; c++) {
                 const int cp = cpv[c];
-                Sa[c] = (cp >= 0 && cp < nc) ? sg[(size_t)cp * na + a] : 0.0;
+                const double* row = (cp >= 0 && cp < nc) ? &sg[(size_t)cp * na] : zero_row;
+                for (int a = 0; a < na; a++) S[a][c] = row[a];
             }
         }
         if (forced >= 0)
             for (int a = 0; a < na; a++) S[a][forced] = a == t->path_index ? 1.0 : 0.0;
-        std::fill(v, v + N_COMBOS, 0.0);
+        // v = 0.0 + the first term + ... : the first term's pass writes 0.0 + x (not x: the same signed zeros)
+        // instead of clearing v in a pass of its own
         if (q == o) {
             double* ro2 = vc.get();
             double* va = vc.get();
+            bool first = true;
             for (int a = 0; a < na; a++) {
                 const double* __restrict Sa = S[a];
                 double mass = 0.0;
@@ -3074,8 +3129,14 @@ private:
                     continue;
                 }
                 v_child(t, a, p, o, rp, ro2, r, weight, ctx, vc, va);
-                for (int c = 0; c < N_COMBOS; c++) v[c] += va[c];
+                if (first) {
+                    for (int c = 0; c < N_COMBOS; c++) v[c] = 0.0 + va[c];
+                    first = false;
+                } else {
+                    for (int c = 0; c < N_COMBOS; c++) v[c] += va[c];
+                }
             }
+            if (first) std::fill(v, v + N_COMBOS, 0.0);
             vc.release((size_t)na + 2);
             vc.depth--;
             return;
@@ -3090,7 +3151,8 @@ private:
             for (int d = 0; d < N_COMBOS; d++) rp2[d] = rp[d] * S[a][d];
             v_child(t, a, p, o, rp2, ro, r, weight, ctx, vc, vs[a]);
         }
-        for (int a = 0; a < na; a++)
+        for (int c = 0; c < N_COMBOS; c++) v[c] = 0.0 + S[0][c] * vs[0][c];
+        for (int a = 1; a < na; a++)
             for (int c = 0; c < N_COMBOS; c++) v[c] += S[a][c] * vs[a][c];
         double* reg = sg + (size_t)nc * na;
         double* ss = reg + (size_t)nc * na;

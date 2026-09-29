@@ -751,6 +751,28 @@ PYBIND11_MODULE(_fastcore, m) {
           "tests: a GPU preparation-pool worker sleeps this long after taking a chunk (0: never)");
     m.def("_debug_fail_prepare", [](long long n) { FlatTrainer::debug_fail_prepare().store(n); }, py::arg("n"),
           "tests: the n-th preparation of a flat / GPU iteration from now fails with std::bad_alloc (0: never; < 0: every one)");
+    m.def("_debug_nested_pool_stop", []() {
+        // tests: an outer pool of 2 whose worker 0 runs an inner pool and then waits (up to 5 s) for the outer pool's stop
+        // flag, set when worker 1 fails: True if worker 0 still sees the outer flag after its inner pool
+        std::atomic<bool> saw{false};
+        std::atomic<int> started{0};
+        py::gil_scoped_release nogil;
+        try {
+            run_pool(2, "outer", [&]() {
+                if (started.fetch_add(1) == 0) {
+                    run_pool(2, "inner", []() {});
+                    const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                    while (!pool_stopping() && std::chrono::steady_clock::now() < end) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    saw.store(pool_stopping());
+                } else {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    throw std::bad_alloc();
+                }
+            });
+        } catch (const std::exception&) {
+        }
+        return saw.load();
+    });
     m.def("_debug_fail_in_work", [](long long n) { debug_fail_in_work().store(n); }, py::arg("n"),
           "tests: the n-th stop check of a pool's worker (workers.h pool_stopping) from now throws std::bad_alloc inside its work (0: never)");
     m.def("_debug_fail_worker", [](long long n) { debug_fail_worker().store(n); }, py::arg("n"),
@@ -1078,6 +1100,7 @@ PYBIND11_MODULE(_fastcore, m) {
             std::atomic<uint64_t> done{0};
             std::atomic<bool> finished{false};
             std::exception_ptr err;
+            t.clear_cancel();  // (here, not in build(): a first callback may come before the build thread gets there)
             std::thread worker([&] {
                 try { t.build(bk, street, threads, &done); } catch (...) { err = std::current_exception(); }
                 finished.store(true);
@@ -1109,6 +1132,8 @@ PYBIND11_MODULE(_fastcore, m) {
             t.build_from_features(bk, street, path, threads);
         }, py::arg("bucketer"), py::arg("street"), py::arg("path"), py::arg("threads") = 1,
            "flop / turn of an exact potential-aware bucketer from a feature file (core.build_exact_features)")
+        .def("cancel", &BucketTables::cancel,
+             "stop a build() running in another thread at its workers' next chunk: it raises RuntimeError('... cancelled')")
         .def("has", [](const BucketTables& t, int street) {
             if (street < FLOP || street > RIVER) throw std::invalid_argument("street must be 1 (flop), 2 (turn) or 3 (river)");
             return t.has(street);
