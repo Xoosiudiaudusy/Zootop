@@ -126,7 +126,9 @@ Everything is in `csrc/`:
 - **`flatcfr.h`**: `FlatTrainer`.
   - The batched algorithm, traversed level by level instead of depth first: a batch of iterations x
     traversers ("jobs") goes forward level by level and then backward.
-  - The CPU prepares the deals, buckets and showdown strengths of batch i+1 while the device runs batch i.
+  - The CPU prepares the deals, buckets and showdown strengths of the next batches while the device runs batch i:
+    a persistent pool of `threads` workers fills a ring of up to 3 batches ahead (`--gpu-prep-pool N`: N ahead;
+    0: the older path, threads started per batch preparing batch i+1 only).  The numbers are the same either way.
   - The level-by-level CPU version, the host emulation of the kernels (`emulate_gpu`) and the device all
     give the same numbers.
   - `copy_to` / `copy_from` move the tables to and from an ordinary `Trainer` in C++, for checkpoints,

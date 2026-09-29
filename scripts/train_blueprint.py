@@ -119,6 +119,9 @@ def main() -> None:
     ap.add_argument("--prune-after", type=int, default=0, help="iterations before pruning starts")
     ap.add_argument("--gpu", type=int, default=-1,
                     help="train on this CUDA device (flat GPU trainer, needs --backend cpp and --batch; bit-identical to --batch on the CPU)")
+    ap.add_argument("--gpu-prep-pool", type=int, default=3,
+                    help="--gpu: batches the host prepares ahead of the device in a persistent thread pool (default 3); 0: the "
+                         "older path (threads started per batch, the next batch only).  The numbers are the same either way")
     ap.add_argument("--gpu-emulate", action="store_true",
                     help="test only: the GPU trainer's kernels emulated on the CPU (same numbers as --gpu, slow)")
     ap.add_argument("--seconds", type=float, default=0.0,
@@ -318,6 +321,10 @@ def main() -> None:
                                          not args.no_linear, trainer.threads)
             ft.batch_size = args.batch
             ft.linear_until = args.linear_until
+            if args.gpu_prep_pool < 0:
+                raise SystemExit("--gpu-prep-pool: 0 (off) or the batches prepared ahead")
+            ft.prep_pool = args.gpu_prep_pool > 0
+            ft.prep_depth = max(1, args.gpu_prep_pool)
             if args.gpu_emulate:
                 ft.emulate_gpu = True
             else:

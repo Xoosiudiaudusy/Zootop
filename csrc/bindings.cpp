@@ -745,6 +745,10 @@ PYBIND11_MODULE(_fastcore, m) {
     // ---- files (persist.h): formats, conversions, test hooks of the Python-identical spellings
     m.def("_debug_fail_table_growth", [](long long n) { FlatNodeTable::debug_fail_grow().store(n); }, py::arg("n"),
           "tests: the n-th node-table growth from now fails with std::bad_alloc (0: never)");
+    m.def("_debug_fail_device", [](long long n) { FlatTrainer::debug_fail_device().store(n); }, py::arg("n"),
+          "tests: the n-th batch the GPU (or its emulation) runs from now fails part way with std::bad_alloc (0: never; < 0: every one)");
+    m.def("_debug_prep_delay_us", [](int us) { FlatTrainer::debug_prep_delay_us().store(us); }, py::arg("us"),
+          "tests: a GPU preparation-pool worker sleeps this long after taking a chunk (0: never)");
     m.def("_debug_fail_prepare", [](long long n) { FlatTrainer::debug_fail_prepare().store(n); }, py::arg("n"),
           "tests: the n-th preparation of a flat / GPU iteration from now fails with std::bad_alloc (0: never; < 0: every one)");
     m.def("_debug_fail_worker", [](long long n) { debug_fail_worker().store(n); }, py::arg("n"),
@@ -1243,6 +1247,13 @@ PYBIND11_MODULE(_fastcore, m) {
             return d;
         })
         .def_readwrite("gpu_pass", &FlatTrainer::gpu_pass)
+        .def_readwrite("prep_depth", &FlatTrainer::prep_depth, "GPU mode: batches the host prepares ahead of the device (pool)")
+        .def_readwrite("prep_pool", &FlatTrainer::prep_pool, "GPU mode: the persistent preparation pool (False: threads per batch, as before)")
+        .def_readwrite("prep_bench", &FlatTrainer::prep_bench, "benchmark of the host part: no device, each batch sleeps prep_bench_ms")
+        .def_readwrite("prep_bench_ms", &FlatTrainer::prep_bench_ms)
+        .def_readonly("ms_prepare_total", &FlatTrainer::ms_prepare_total)
+        .def_readonly("ms_wait_prepare", &FlatTrainer::ms_wait_prepare)
+        .def_readonly("ms_device_total", &FlatTrainer::ms_device_total)
         .def_readwrite("emulate_gpu", &FlatTrainer::emulate_gpu)
         .def("use_gpu", [](FlatTrainer& t, int device) { py::gil_scoped_release nogil; t.use_gpu(device); }, py::arg("device") = 0)
         .def_property_readonly("on_gpu", &FlatTrainer::on_gpu)

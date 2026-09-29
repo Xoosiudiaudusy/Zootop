@@ -18,6 +18,9 @@
 #include <array>
 #include <cstdint>
 #include <stdexcept>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 #include <vector>
 
 namespace negp {
@@ -31,10 +34,8 @@ struct Binom {
             for (int k = 0; k < 8; k++) c[n][k] = k == 0 ? 1 : (n == 0 ? 0 : c[n - 1][k - 1] + c[n - 1][k]);
     }
 };
-inline const Binom& binom() {
-    static const Binom b;
-    return b;
-}
+inline const Binom kBinom{};  // (a namespace-scope table: no guard check per use, unlike a function-local static)
+inline const Binom& binom() { return kBinom; }
 // C(n, k) for k <= 7; n may be large (up to ~2^13 with k <= 4 without overflow)
 inline uint64_t C(int64_t n, int k) {
     if (n < 0 || k < 0 || k > 7 || n < k) return 0;
@@ -44,26 +45,48 @@ inline uint64_t C(int64_t n, int k) {
     return r;
 }
 
-inline int ctz32(uint32_t m) {
-    int n = 0;
-    while (!(m & 1u)) { m >>= 1; n++; }
-    return n;
+inline int ctz32(uint32_t m) {  // m != 0
+#if defined(_MSC_VER)
+    unsigned long i;
+    _BitScanForward(&i, m);
+    return (int)i;
+#else
+    return __builtin_ctz(m);
+#endif
 }
 
 inline int popcount13(uint32_t m) {
-    int n = 0;
-    while (m) { m &= m - 1; n++; }
-    return n;
+    // bit arithmetic (no library call; __builtin_popcount without a popcnt target flag calls one)
+    m = m - ((m >> 1) & 0x55555555u);
+    m = (m & 0x33333333u) + ((m >> 2) & 0x33333333u);
+    m = (m + (m >> 4)) & 0x0F0F0F0Fu;
+    return (int)((m * 0x01010101u) >> 24);
+}
+
+// C(n, k) for the index's arguments (k <= 4 here, n < ~40000): the product of k consecutive integers divided by
+// k! once (exact: that product is a multiple of k!, and below 2^64 for these n); the same values as C()
+inline uint64_t C_small_k(uint64_t n, int k) {
+    if (n < (uint64_t)k) return 0;
+    if (n < 64) return binom().c[n][k];
+    switch (k) {
+        case 0: return 1;
+        case 1: return n;
+        case 2: return n * (n - 1) / 2;
+        case 3: return n * (n - 1) * (n - 2) / 6;
+        case 4: return n * (n - 1) * (n - 2) * (n - 3) / 24;
+        default: return C((int64_t)n, k);
+    }
 }
 
 // colex rank of a set of ranks: sum over its elements b_0 < b_1 < ... of C(b_i, i + 1)
 inline uint64_t colex(uint32_t mask) {
+    const Binom& bt = binom();
     uint64_t r = 0;
     int i = 0;
     while (mask) {
-        int b = ctz32(mask);
+        const int b = ctz32(mask);  // b < 13, i <= 7: the table (C(b, i) = 0 for b < i there too)
         mask &= mask - 1;
-        r += C(b, ++i);
+        r += bt.c[b][++i];
     }
     return r;
 }
@@ -79,12 +102,12 @@ inline uint32_t colex_unrank(uint64_t r, int m) {
 }
 // the ranks of `set` renumbered among the ranks outside `used` (both 13-bit masks)
 inline uint32_t compress(uint32_t set, uint32_t used) {
-    uint32_t out = 0;
-    int k = 0;
-    for (int r = 0; r < 13; r++) {
-        if (used >> r & 1) continue;
-        if (set >> r & 1) out |= 1u << k;
-        k++;
+    // every rank of `set` not in `used` moves down by the number of `used` ranks below it
+    uint32_t out = 0, m = set & ~used;
+    while (m) {
+        const int r = ctz32(m);
+        m &= m - 1;
+        out |= 1u << (r - popcount13(used & ((1u << r) - 1u)));
     }
     return out;
 }
@@ -212,7 +235,7 @@ private:
         const int m0 = hidx::popcount13(a0), m1 = hidx::popcount13(a1);
         SuitKey k;
         k.pat = m0 * 8 + m1;
-        k.val = hidx::colex(a0) * hidx::C(13 - m0, m1) + hidx::colex(hidx::compress(a1, a0));
+        k.val = hidx::colex(a0) * hidx::binom().c[13 - m0][m1] + hidx::colex(hidx::compress(a1, a0));
         k.order = ((uint64_t)k.pat << 40) | k.val;
         k.suit = s;
         return k;
@@ -237,7 +260,7 @@ private:
         for (int g = 0; g < cfg.n_runs; g++) {
             const int len = cfg.run_len[g];
             uint64_t r = 0;
-            for (int i = 1; i <= len; i++) r += hidx::C((int64_t)(k[pos + i - 1].val + (uint64_t)(len - i)), len - i + 1);
+            for (int i = 1; i <= len; i++) r += hidx::C_small_k(k[pos + i - 1].val + (uint64_t)(len - i), len - i + 1);
             idx = idx * cfg.run_size[g] + r;
             pos += len;
         }
