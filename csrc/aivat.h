@@ -552,6 +552,72 @@ struct RootTable {
     }
 };
 
+// the exact heads-up preflop all-in equity per suit class of the hole pair (c, d): wins - losses of c over
+// every 5-card board of the 48 other cards (1,712,304); v2 "preflop exact" (docs/aivat.md, type (b))
+constexpr int PREFLOP_BOARDS = 1712304;
+struct PreflopEquity {
+    std::vector<int32_t> orbit;  // NC x NC (pair_orbits)
+    int n_classes = 0;
+    std::vector<int32_t> net;    // per class: wins - losses of the first hole
+    std::vector<uint8_t> have;   // per class: computed (a partial table, tests: only some classes)
+    bool empty() const { return net.empty(); }
+    // every class, or only `only` (and their mirrors)
+    static std::shared_ptr<PreflopEquity> build(int threads, const std::vector<int>* only = nullptr) {
+        auto t = std::make_shared<PreflopEquity>();
+        t->orbit = pair_orbits(t->n_classes);
+        const int nc = t->n_classes;
+        std::vector<int> rep_c((size_t)nc, -1), rep_d((size_t)nc, -1), mirror((size_t)nc, -1);
+        for (int ci = 0; ci < NC; ci++)
+            for (int di = 0; di < NC; di++) {
+                const int32_t o = t->orbit[(size_t)ci * NC + di];
+                if (o >= 0 && rep_c[(size_t)o] < 0) rep_c[(size_t)o] = ci, rep_d[(size_t)o] = di;
+            }
+        for (int o = 0; o < nc; o++) mirror[(size_t)o] = t->orbit[(size_t)rep_d[(size_t)o] * NC + rep_c[(size_t)o]];
+        t->net.assign((size_t)nc, 0);
+        t->have.assign((size_t)nc, only ? 0 : 1);
+        if (only)
+            for (int o : *only) {
+                if (o < 0 || o >= nc) throw std::invalid_argument("preflop equity: class out of range");
+                t->have[(size_t)o] = t->have[(size_t)mirror[(size_t)o]] = 1;
+            }
+        const Combos& cb = combos();
+        std::atomic<int> next{0};
+        auto work = [&]() {
+            for (int o = next.fetch_add(1); o < nc && !pool_stopping(); o = next.fetch_add(1)) {
+                if (mirror[(size_t)o] < o || !t->have[(size_t)o]) continue;  // the mirror class: minus its value (below)
+                const int x0 = cb.c0[rep_c[(size_t)o]], x1 = cb.c1[rep_c[(size_t)o]];
+                const int y0 = cb.c0[rep_d[(size_t)o]], y1 = cb.c1[rep_d[(size_t)o]];
+                int rest[48], n = 0;
+                for (int k = 0; k < 52; k++) if (k != x0 && k != x1 && k != y0 && k != y1) rest[n++] = k;
+                int x[7] = {x0, x1}, y[7] = {y0, y1};
+                int32_t w = 0;
+                for (int a = 0; a < n; a++) {
+                    x[2] = y[2] = rest[a];
+                    for (int b = a + 1; b < n; b++) {
+                        x[3] = y[3] = rest[b];
+                        for (int c = b + 1; c < n; c++) {
+                            x[4] = y[4] = rest[c];
+                            for (int d = c + 1; d < n; d++) {
+                                x[5] = y[5] = rest[d];
+                                for (int e = d + 1; e < n; e++) {
+                                    x[6] = y[6] = rest[e];
+                                    const int64_t sx = negp::evaluate(x, 7), sy = negp::evaluate(y, 7);
+                                    w += sx > sy ? 1 : (sx < sy ? -1 : 0);
+                                }
+                            }
+                        }
+                    }
+                }
+                t->net[(size_t)o] = w;
+            }
+        };
+        run_pool(std::max(1, threads), "preflop equity table", work);
+        for (int o = 0; o < nc; o++)
+            if (mirror[(size_t)o] < o) t->net[(size_t)o] = -t->net[(size_t)mirror[(size_t)o]];
+        return t;
+    }
+};
+
 // -------------------------------------------------------------------------- heuristic v1
 class Evaluator {
 public:
@@ -566,8 +632,9 @@ public:
     static void set_lanes(int n) { lanes_setting().store(n < 1 ? 1 : (n > MAX_LANES ? MAX_LANES : n)); }
     static int lanes_in_flight() { return lanes_setting().load(std::memory_order_relaxed); }
 
-    Evaluator(std::shared_ptr<const Game> game, const ValueParams& vp, std::shared_ptr<const RootTable> root)
-        : g_(std::move(game)), vp_(vp), root_(std::move(root)) {}
+    Evaluator(std::shared_ptr<const Game> game, const ValueParams& vp, std::shared_ptr<const RootTable> root,
+              std::shared_ptr<const PreflopEquity> preflop = nullptr)
+        : g_(std::move(game)), vp_(vp), root_(std::move(root)), pf_(std::move(preflop)) {}
 
     const Game& game() const { return *g_; }
     const ValueParams& params() const { return vp_; }
@@ -986,6 +1053,7 @@ private:
     std::shared_ptr<const Game> g_;
     ValueParams vp_;
     std::shared_ptr<const RootTable> root_;
+    std::shared_ptr<const PreflopEquity> pf_;  // v2 "preflop exact": set, a preflop all-in is valued by it
 
     static void add_term(HandOut& out, int kind, int street, int k, double v) {
         Term t;
@@ -1135,6 +1203,7 @@ private:
             const int missing = 5 - nbrd;
             if (missing == 0) return showdown(ctx, board, m, need, out);
             if (missing <= 2) return equity_exact(ctx, board, nbrd, m, need, out);
+            if (pf_ && !pf_->empty() && nbrd == 0) return preflop_exact(ctx, m, need, out);
             return equity_mc(ctx, board, nbrd, m, node, need, out);
         }
         if (n_random == 0 && pr.street == RIVER) return river_tree(ctx, pr, need, out);
@@ -1272,6 +1341,19 @@ private:
                 }
         }
         for (size_t t = 0; t < list.size(); t++) out[(size_t)list[t]] = m * (double)tot[t] / (double)cnt[t];
+    }
+
+    // v2: m * (P(win) - P(lose)) over every board, from the exact table
+    void preflop_exact(Ctx& ctx, double m, const std::vector<char>& need, std::vector<double>& out) const {
+        const Combos& cb = combos();
+        const int di = cb.idx[ctx.d[0]][ctx.d[1]];
+        for (int c = 0; c < NC; c++) {
+            if (!need[(size_t)c]) continue;
+            const int32_t o = pf_->orbit[(size_t)c * NC + (size_t)di];
+            if (o < 0) throw std::logic_error("preflop_exact: the combo shares a card with y's hole");
+            if (!pf_->have[(size_t)o]) throw std::runtime_error("preflop_exact: the table lacks this pair's class");
+            out[(size_t)c] = m * (double)pf_->net[(size_t)o] / (double)PREFLOP_BOARDS;
+        }
     }
 
     void equity_mc(Ctx& ctx, const int* board, int nbrd, double m, int node, const std::vector<char>& need, std::vector<double>& out) const {

@@ -127,6 +127,28 @@ static void register_aivat(py::module_& m) {
             return std::make_shared<Game>(spec_from_dict(spec), std::move(bk), std::shared_ptr<const negp::BlueprintTable>(bp));
         }), py::arg("spec"), py::arg("bucketer"), py::arg("blueprint"));
 
+    py::class_<PreflopEquity, std::shared_ptr<PreflopEquity>>(m, "AivatPreflopEquity")
+        .def_static("build", [](int threads, const py::object& only) {
+            std::vector<int> cls;
+            const bool part = !only.is_none();
+            if (part) cls = only.cast<std::vector<int>>();
+            py::gil_scoped_release nogil;
+            return PreflopEquity::build(threads, part ? &cls : nullptr);
+        }, py::arg("threads") = 1, py::arg("only") = py::none(),
+           "exact heads-up preflop all-in equity per suit class of the hole pair: wins - losses over the 1,712,304 boards")
+        .def_static("from_net", [](const std::vector<int32_t>& net) {
+            auto t = std::make_shared<PreflopEquity>();
+            t->orbit = pair_orbits(t->n_classes);
+            if ((int)net.size() != t->n_classes) throw std::invalid_argument("preflop equity: one value per pair class");
+            t->net = net;
+            t->have.assign(net.size(), 1);
+            return t;
+        })
+        .def("class_of", [](const PreflopEquity& t, int c, int d) { return t.orbit[(size_t)c * NC + (size_t)d]; })
+        .def_property_readonly("n_classes", [](const PreflopEquity& t) { return t.n_classes; })
+        .def_property_readonly("net", [](const PreflopEquity& t) { return t.net; })
+        .def_readonly_static("boards", &PREFLOP_BOARDS);
+
     py::class_<RootTable, std::shared_ptr<RootTable>>(m, "AivatRootTable")
         .def_static("build", [](const Game& g, int rollouts, uint64_t seed, int threads) {
             py::gil_scoped_release nogil;
@@ -147,7 +169,8 @@ static void register_aivat(py::module_& m) {
         .def_property_readonly("mean", [](const RootTable& r) { return py::make_tuple(r.mean[0], r.mean[1]); });
 
     py::class_<Evaluator, std::shared_ptr<Evaluator>>(m, "AivatEvaluator")
-        .def(py::init([](std::shared_ptr<Game> g, const std::vector<int>& rollouts, int eq_samples, uint64_t seed, const py::object& root, int alloc, bool turn_exact) {
+        .def(py::init([](std::shared_ptr<Game> g, const std::vector<int>& rollouts, int eq_samples, uint64_t seed, const py::object& root,
+                         int alloc, bool turn_exact, const py::object& preflop) {
             ValueParams vp;
             if (rollouts.size() > 4) throw std::invalid_argument("rollouts: at most one per street (preflop, flop, turn)");
             for (size_t i = 0; i < rollouts.size(); i++) vp.rollouts[i] = rollouts[i];
@@ -158,9 +181,11 @@ static void register_aivat(py::module_& m) {
             vp.turn_exact = turn_exact;
             std::shared_ptr<const RootTable> rt;
             if (!root.is_none()) rt = root.cast<std::shared_ptr<RootTable>>();
-            return std::make_shared<Evaluator>(std::shared_ptr<const Game>(g), vp, rt);
-        }), py::arg("game"), py::arg("rollouts"), py::arg("eq_samples") = 2000, py::arg("seed") = 0, py::arg("root") = py::none(), py::arg("alloc") = 0,
-            py::arg("turn_exact") = false)
+            std::shared_ptr<const PreflopEquity> pf;
+            if (!preflop.is_none()) pf = preflop.cast<std::shared_ptr<PreflopEquity>>();
+            return std::make_shared<Evaluator>(std::shared_ptr<const Game>(g), vp, rt, pf);
+        }), py::arg("game"), py::arg("rollouts"), py::arg("eq_samples") = 2000, py::arg("seed") = 0, py::arg("root") = py::none(),
+            py::arg("alloc") = 0, py::arg("turn_exact") = false, py::arg("preflop") = py::none())
         .def("evaluate", [](const Evaluator& e, const py::dict& hand, bool trace) {
             const HandIn h = aivat_hand_from_py(hand);
             HandOut o;

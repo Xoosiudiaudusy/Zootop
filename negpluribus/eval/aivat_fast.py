@@ -51,10 +51,10 @@ def make_game(spec, core_bucketer, blueprint):
 
 class FastAivat:
     def __init__(self, game, rollouts: Sequence[int] = (4, 8, 8), eq_samples: int = 2000, seed: int = 0, root=None,
-                 alloc: int = 0, turn_exact: bool = False):
-        """``alloc``: 0 heuristic v1 (``rollouts`` per combo and branch); 1 v2, rollouts by the combo's weight
-        in the terms (at least 1).  ``turn_exact``: v2, turn states with decisions ahead valued exactly
-        instead of by rollouts.  Independent options (docs/aivat.md)."""
+                 alloc: int = 0, turn_exact: bool = False, preflop=None):
+        """Heuristic v1 by default; v2 options, independent (docs/aivat.md):
+        ``alloc=1`` rollouts by the combo's weight in the terms (at least 1); ``turn_exact`` turn states with
+        decisions ahead valued exactly; ``preflop`` (``preflop_equity``) a preflop all-in by the exact table."""
         self.game = game
         self.rollouts = list(rollouts)
         self.eq_samples = eq_samples
@@ -62,7 +62,8 @@ class FastAivat:
         self.root = root
         self.alloc = alloc
         self.turn_exact = turn_exact
-        self.ev = _core().AivatEvaluator(game, self.rollouts, eq_samples, seed, root, alloc, turn_exact)
+        self.preflop = preflop
+        self.ev = _core().AivatEvaluator(game, self.rollouts, eq_samples, seed, root, alloc, turn_exact, preflop)
 
     def evaluate(self, hand, trace: bool = False) -> dict:
         return self.ev.evaluate(hand if isinstance(hand, dict) else hand_to_dict(hand), trace)
@@ -91,6 +92,22 @@ def root_table(game, rollouts: int, seed: int = 0, threads: int = 1, cache_path:
         os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
         np.savez(cache_path, v0=np.array(v0), v1=np.array(v1), meta=json.dumps(meta))
     return rt
+
+
+def preflop_equity(threads: int = 1, cache_path: Optional[str] = None):
+    """The exact heads-up preflop all-in equity table (AivatPreflopEquity; independent of the blueprint and the
+    abstraction), built once (about 3.5 thread-hours) or read from ``cache_path`` (.npz)."""
+    c = _core()
+    if cache_path and os.path.exists(cache_path):
+        z = np.load(cache_path, allow_pickle=False)
+        if json.loads(str(z["meta"])) == {"kind": "preflop_equity_exact", "boards": int(c.AivatPreflopEquity.boards)}:
+            return c.AivatPreflopEquity.from_net(list(z["net"]))
+    t = c.AivatPreflopEquity.build(int(threads))
+    if cache_path:
+        os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
+        np.savez(cache_path, net=np.array(t.net, dtype=np.int32),
+                 meta=json.dumps({"kind": "preflop_equity_exact", "boards": int(c.AivatPreflopEquity.boards)}))
+    return t
 
 
 def summarize(results: Sequence[dict], nets: Optional[Sequence[float]] = None, per: float = 100.0,
