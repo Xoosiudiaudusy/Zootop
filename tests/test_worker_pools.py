@@ -186,3 +186,93 @@ def test_progress_callback_that_raises():
         print("after ok")
     ''')
     assert "raised True" in out and "after ok" in out, out
+
+
+INSIDE = {  # pools that had their own handlers: a failure inside the work (not before it)
+    "precompute": "lambda: bucketer().precompute(1, 4)",
+    "tables_flop": "lambda: core.BucketTables().build(bucketer(), 1, 4)",
+    "aivat_flop": "lambda: core.aivat_build_tables(bucketer(), 4, [1])",
+}
+
+
+@pytest.mark.parametrize("name", list(INSIDE))
+def test_a_failure_inside_the_work_stops_the_pool(name):
+    out = run(f'''
+        import time
+        core._debug_fail_in_work(3)  # the 3rd stop check from now throws, inside a worker's loop
+        t = time.perf_counter()
+        try:
+            ({INSIDE[name]})()
+            print("no error")
+        except RuntimeError as e:
+            print("raised", "out of memory" in str(e), str(e)[:60])
+        core._debug_fail_in_work(0)
+        print("seconds", round(time.perf_counter() - t, 2))
+    ''')
+    assert "raised True" in out, out
+
+
+def test_exploitability_failure_inside_the_work():
+    out = run('''
+        import random
+        from negpluribus.cfr.game import GameSpec
+        from negpluribus.cfr.mccfr import MCCFRTrainer
+        from negpluribus.engine import Street
+        from negpluribus.fast.trainer import spec_to_dict
+        p = os.path.join(sys.path[0], "data", "buckets_3p_15bb_flop.json")
+        bk = EquityBucketer.load(p) if os.path.exists(p) else EquityBucketer(n_buckets=8, samples=150).fit(n_situations=300, seed=0)
+        spec = GameSpec(n_players=2, stack_bb=30, max_street=Street.RIVER, n_buckets=8, max_raises_per_street=2,
+                        preflop_fracs=(1.0,), postflop_fracs=(0.5, 1.0))
+        t = MCCFRTrainer(spec, bk, seed=2, backend="cpp", threads=1).train(2000)
+        game = core.SearchGame(spec_to_dict(spec), core_bucketer(bk), t.blueprint().lookup)
+        rng = random.Random(3); order = list(range(52)); rng.shuffle(order)
+        st = spec.new_hand(order, button=0); acts = []
+        for name in ["r1", "c", "c", "c"]:
+            a = spec.grid.to_concrete(st.observe(st.current_player), name)
+            acts.append((int(a.type), int(a.amount))); st.apply(a)
+        obs = st.observe(st.current_player)
+        s = core.SubgameSearch(game, list(st.starting_stacks), 0, acts, list(obs.board), obs.seat, list(obs.hole),
+                               iterations=300, time_budget=0.0, threads=4, seed=1, depth="end")
+        s.solve()
+        core._debug_fail_in_work(2)
+        try:
+            s.subgame_exploitability(0, 2)
+            print("no error")
+        except RuntimeError as e:
+            print("raised", "exploitability (river cards)" in str(e), "out of memory" in str(e))
+        core._debug_fail_in_work(0)
+        print("after", s.subgame_exploitability(0, 2)[0] >= 0)
+    ''')
+    assert "raised True True" in out and "after True" in out, out
+
+
+def test_bucket_tables_refuse_other_streets():
+    out = run('''
+        t = core.BucketTables()
+        for call in (lambda: t.build(bucketer(), 0, 1), lambda: t.build(bucketer(), 4, 1), lambda: t.size(0), lambda: t.size(4),
+                     lambda: t.has(0), lambda: t.has(4), lambda: core.aivat_build_tables(bucketer(), 1, [4])):
+            try:
+                call()
+                print("no error")
+            except ValueError:
+                print("refused")
+    ''')
+    assert out.count("refused") == 7, out
+
+
+def test_progress_callback_error_cancels_the_build():
+    out = run('''
+        import time
+        bk = bucketer()
+        t = time.perf_counter(); core.BucketTables().build(bk, 1, 2); normal = time.perf_counter() - t
+        def progress(done, total):
+            raise KeyboardInterrupt
+        t = time.perf_counter()
+        try:
+            core.BucketTables().build(bk, 1, 2, progress, 0.05)
+            print("no error")
+        except KeyboardInterrupt:
+            print("interrupted")
+        print("fast", time.perf_counter() - t < 0.5 * normal)
+    ''')
+    assert "interrupted" in out and "fast True" in out, out

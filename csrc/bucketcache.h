@@ -68,34 +68,26 @@ inline long long precompute_buckets(Bucketer& bk, int street, int threads) {
     const std::vector<std::array<int, 5>> boards = canonical_boards(n);
     std::atomic<size_t> next{0};
     std::atomic<long long> visited{0};
-    std::string err;
-    std::mutex err_mu;
-    auto work = [&]() {
-        try {
-            long long mine = 0;
-            for (size_t i = next.fetch_add(1); i < boards.size() && !pool_stopping(); i = next.fetch_add(1)) {
-                const std::array<int, 5>& b = boards[i];
-                bool on[52] = {false};
-                for (int k = 0; k < n; k++) on[b[(size_t)k]] = true;
-                for (int x = 0; x < 52; x++) {
-                    if (on[x]) continue;
-                    for (int y = x + 1; y < 52; y++) {
-                        if (on[y]) continue;
-                        const int hole[2] = {x, y};
-                        bk.bucket(hole, b.data(), n);
-                        mine++;
-                    }
+    auto work = [&]() {  // (an error leaves to run_pool: the other workers stop, the error is raised)
+        long long mine = 0;
+        for (size_t i = next.fetch_add(1); i < boards.size() && !pool_stopping(); i = next.fetch_add(1)) {
+            const std::array<int, 5>& b = boards[i];
+            bool on[52] = {false};
+            for (int k = 0; k < n; k++) on[b[(size_t)k]] = true;
+            for (int x = 0; x < 52; x++) {
+                if (on[x]) continue;
+                for (int y = x + 1; y < 52; y++) {
+                    if (on[y]) continue;
+                    const int hole[2] = {x, y};
+                    bk.bucket(hole, b.data(), n);
+                    mine++;
                 }
             }
-            visited.fetch_add(mine);
-        } catch (const std::exception& e) {
-            std::lock_guard<std::mutex> lk(err_mu);
-            err = e.what();
         }
+        visited.fetch_add(mine);
     };
     const int T = std::max(1, threads);
     run_pool(T, "bucket cache precompute", work);
-    if (!err.empty()) throw std::runtime_error("precompute: " + err);
     return visited.load();
 }
 
