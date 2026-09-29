@@ -1617,7 +1617,8 @@ private:
             const long long i = bp.find(node_key(st.street, rel, st.n_active(), bucket, hh));
             if (i >= 0) {
                 int legal[MAX_ACTIONS];
-                for (int a = 0; a < na.n; a++) legal[a] = grid_to_bp_[na.id[a]];
+                // an inserted (off-grid) action has no blueprint name: -1, as in profile_rows (QA-2)
+                for (int a = 0; a < na.n; a++) legal[a] = na.id[a] == INSERTED_ID ? -1 : grid_to_bp_[na.id[a]];
                 if (!game_->presampled.empty()) {  // the action drawn in advance for this infoset and continuation
                     // (a raise size that is the all-in here plays the all-in, as in policy_at; a name that is
                     // not legal for another reason: the renormalised row)
