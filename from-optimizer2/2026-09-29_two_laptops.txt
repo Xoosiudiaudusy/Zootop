@@ -1,0 +1,63 @@
+Two laptops, 4 nodes (user's decision 29.09 12:05): 4060 laptop (192.168.1.4, a friend's machine: only C:\np_run\opt2 is
+ours) + 3050 laptop whiskas (192.168.1.7); the PC does not take part.  Game: 3-max 100bb wide pot16 from the 100M
+checkpoint (the same on both: each laptop has the checkpoint and splits it itself; split_nodes.py, deterministic).
+
+Node speeds, one node in one process (dist_bench / cpu_node_phases, pass 16384) [замер]:
+  GPU 4060 (4 prep threads)   402,933 it/s   device ms/batch: forward 18.9, backward 7.4, sort 4.6, add 5.9
+  GPU 3050 (4 prep threads)   330,170 it/s   device ms/batch: forward 22.6, backward 11.0, sort 5.4, add 8.2
+  CPU 4060 (12 threads)        30,116 it/s   ms/batch: begin 469.7, end 25.7, apply 48.6
+  CPU 3050 (8 threads)         26,227 it/s   ms/batch: begin 546.1, end 21.1, apply 57.4
+
+Plans (opt2/bench/dist_plan.py, static: before the start, from the measured work per branch and the nodes' speed and
+memory) [оценка, network not included]:
+  4 nodes, head on every node: gpu3050 552 branches, cpu3050 0, gpu4060 525, cpu4060 0 -- the CPU 3050 node's head alone
+    is the slowest (relative time 1.00 vs 0.69 of the GPUs): x1.19 of the 4060 alone      -> assign_4node_laptops.json
+  2 GPU nodes: 552 / 525 branches, balanced: x1.73 of the 4060 alone                        -> assign_2gpu_laptops.json
+
+Over TCP on ONE machine (dist_train, localhost, 262,144 iterations, batch = pass = 16384; opt2/bench/local_breakdown.ps1)
+with 8 MB socket buffers [замер]; digest IDENTICAL with the single trainer (717101f05c9615a3):
+                                   3050 (whiskas)                          4060
+  one GPU node                     274,021 it/s; wall 56.3 ms/batch:       292,164 it/s; wall 52.8 ms/batch:
+                                   compute 54.8 + network 1.2               compute 46.1 + network 6.0
+  GPU node + CPU node (head only)  241,170 it/s; wall 63.9:                238,116 it/s; wall 64.8:
+                                   GPU 57.9 + CPU 38.2 (head)               GPU 50.9 + CPU 46.6 (head)
+  localhost ECHO (4 MB)            1.5-1.6 GB/s each way                   130-280 MB/s (slow: before 8 MB buffers
+                                                                           the 4060's single node lost 23 ms/batch
+                                                                           to the transport, 225,152 it/s)
+
+ACROSS THE TWO LAPTOPS over Wi-Fi (after the user whitelisted .7 in the 4060's VPN and a firewall rule on the 4060 let
+C:\Python314 take connections from .7).  Coordinator on the 3050; its nodes on localhost, the 4060's over Wi-Fi.
+262,144 iterations from 100M, batch 16384; every run's digest IDENTICAL with the single trainer (717101f05c9615a3).
+Link measured by the coordinator (PING / ECHO 4 MB) [замер]:
+  3050 -> 4060 nodes: round trip min 2.50 / median 2.97-3.08 / max 5.05-5.08 ms; 7.2-8.3 MB/s each way
+  3050 -> its own nodes (localhost): round trip 0.13-0.20 ms; 1.6-1.8 GB/s
+
+  config                                 it/s     wall/batch  slowest compute  the rest (network)   Wi-Fi bytes/batch
+  one GPU node, 3050 (localhost)         274,021    56.3 ms        54.8              1.5           -
+  one GPU node, 4060 (localhost)         292,164    52.8 ms        46.1              6.7           -
+  2 GPU nodes (552/525 br.), lockstep     82,149   187.7 ms        33.7            154.0           1.16 MB (0.64 to, 0.52 from the 4060)
+  2 GPU nodes, pipelined (pass 4096)      80,145   192.4 ms        36.8            155.6           1.16 MB
+  4 nodes (CPU: head only), lockstep      36,333   424.4 ms       104.4            320.1           2.32 MB (+1.16 to the 4060's CPU node)
+  4 nodes, pipelined (pass 4096)          41,874   368.3 ms        53.1            315.1           2.32 MB
+
+Per node, 4 nodes lockstep (ms per batch): 3050 GPU: compute 60.5 (begin 39.1, end 4.6, apply 16.7; device forward 23.2,
+backward 12.9, sort 7.0, add 8.3), network beyond compute 2.3, waits for the others 361.4.  3050 CPU (head): compute 38.8,
+network 2.0, waits 383.5.  4060 GPU: compute 87.2 (device forward 40.3, backward 15.8, sort 7.4, add 14.3 -- slower than
+alone: its laptop also ran the 12-thread CPU node), network beyond compute 277.6, waits 59.3.  4060 CPU (head): compute 40.1,
+network 256.8, waits 127.3.  Coordinator: 0.0 ms.
+Per node, 2 GPU nodes lockstep: 3050: compute 32.6 (device 13.3 / 6.4 / 2.4 / 4.7), network 1.6, waits 153.4; 4060: compute
+28.4 (device 10.8 / 4.7 / 2.7 / 3.4), network beyond compute 158.3, waits 0.8.
+(Pipelined runs: per-node bytes and network are not split per round; the totals and waits are.)
+
+Where it is lost: the Wi-Fi link (7-8 MB/s, round trip ~3 ms) carries 1.16 MB of crossing values per batch per GPU pair,
++1.16 MB per head-only CPU node on the far laptop (every node needs every value for its head): 155-320 ms per batch
+against 34-53 ms of compute.  Pipelining hides compute, not a network 4x longer.
+[оценка] 1 Gbit Ethernet (~110 MB/s): 1.16 MB in ~11 ms -> 2 GPU nodes ~max(34, 11) ms/batch pipelined -> 360-480k it/s
+(vs 292k for the 4060 alone); 4 nodes: the head-only CPU nodes (~40 ms/batch) and 2.3 MB (~21 ms) -> ~300k.
+
+Blocker for the laptop-to-laptop runs (resolved by the user at 12:40) [замер, read only]: no TCP between the laptops in either direction (not even
+port 22).  The 4060's AmneziaVPN routes 0.0.0.0/0 and 192.168.1.0/24 into its tunnel (metric 0) with Wi-Fi exceptions
+(/32) only for .1 .2 .3 .5 .6; whiskas has .7 now (DHCP; it was .2 / .6 before), so the 4060 answers it through the VPN.
+The 4060's firewall: port 8765 open to the local subnet (agent-bridge), 50052 only to .3 / 192.168.2.4, C:\Python314
+without a rule.  Needs the user: the VPN off during the test, or .7 excluded, or whiskas back on .2 / .6; and one more
+open port on the 4060 (or the coordinator on the 4060 with an inbound rule for Python on whiskas).
