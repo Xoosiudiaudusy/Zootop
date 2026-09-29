@@ -14,8 +14,9 @@ do not overwrite each other.  ``--backend cpp`` / ``--threads`` select the C++ c
 Formats: with the C++ backend checkpoints and blueprints are binary files written straight from
 the C++ table (docs/backends.md, "Binary checkpoints and blueprints"); ``--json`` also writes the
 old JSON files (the same bytes as before), ``--format json`` writes only JSON.  The Python
-reference trainer always writes JSON.  ``--resume`` takes checkpoint_<tag>.bin, else the old
-checkpoint_<tag>.json; ``scripts/export_json.py`` turns any binary file into its JSON.  Every tool
+reference trainer always writes JSON.  ``--resume`` takes checkpoint_<tag>.bin or .json, the one of the larger
+iteration (an error if there is none, or if its passport <file>.run.json names other training settings); a new
+run on a tag with checkpoints needs ``--overwrite``; ``scripts/export_json.py`` turns any binary file into its JSON.  Every tool
 reads both formats (eval_archetypes.py, compare_checkpoints.py, play_slumbot.py).
 
 After training the script prints:
@@ -85,6 +86,8 @@ def main() -> None:
                     help="continue checkpoint_<tag>.bin/.json (the one of the larger iteration); an error if there is none, or if "
                          "its passport (<file>.run.json) says it was trained with other --seed/--batch/--no-linear/--linear-until/"
                          "--prune-* settings")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="a new run (no --resume) on a tag that has checkpoints: write over them (and its blueprint); refused otherwise")
     ap.add_argument("--resume-override", action="store_true",
                     help="with --resume: continue even if these settings differ from the checkpoint's (the passport keeps the history)")
     ap.add_argument("--eval-deals", type=int, default=300)
@@ -141,6 +144,37 @@ def main() -> None:
     os.makedirs(data, exist_ok=True)
     bk_path = os.path.join(data, f"buckets_{tag}.json")
 
+    # the run passport (negpluribus/fast/runinfo.py): the settings that change what training computes, how it runs,
+    # the game; written next to every checkpoint and blueprint as <file>.run.json
+    train_settings = {"seed": int(args.seed), "batch": int(args.batch), "linear": not args.no_linear, "linear_until": int(args.linear_until),
+                      "prune_below": float(args.prune_below), "prune_prob": float(args.prune_prob), "prune_after": int(args.prune_after),
+                      "prune_relative": bool(args.prune_relative), "prune_scale_t": bool(args.prune_scale_t),
+                      "regret_floor": float(args.regret_floor)}
+    game_info = {"players": args.players, "stack_bb": args.stack, "street": args.street, "preflop_fracs": args.preflop_fracs,
+                 "postflop_fracs": args.postflop_fracs, "max_raises": args.max_raises, "buckets": args.buckets,
+                 "buckets_kind": args.buckets_kind, "exact_features": bool(args.exact_features), "tag": tag}
+    # --resume: which checkpoint and whether its passport's settings are this run's, before any work (the buckets'
+    # fit, loading the checkpoint); a new run: not over the checkpoints of the tag unless asked (--overwrite)
+    from negpluribus.fast import resolve_backend
+
+    resume_from, saved = None, None
+    if args.resume:
+        try:
+            resume_from = resume_checkpoint(data, tag, binary=resolve_backend(args.backend) == "cpp")
+        except ResumeError as err:
+            raise SystemExit(str(err))
+        saved = read_passport(resume_from)
+        early = train_diff(saved, train_settings) if saved else {}
+        if early and not args.resume_override:
+            text = ", ".join(f"{k}: {a!r} (checkpoint) vs {b!r} (now)" for k, (a, b) in early.items())
+            raise SystemExit(f"--resume: {resume_from} was trained with other settings: {text}; use the same flags, "
+                             "another --tag, or --resume-override to continue anyway")
+    else:
+        old = [p for p in (os.path.join(data, f"checkpoint_{tag}{e}") for e in (".bin", ".json")) if os.path.exists(p)]
+        if old and not args.overwrite:
+            raise SystemExit(f"{' and '.join(old)} exist: continue with --resume, start a new run over the tag's files with "
+                             "--overwrite, or use another --tag")
+
     print("game:", spec.describe())
     bucketer = spec.make_bucketer()
     if spec.needs_buckets():
@@ -186,24 +220,10 @@ def main() -> None:
     also_json = cpp and args.json and ext == ".bin"  # JSON copies next to the binary files
     print(f"backend: {trainer.backend}" + (f" x{trainer.threads} threads, bucket cache {trainer.cache_caps}" if cpp else "")
           + f", files {ext[1:]}{' + json' if also_json else ''}, Windows power throttling {'off' if no_throttle else 'not changed'}")
-    # the run passport (negpluribus/fast/runinfo.py): the settings that change what training computes, how it runs,
-    # the game; written next to every checkpoint and blueprint as <file>.run.json
-    train_settings = {"seed": int(args.seed), "batch": int(args.batch), "linear": not args.no_linear, "linear_until": int(args.linear_until),
-                      "prune_below": float(args.prune_below), "prune_prob": float(args.prune_prob), "prune_after": int(args.prune_after),
-                      "prune_relative": bool(args.prune_relative), "prune_scale_t": bool(args.prune_scale_t),
-                      "regret_floor": float(args.regret_floor)}
-    game_info = {"players": args.players, "stack_bb": args.stack, "street": args.street, "preflop_fracs": args.preflop_fracs,
-                 "postflop_fracs": args.postflop_fracs, "max_raises": args.max_raises, "buckets": args.buckets,
-                 "buckets_kind": args.buckets_kind, "exact_features": bool(args.exact_features), "tag": tag}
     history: list = []
     if args.resume:
         # C++ backend: checkpoint_<tag>.bin or .json, the one of the larger iteration (never the newer file: an old
         # JSON next to a later binary is not continued); Python backend: the JSON.  None: an error, not a new run
-        try:
-            resume_from = resume_checkpoint(data, tag, binary=cpp)
-        except ResumeError as err:
-            raise SystemExit(str(err))
-        saved = read_passport(resume_from)
         t = time.perf_counter()
         trainer.load_checkpoint(resume_from)
         diff = train_diff(saved, train_settings) if saved else {}
@@ -434,8 +454,8 @@ def main() -> None:
               f"nodes touched + pruned), nodes touched {touched:,} ({touched / max(1, trainer.iteration):.1f} per iteration)")
     # the agent's strategy: the average strategy at full precision, as trainer.strategy() had it
     # (C++ backend: the same floats from a C++ lookup, no dict)
-    # the final state also as the .it<N> snapshot of its iteration (M1: a later --resume writes over the plain files;
-    # GPU runs end on whole batches, so their snapshot names are multiples of the batch like their checkpoints)
+    # the final state also as the .it<N> snapshot of its iteration (M1: a later --resume writes over the plain files);
+    # N is the exact final iteration (a multiple of the batch for GPU runs with --seconds, or --iters a multiple of it)
     if cpp:
         save_outputs(snapshot=True)
         # the in-memory blueprint only for the evaluation below (a large game's copy may not fit in RAM)

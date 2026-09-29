@@ -73,8 +73,10 @@ python scripts/train_blueprint.py <game flags> --backend cpp --gpu 0 --batch 163
   - Larger batches gain little speed.  They also carry a quality risk on short runs: 65536 on HU at 20M
     iterations lost 11 bb/100.
 - **`--checkpoint-every N`**: a checkpoint and a blueprint (plus the `.it<N>` copy) every N iterations.
-  - N is rounded up to a multiple of B, so the `.it<N>` names of a GPU run are multiples of B.
-  - The final iteration always gets its `.it<N>` copy too (a later `--resume` writes over the plain files).
+  - N is rounded up to a multiple of B, so the `.it<N>` names of the checkpoints of a GPU run are multiples of B.
+  - The final iteration always gets its `.it<N>` copy too (a later `--resume` writes over the plain files).  Its
+    name is a multiple of B with `--seconds` (whole batches) or when `--iters` is one; with other `--iters` the last
+    batch is shorter and the name is the exact final iteration.
   - Each checkpoint copies the device tables into the ordinary trainer and frees that copy after writing.
 - **`--resume`**: continues from `checkpoint_<tag>.bin` (or `.json`: the one of the larger iteration).
   - No checkpoint is an error (not a new run over the tag's files).

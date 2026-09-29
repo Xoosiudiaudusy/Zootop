@@ -16,17 +16,8 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from negpluribus.fast.binfmt import file_kind, read_checkpoint_identity  # noqa: E402
-from negpluribus.fast.runinfo import file_iteration, read_passport  # noqa: E402
-
-
-def identity(path: str, kind: str):
-    if kind != "checkpoint":
-        return None
-    try:
-        return read_checkpoint_identity(path)
-    except Exception:
-        return None
+from negpluribus.fast.binfmt import file_kind  # noqa: E402
+from negpluribus.fast.runinfo import file_header, file_iteration, read_passport  # noqa: E402
 
 
 def main() -> None:
@@ -36,15 +27,18 @@ def main() -> None:
     args = ap.parse_args()
     for path in args.files:
         kind = file_kind(path) if os.path.exists(path) else "missing"
-        it = file_iteration(path)
+        head = file_header(path) or {}  # (the header only: a large checkpoint is not read)
+        it = head.get("iteration") if head else file_iteration(path)
         pp = read_passport(path)
         if args.json:
-            print(json.dumps({"file": path, "kind": kind, "iteration": it, "passport": pp}, indent=1))
+            print(json.dumps({"file": path, "kind": kind, "iteration": it, "infosets": head.get("infosets"),
+                              "identity": head.get("identity"), "passport": pp}, indent=1))
             continue
         print(f"{path}")
-        print(f"  kind {kind}, iteration {'?' if it is None else f'{it:,}'}, {os.path.getsize(path):,} bytes" if os.path.exists(path)
-              else "  (file missing)")
-        ident = identity(path, kind)
+        n_inf = head.get("infosets")
+        print(f"  kind {kind}, iteration {'?' if it is None else f'{it:,}'}, {'?' if n_inf is None else f'{n_inf:,}'} infosets, "
+              f"{os.path.getsize(path):,} bytes" if os.path.exists(path) else "  (file missing)")
+        ident = head.get("identity")
         if ident:
             print(f"  game: {ident['n_players']} players, {ident['stack_bb']}bb, streets to {ident['max_street']}, "
                   f"preflop {ident['preflop_fracs']}, postflop {ident['postflop_fracs']}, raises {ident['max_raises_per_street']}, "
