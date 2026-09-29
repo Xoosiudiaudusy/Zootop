@@ -87,3 +87,15 @@ def test_pruning_with_threads_gives_distributions(game):
     spec, g = game
     r = search(spec, g, TURN, prune_mode=3, prune_below=0.1, threads=4, iterations=0, time_budget=0.5).solve()
     assert r["pruned"] > 0 and abs(sum(r["average"]) - 1.0) < 1e-9
+
+
+def test_agent_prune_spec():
+    from negpluribus.agents.core_search import SearchConfig, prune_kwargs
+
+    assert prune_kwargs("") == {}
+    assert prune_kwargs("r0.2") == dict(prune_mode=3, prune_below=0.2)
+    assert prune_kwargs("r0.2n") == dict(prune_mode=3, prune_below=0.2, prune_river=False)
+    assert prune_kwargs("t5") == dict(prune_mode=2, prune_below=5.0) and prune_kwargs("a100")["prune_mode"] == 1
+    with pytest.raises(ValueError):
+        SearchConfig(time_budget=1.0, prune="x1")
+    assert SearchConfig(time_budget=1.0, prune="r0.2").prune == "r0.2"

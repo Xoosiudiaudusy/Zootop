@@ -95,10 +95,14 @@ class SearchConfig:
     river_buckets: int = 0
     # vector CFR's weighting: 0 Linear CFR, 1 CFR+, 2 DCFR(1.5, 0, 2)
     vector_discount: int = 0
+    # regret-based pruning in the MCCFR (type b, off by default): "" off, else r<f> (relative), t<C> (x t), a<C>
+    # (absolute), a suffix "n" never on river nodes (SubgameSearch prune_mode / prune_below / prune_river)
+    prune: str = ""
 
     def __post_init__(self) -> None:
         if self.play not in ("average", "final"):
             raise ValueError(f"play must be 'average' or 'final', got {self.play!r}")
+        prune_kwargs(self.prune)  # (a bad spec fails here, not at the first search)
         if self.iterations <= 0 and self.time_budget <= 0 and not self.street_budgets and not self.street_iterations:
             raise ValueError("set time_budget, street_budgets or iterations")
         if not 1 <= int(self.search_from_street) <= 3:
@@ -318,6 +322,9 @@ def add_search_args(ap) -> None:
                          "(0: the subgame's buckets, --search-buckets or the blueprint's)")
     ap.add_argument("--search-vector-discount", choices=("linear", "cfr+", "dcfr"), default="linear",
                     help="the vector CFR's weighting (the MCCFR is always Linear)")
+    ap.add_argument("--search-prune", default="",
+                    help="regret-based pruning in the MCCFR (type b; off by default): r<f> relative (regret < -f x sum |regret| of the "
+                         "node; measured best r0.2), t<C> x t, a<C> absolute; suffix n: never on river nodes (e.g. r0.2n)")
 
 
 def search_config_from_args(args) -> "SearchConfig":
@@ -334,7 +341,23 @@ def search_config_from_args(args) -> "SearchConfig":
                                                   parse_street_budgets(getattr(args, "search_vector_iterations", "")).items()},
                         river_exact=getattr(args, "search_river_exact", False),
                         river_buckets=getattr(args, "search_river_buckets", 0),
-                        vector_discount={"linear": 0, "cfr+": 1, "dcfr": 2}[getattr(args, "search_vector_discount", "linear")])
+                        vector_discount={"linear": 0, "cfr+": 1, "dcfr": 2}[getattr(args, "search_vector_discount", "linear")],
+                        prune=getattr(args, "search_prune", ""))
+
+
+def prune_kwargs(spec: str) -> dict:
+    """SubgameSearch's pruning arguments of a --search-prune spec ("" : none, the search unchanged)."""
+    spec = (spec or "").strip()
+    if not spec:
+        return {}
+    kw = {}
+    if spec.endswith("n"):
+        kw["prune_river"] = False
+        spec = spec[:-1]
+    if spec[:1] not in ("a", "t", "r"):
+        raise ValueError(f"--search-prune: r<f>, t<C> or a<C> (optionally with n), got {spec!r}")
+    kw.update(prune_mode={"a": 1, "t": 2, "r": 3}[spec[0]], prune_below=float(spec[1:]))
+    return kw
 
 
 def raise_offgrid_distance(obs: Observation, amount: int, grid) -> float:
@@ -536,7 +559,7 @@ class CoreSearchAgent(Agent):
             threads=self.cfg.threads, seed=self.rng.getrandbits(32), focus=self.cfg.focus, min_prob=self.cfg.min_prob,
             linear=True, overrides=overrides or None, depth=self.cfg.depth, rollouts=self.cfg.rollouts, bias=self.cfg.bias,
             vector_cfr=self.cfg.vector_cfr, river_exact=self.cfg.river_exact, river_buckets=self.cfg.river_buckets,
-            vector_discount=self.cfg.vector_discount)
+            vector_discount=self.cfg.vector_discount, **prune_kwargs(self.cfg.prune))
         if self.cfg.vector_cfr and s.vector_eligible:
             vi = int(self.cfg.vector_street_iterations.get(street, 0))
             s.set_budget(vi, 0.0 if vi > 0 else budget)
