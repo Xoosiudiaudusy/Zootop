@@ -485,8 +485,12 @@ private:
 
 struct ValueParams {
     int rollouts[4] = {4, 8, 8, 0};  // per street of the state reached (preflop, flop, turn)
+    // 0: heuristic v1, k rollouts for every combo of a branch.  1: v2 "rollouts by weight" (docs/aivat.md,
+    // type (b)): combo c of a branch with weights w gets k_c = max(1, ceil(k n_eff w_c / sum w)) rollouts,
+    // n_eff = (sum w)^2 / sum w^2, so sum_c w_c^2 / k_c <= sum_c w_c^2 / k (the weighted noise of v1 at most)
     int eq_samples = 2000;           // random boards of a preflop all-in value
     uint64_t seed = 0;
+    int alloc = 0;
 };
 
 // one finished hand (negpluribus/eval/aivat.py AivatHand)
@@ -743,7 +747,9 @@ public:
                     bool any = false;
                     for (int c = 0; c < NC; c++) if (w_ca[(size_t)c * A + j] > 0.0) need[(size_t)c] = 1, any = true;
                     vals[(size_t)j].assign((size_t)NC, 0.0);
-                    if (any) branch(ctx, st, true, acts[(size_t)j].first, acts[(size_t)j].second, std::vector<int>(), node, need, vals[(size_t)j]);
+                    std::vector<double> wj((size_t)NC, 0.0);
+                    for (int c = 0; c < NC; c++) wj[(size_t)c] = w_ca[(size_t)c * A + j];
+                    if (any) branch(ctx, st, true, acts[(size_t)j].first, acts[(size_t)j].second, std::vector<int>(), node, need, vals[(size_t)j], &wj);
                     if (trace) out.trace.emplace_back("x" + std::to_string(k) + ":a" + std::to_string(j), vals[(size_t)j]);
                 }
                 double first = 0.0, wsum = 0.0, second = 0.0, wa = 0.0;
@@ -807,10 +813,12 @@ public:
                     std::vector<double> v_before((size_t)NC, 0.0), v_after((size_t)NC, 0.0);
                     const bool use_reused = have_reused && fixed.empty();
                     if (use_reused) v_before = reused;
-                    else branch(ctx, before, true, atype, amount, fixed, node, need, v_before);
+                    else branch(ctx, before, true, atype, amount, fixed, node, need, v_before, &w_c);
                     std::vector<int> fixed2(fixed);
                     fixed2.insert(fixed2.end(), f_obs.begin(), f_obs.end());
-                    branch(ctx, before, true, atype, amount, fixed2, node, need2, v_after);
+                    std::vector<double> w_c2((size_t)NC, 0.0);
+                    for (int c = 0; c < NC; c++) if (need2[(size_t)c]) w_c2[(size_t)c] = w_c[(size_t)c];
+                    branch(ctx, before, true, atype, amount, fixed2, node, need2, v_after, &w_c2);
                     if (trace) {
                         out.trace.emplace_back("c" + std::to_string(k) + ":" + std::to_string(nb) + ":before", v_before);
                         out.trace.emplace_back("c" + std::to_string(k) + ":" + std::to_string(nb) + ":after", v_after);
@@ -1097,8 +1105,9 @@ private:
     }
 
     // ---- heuristic v1: the value of the state reached by `action` from `parent`, next cards `fixed`
+    // `weight` (optional): the combos' weights in the terms that use these values (v2 allocation)
     void branch(Ctx& ctx, const HandState& parent, bool has_action, int atype, int amount, const std::vector<int>& fixed, int node,
-                const std::vector<char>& need, std::vector<double>& out) const {
+                const std::vector<char>& need, std::vector<double>& out, const std::vector<double>* weight = nullptr) const {
         const Combos& cb = combos();
         std::fill(out.begin(), out.end(), 0.0);
         bool any = false;
@@ -1139,7 +1148,29 @@ private:
         // the rollouts (c, r) in order, LANES in flight at a time; each value is summed in r order as before
         std::vector<int> list;
         for (int c = 0; c < NC; c++) if (need[(size_t)c]) list.push_back(c);
-        const int n_jobs = (int)list.size() * k;
+        // rollouts per combo: k (v1), or by weight (v2); they depend only on the weights, known before the
+        // node's outcome, and every combo keeps at least one, so each value stays an unbiased estimate
+        std::vector<int> kc(list.size(), k), first(list.size() + 1, 0);
+        if (vp_.alloc == 1 && weight) {
+            double sw = 0.0, sw2 = 0.0;
+            for (int c : list) {
+                const double w = (*weight)[(size_t)c];
+                sw += w;
+                sw2 += w * w;
+            }
+            if (sw > 0.0 && sw2 > 0.0) {
+                const double n_eff = sw * sw / sw2;
+                for (size_t i = 0; i < list.size(); i++) {
+                    const double x = std::ceil((double)k * n_eff * (*weight)[(size_t)list[i]] / sw);
+                    kc[i] = x < 1.0 ? 1 : (x > 1e6 ? 1000000 : (int)x);
+                }
+            }
+        }
+        for (size_t i = 0; i < list.size(); i++) first[i + 1] = first[i] + kc[i];
+        const int n_jobs = first[list.size()];
+        std::vector<int> job_i((size_t)n_jobs);
+        for (size_t i = 0; i < list.size(); i++)
+            for (int r = 0; r < kc[i]; r++) job_i[(size_t)(first[i] + r)] = (int)i;
         std::vector<double> vals((size_t)n_jobs, 0.0);
         const int LANES = lanes_in_flight();
         Lane lanes[MAX_LANES];
@@ -1148,7 +1179,8 @@ private:
         auto load = [&](Lane& L) {
             while (next < n_jobs) {
                 const int job = next++;
-                const int c = list[(size_t)(job / k)], r = job % k;
+                const int i = job_i[(size_t)job];
+                const int c = list[(size_t)i], r = job - first[(size_t)i];
                 const int hole[2] = {cb.c0[c], cb.c1[c]};
                 L.rng = CounterRng(stream_seed({vp_.seed, hid, (uint64_t)node, (uint64_t)c, (uint64_t)r}));
                 lane_init(ctx, L, parent, has_action, atype, amount, fixed, hole, &start);
@@ -1171,8 +1203,8 @@ private:
             }
         for (size_t i = 0; i < list.size(); i++) {
             double tot = 0.0;
-            for (int r = 0; r < k; r++) tot += vals[i * (size_t)k + (size_t)r];
-            out[(size_t)list[i]] = tot / k;
+            for (int r = 0; r < kc[i]; r++) tot += vals[(size_t)(first[i] + r)];
+            out[(size_t)list[i]] = tot / kc[i];
         }
     }
 
