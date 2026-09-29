@@ -197,7 +197,7 @@ inline void build_exact_features(int n_board, int bins, int threads, ExactFeatur
     auto work = [&]() {
         ExactFeatureBatch batch(bins);
         int counts[64];
-        for (size_t i = next.fetch_add(1); i < boards.size(); i = next.fetch_add(1)) {
+        for (size_t i = next.fetch_add(1); i < boards.size() && !pool_stopping(); i = next.fetch_add(1)) {
             const int* board = boards[i].data();
             batch.compute(board, n_board);
             bool on[52] = {false};

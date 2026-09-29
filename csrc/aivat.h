@@ -242,7 +242,7 @@ inline bool build_river_table_fast(const Bucketer& bk, BucketTables& tables, int
     auto work = [&]() {
         std::vector<uint8_t> out(NC);
         long long mine = 0;
-        for (size_t i = next.fetch_add(1); i < boards.size() && !unsupported.load(); i = next.fetch_add(1)) {
+        for (size_t i = next.fetch_add(1); i < boards.size() && !unsupported.load() && !pool_stopping(); i = next.fetch_add(1)) {
             const int* b = boards[i].data();
             if (!bk.river_buckets_all(b, cb.idx, out.data())) {
                 unsupported.store(true);
@@ -277,7 +277,7 @@ inline uint64_t build_table_through_bucketer(Bucketer& bk, BucketTables& tables,
     std::atomic<uint64_t> next{0};
     auto work = [&]() {
         int hole[2], board[5];
-        for (uint64_t lo = next.fetch_add(4096); lo < n; lo = next.fetch_add(4096)) {
+        for (uint64_t lo = next.fetch_add(4096); lo < n && !pool_stopping(); lo = next.fetch_add(4096)) {
             const uint64_t hi = std::min(n, lo + 4096);
             for (uint64_t i = lo; i < hi; i++) {
                 ix.unindex(i, hole, board);
@@ -693,7 +693,7 @@ public:
         std::vector<std::string> errors(hands.size());
         std::atomic<size_t> next{0};
         auto work = [&]() {
-            for (size_t i = next.fetch_add(1); i < hands.size(); i = next.fetch_add(1)) {
+            for (size_t i = next.fetch_add(1); i < hands.size() && !pool_stopping(); i = next.fetch_add(1)) {
                 try {
                     res[i] = evaluate(hands[i], false);
                 } catch (const std::exception& e) {
@@ -733,7 +733,7 @@ public:
         std::mutex err_mu;
         auto work = [&]() {
             try {
-                for (int o = next.fetch_add(1); o < nc; o = next.fetch_add(1))
+                for (int o = next.fetch_add(1); o < nc && !pool_stopping(); o = next.fetch_add(1))
                     for (int pos = 0; pos < 2; pos++) rt->values[pos][(size_t)o] = ev.root_value(pos, rep_c[(size_t)o], rep_d[(size_t)o], o, rollouts);
             } catch (const std::exception& e) {
                 std::lock_guard<std::mutex> lk(err_mu);
